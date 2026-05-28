@@ -1,0 +1,12013 @@
+import streamlit as st
+import pandas as pd
+import json
+import hashlib
+
+try:
+    import bcrypt
+except Exception:
+    bcrypt = None
+
+import uuid
+from pathlib import Path
+from datetime import date, datetime, timedelta
+try:
+    from zoneinfo import ZoneInfo
+except Exception:
+    ZoneInfo = None
+from io import BytesIO
+import zipfile
+import sqlite3
+import re
+import os
+import base64
+import random
+import shutil
+import threading
+from contextlib import contextmanager
+
+try:
+    import requests
+except Exception:
+    requests = None
+
+try:
+    import matplotlib.pyplot as plt
+except Exception:
+    plt = None
+
+try:
+    from reportlab.lib import colors
+    from reportlab.lib.pagesizes import A4
+    from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
+    from reportlab.lib.units import mm
+    from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer, Table, TableStyle, PageBreak
+    from reportlab.pdfbase import pdfmetrics
+    from reportlab.pdfbase.cidfonts import UnicodeCIDFont
+except Exception:
+    colors = None
+
+
+# =========================
+# ページ設定
+# =========================
+st.set_page_config(
+    page_title="ひだまり 健康チェック管理システム",
+    page_icon="☀️",
+    layout="wide",
+)
+
+# =========================
+# JST時刻統一（Ver4.3）
+# Streamlit Cloud等のUTCサーバーでも、記録日時・更新日時・監査ログ・バックアップ履歴を日本時間で統一する。
+# =========================
+JST = ZoneInfo("Asia/Tokyo") if ZoneInfo else None
+
+def now_jst_dt():
+    if JST:
+        return datetime.now(JST)
+    # zoneinfoが使えない環境向けのフォールバック
+    return datetime.utcnow() + timedelta(hours=9)
+
+def format_now_jst(fmt="%Y-%m-%d %H:%M:%S"):
+    return now_jst_dt().strftime(fmt)
+
+def now_jst():
+    return format_now_jst("%Y-%m-%d %H:%M:%S")
+
+def today_jst():
+    return now_jst_dt().date()
+
+
+
+def is_admin_user():
+    role = st.session_state.get("role", "")
+    user = (
+        st.session_state.get("username", "")
+        or st.session_state.get("user_id", "")
+        or st.session_state.get("login_user", "")
+        or st.session_state.get("user", "")
+    )
+    login_info = st.session_state.get("login_user_info", {})
+    if isinstance(login_info, dict):
+        role = role or login_info.get("role", "")
+        user = user or login_info.get("username", "") or login_info.get("id", "")
+    return role == "admin" or user == "kanri"
+
+
+# 管理者専用メニュー制御
+ADMIN_ONLY_MENUS = [
+    "自分専用ダッシュボード",
+    "データダウンロード",
+    "LIFE入力標準化",
+    "短期目標・モニタリング",
+    "モニタリング下書き作成",
+    "管理者LIFE入力",
+    "LIFE不足チェック",
+    "LIFE CSV出力",
+    "LIFE登録一覧",
+    "加算シミュレーション",
+    "現場の気づき構造化・AI管理者支援",
+    "セキュリティ・保守管理",
+    "利用者ID移行チェック",
+    "利用者名ゆれ紐づけマスタ",
+]
+
+def filter_admin_menus(menu_list):
+    if is_admin_user():
+        return menu_list
+    return [m for m in menu_list if m not in ADMIN_ONLY_MENUS]
+
+
+
+
+def current_login_user():
+    user = (
+        st.session_state.get("username", "")
+        or st.session_state.get("user_id", "")
+        or st.session_state.get("login_user", "")
+        or st.session_state.get("user", "")
+    )
+    login_info = st.session_state.get("login_user_info", {})
+    if isinstance(login_info, dict):
+        user = user or login_info.get("username", "") or login_info.get("id", "")
+    return user or "kanri"
+
+# =========================
+# ログイン設定
+# =========================
+USERS = {
+    "kanri": {"password": "rui", "role": "admin", "label": "管理者"},
+    "staff": {"password": "rui", "role": "staff", "label": "職員"},
+}
+
+
+# =========================
+# ファイル設定
+# =========================
+DATA_DIR = Path("data")
+REPORT_DIR = Path("reports")
+BUSINESS_HANDOVER_PHOTO_DIR = DATA_DIR / "business_handover_photos"
+BUSINESS_HANDOVER_EXCEL_DIR = DATA_DIR / "business_handover_excels"
+
+HEALTH_FILE = DATA_DIR / "health_data.xlsx"
+EXCRETION_FILE = DATA_DIR / "excretion_data.xlsx"
+USER_FILE = DATA_DIR / "user_master.xlsx"
+HANDOVER_FILE = DATA_DIR / "business_handover_data.xlsx"
+SHORT_GOAL_MASTER_FILE = DATA_DIR / "short_goal_master.xlsx"
+SHORT_GOAL_CHECK_FILE = DATA_DIR / "short_goal_check_data.xlsx"
+MONITORING_DRAFT_FILE = DATA_DIR / "monitoring_draft_data.xlsx"
+LIFE_ADL_FILE = DATA_DIR / "life_adl_assessment_data.xlsx"
+ALERT_CONDITION_FILE = DATA_DIR / "handover_alert_condition_master.xlsx"
+ACCOUNT_FILE = DATA_DIR / "login_account_master.xlsx"
+LOGIN_HISTORY_FILE = DATA_DIR / "login_history.xlsx"
+MENU_CATEGORY_SETTINGS_FILE = DATA_DIR / "menu_category_settings.json"
+
+
+# =========================
+# SQLite設定（Ver3.7 DB層分離）
+# DB接続・WAL設定・保存/読込・整合性チェックは db/database.py に分離
+# =========================
+HIDAMARI_DB_FILE = DATA_DIR / "hidamari_health.db"
+
+SQLITE_TABLE_HEALTH = "health_records"
+SQLITE_TABLE_EXCRETION = "excretion_records"
+SQLITE_TABLE_HANDOVER = "handover_logs"
+SQLITE_TABLE_SHORT_GOAL_MASTER = "short_term_goals"
+SQLITE_TABLE_SHORT_GOAL_CHECKS = "short_goal_checks"
+SQLITE_TABLE_MONITORING_DRAFTS = "monitoring_drafts"
+SQLITE_TABLE_ALERT_CONDITIONS = "alert_conditions"
+SQLITE_TABLE_ALERTS = "alerts"
+SQLITE_TABLE_ACCOUNTS = "login_accounts"
+SQLITE_TABLE_LOGIN_HISTORY = "login_history"
+SQLITE_TABLE_USERS = "users"
+SQLITE_TABLE_APP_SETTINGS = "app_settings"
+SQLITE_TABLE_LIFE_ADL = "life_adl_assessments"
+SQLITE_TABLE_AI_INSIGHT_LOGS = "ai_insight_logs"
+SQLITE_TABLE_USER_NAME_ALIASES = "user_name_aliases"
+SQLITE_TABLE_HANDOVER_KEYWORDS = "handover_keywords"
+
+APP_SETTING_COLUMNS = [
+    "設定キー",
+    "設定値",
+    "分類",
+    "説明",
+    "更新日時",
+    "更新者",
+]
+
+HANDOVER_KEYWORD_COLUMNS = [
+    "id",
+    "keyword",
+    "title",
+    "category",
+    "is_active",
+    "sort_order",
+    "created_at",
+    "updated_at",
+]
+
+from db import database as db_engine
+
+db_engine.configure_database(DATA_DIR, HIDAMARI_DB_FILE)
+
+DB_BUSY_TIMEOUT_MS = db_engine.DB_BUSY_TIMEOUT_MS
+DB_WRITE_LOCK = db_engine.DB_WRITE_LOCK
+DB_LAST_INTEGRITY_RESULT = db_engine.get_last_integrity_result()
+
+validate_sqlite_identifier = db_engine.validate_sqlite_identifier
+apply_sqlite_pragmas = db_engine.apply_sqlite_pragmas
+hidamari_db_connection = db_engine.hidamari_db_connection
+hidamari_write_transaction = db_engine.hidamari_write_transaction
+get_hidamari_conn = db_engine.get_hidamari_conn
+sqlite_table_exists = db_engine.sqlite_table_exists
+sqlite_table_row_count = db_engine.sqlite_table_row_count
+normalize_df_columns = db_engine.normalize_df_columns
+prepare_sqlite_dataframe = db_engine.prepare_sqlite_dataframe
+db_write_dataframe = db_engine.db_write_dataframe
+db_read_dataframe = db_engine.db_read_dataframe
+
+# =========================
+# Supabase外部DB対応（Ver4.5）
+# 主要3機能だけ外部DB化：健康チェック／排泄チェック／業務全体申し送り
+# それ以外のテーブルは従来通り SQLite + バックアップ方式。
+# =========================
+SUPABASE_CORE_TABLES = {
+    "health_records": ["記録日", "利用者名"],
+    "excretion_records": ["記録日", "利用者名", "時間帯"],
+    "handover_logs": ["記録ID"],
+}
+
+_original_save_sqlite_table = db_engine.save_sqlite_table
+_original_load_sqlite_table = db_engine.load_sqlite_table
+
+
+def _sb_clean(value, default=""):
+    try:
+        if pd.isna(value):
+            return default
+    except Exception:
+        pass
+    text = str(value).strip()
+    if text.lower() in ["nan", "none", "nat"]:
+        return default
+    return text
+
+
+def _sb_json_safe(value):
+    try:
+        if pd.isna(value):
+            return ""
+    except Exception:
+        pass
+    if isinstance(value, (datetime, date)):
+        return value.isoformat()
+    try:
+        if hasattr(value, "isoformat"):
+            return value.isoformat()
+    except Exception:
+        pass
+    try:
+        if hasattr(value, "item"):
+            return value.item()
+    except Exception:
+        pass
+    return value
+
+
+def _supabase_config():
+    try:
+        sb = st.secrets.get("supabase", {}) if hasattr(st, "secrets") else {}
+    except Exception:
+        sb = {}
+
+    def pick(*keys):
+        for key in keys:
+            try:
+                if isinstance(sb, dict) and sb.get(key):
+                    return str(sb.get(key)).strip()
+            except Exception:
+                pass
+            try:
+                if hasattr(st, "secrets") and st.secrets.get(key):
+                    return str(st.secrets.get(key)).strip()
+            except Exception:
+                pass
+        return ""
+
+    enabled_raw = pick("enabled", "SUPABASE_ENABLED")
+    url = pick("url", "SUPABASE_URL")
+    key = pick("key", "service_role_key", "anon_key", "SUPABASE_KEY", "SUPABASE_SERVICE_ROLE_KEY", "SUPABASE_ANON_KEY")
+    enabled = str(enabled_raw).lower() in ["1", "true", "yes", "on", "有効"]
+    if not enabled and url and key:
+        enabled = True
+    return {"enabled": enabled, "url": url.rstrip("/"), "key": key}
+
+
+def supabase_is_enabled():
+    cfg = _supabase_config()
+    return bool(cfg.get("enabled") and cfg.get("url") and cfg.get("key") and requests is not None)
+
+
+def _supabase_headers(prefer="return=minimal"):
+    cfg = _supabase_config()
+    headers = {
+        "apikey": cfg["key"],
+        "Authorization": f"Bearer {cfg['key']}",
+        "Content-Type": "application/json",
+    }
+    if prefer:
+        headers["Prefer"] = prefer
+    return headers
+
+
+def _supabase_endpoint(table_name: str, query: str = ""):
+    cfg = _supabase_config()
+    return f"{cfg['url']}/rest/v1/{table_name}" + query
+
+
+def _make_supabase_record_key(row: dict, table_name: str, unique_cols=None):
+    cols = unique_cols or SUPABASE_CORE_TABLES.get(table_name, [])
+    if not cols:
+        cols = ["記録ID"] if "記録ID" in row else []
+    key = "__".join([_sb_clean(row.get(col)) for col in cols]).strip("_")
+    return key or str(uuid.uuid4())
+
+
+def _df_to_supabase_payload(df: pd.DataFrame, table_name: str, unique_cols=None):
+    if df is None or df.empty:
+        return []
+    payload = []
+    for _, row in df.copy().iterrows():
+        data = {str(k): _sb_json_safe(v) for k, v in row.to_dict().items()}
+        payload.append({
+            "record_key": _make_supabase_record_key(data, table_name, unique_cols),
+            "data": data,
+            "updated_at": format_now_jst("%Y-%m-%dT%H:%M:%S+09:00") if "format_now_jst" in globals() else datetime.utcnow().isoformat(),
+        })
+    return payload
+
+
+def supabase_read_table(table_name: str, columns=None) -> pd.DataFrame:
+    if not supabase_is_enabled() or table_name not in SUPABASE_CORE_TABLES:
+        return _original_load_sqlite_table(table_name, columns or [])
+    try:
+        url = _supabase_endpoint(table_name, "?select=record_key,data,updated_at&order=updated_at.desc")
+        res = requests.get(url, headers=_supabase_headers(prefer=""), timeout=20)
+        res.raise_for_status()
+        rows = res.json() or []
+        data_rows = []
+        for item in rows:
+            data = item.get("data") or {}
+            if isinstance(data, dict):
+                data_rows.append(data)
+        df = pd.DataFrame(data_rows)
+        if columns:
+            for col in columns:
+                if col not in df.columns:
+                    df[col] = ""
+            df = df[columns]
+        return df
+    except Exception as e:
+        try:
+            st.warning(f"Supabase読込に失敗したため、ローカルSQLiteを読み込みます：{table_name} / {e}")
+        except Exception:
+            pass
+        return _original_load_sqlite_table(table_name, columns or [])
+
+
+def supabase_replace_table(df: pd.DataFrame, table_name: str, columns=None, unique_cols=None) -> bool:
+    if not supabase_is_enabled() or table_name not in SUPABASE_CORE_TABLES:
+        return False
+    try:
+        del_url = _supabase_endpoint(table_name, "?record_key=neq.__never_delete_marker__")
+        del_res = requests.delete(del_url, headers=_supabase_headers(), timeout=20)
+        del_res.raise_for_status()
+        payload = _df_to_supabase_payload(df, table_name, unique_cols=unique_cols)
+        if payload:
+            post_url = _supabase_endpoint(table_name)
+            for i in range(0, len(payload), 500):
+                chunk = payload[i:i + 500]
+                post_res = requests.post(post_url, headers=_supabase_headers(), json=chunk, timeout=30)
+                post_res.raise_for_status()
+        return True
+    except Exception as e:
+        try:
+            st.error(f"Supabase保存に失敗しました。ローカルSQLiteへ保存します：{table_name} / {e}")
+        except Exception:
+            pass
+        return False
+
+
+def save_sqlite_table(df, table_name, columns, date_cols=None, unique_cols=None, sort_cols=None):
+    if table_name in SUPABASE_CORE_TABLES and supabase_replace_table(df, table_name, columns=columns, unique_cols=unique_cols):
+        try:
+            return _original_save_sqlite_table(df, table_name, columns, date_cols=date_cols, unique_cols=unique_cols, sort_cols=sort_cols)
+        except Exception:
+            return None
+    return _original_save_sqlite_table(df, table_name, columns, date_cols=date_cols, unique_cols=unique_cols, sort_cols=sort_cols)
+
+
+def load_sqlite_table(table_name, columns, date_cols=None):
+    if table_name in SUPABASE_CORE_TABLES and supabase_is_enabled():
+        return supabase_read_table(table_name, columns=columns)
+    return _original_load_sqlite_table(table_name, columns, date_cols=date_cols)
+
+
+def get_supabase_storage_status():
+    cfg = _supabase_config()
+    if requests is None:
+        return "Supabase無効：requestsライブラリが利用できません。"
+    if not cfg.get("url") or not cfg.get("key"):
+        return "Supabase未設定：Streamlit Secrets に url と key を登録してください。"
+    if not cfg.get("enabled"):
+        return "Supabase未有効：enabled=true を設定してください。"
+    try:
+        url = _supabase_endpoint("health_records", "?select=record_key&limit=1")
+        res = requests.get(url, headers=_supabase_headers(prefer=""), timeout=10)
+        if res.status_code in [200, 206]:
+            return "Supabase接続OK：健康チェック・排泄チェック・申し送りは外部DB保存です。"
+        return f"Supabase接続注意：HTTP {res.status_code} / {res.text[:120]}"
+    except Exception as e:
+        return f"Supabase接続エラー：{e}"
+
+
+def get_supabase_create_table_sql():
+    return """
+-- Supabase SQL Editorで実行してください
+create table if not exists public.health_records (
+  record_key text primary key,
+  data jsonb not null default '{}'::jsonb,
+  updated_at timestamptz default now()
+);
+
+create table if not exists public.excretion_records (
+  record_key text primary key,
+  data jsonb not null default '{}'::jsonb,
+  updated_at timestamptz default now()
+);
+
+create table if not exists public.handover_logs (
+  record_key text primary key,
+  data jsonb not null default '{}'::jsonb,
+  updated_at timestamptz default now()
+);
+
+-- service_role key をStreamlit Secretsで使う場合はRLSを有効化しなくても動作します。
+-- anon key を使う場合は、別途RLSポリシーが必要です。
+""".strip()
+
+def initialize_sqlite_engine():
+    return db_engine.initialize_sqlite_engine()
+
+def run_db_integrity_check(auto_repair: bool = True) -> dict:
+    global DB_LAST_INTEGRITY_RESULT
+    DB_LAST_INTEGRITY_RESULT = db_engine.run_db_integrity_check(auto_repair=auto_repair)
+    return DB_LAST_INTEGRITY_RESULT
+
+def get_db_integrity_status_text() -> str:
+    return db_engine.get_db_integrity_status_text()
+
+
+
+# =========================
+# 商品化向け：設定系SQLite一元管理
+# =========================
+def ensure_app_settings_table():
+    """JSON/Excelへ散らばりやすい設定をSQLiteへ集約するための共通テーブルを用意する。"""
+    try:
+        if not sqlite_table_exists(SQLITE_TABLE_APP_SETTINGS):
+            db_write_dataframe(pd.DataFrame(columns=APP_SETTING_COLUMNS), SQLITE_TABLE_APP_SETTINGS, APP_SETTING_COLUMNS, unique_cols=["設定キー"])
+    except Exception:
+        # 初期化途中でもアプリ全体を止めない
+        pass
+
+
+def _json_dumps_safe(value) -> str:
+    try:
+        return json.dumps(value, ensure_ascii=False)
+    except Exception:
+        return json.dumps(str(value), ensure_ascii=False)
+
+
+def _json_loads_safe(value, default=None):
+    if value is None or value == "":
+        return default
+    try:
+        return json.loads(value)
+    except Exception:
+        return default
+
+
+def get_app_setting(setting_key, default=None):
+    """SQLite app_settings から設定値を取得する。値はJSONとして保存・復元する。"""
+    setting_key = clean_text(setting_key)
+    if not setting_key:
+        return default
+    try:
+        ensure_app_settings_table()
+        df = load_sqlite_table(SQLITE_TABLE_APP_SETTINGS, APP_SETTING_COLUMNS)
+        hit = df[df["設定キー"].astype(str) == setting_key]
+        if hit.empty:
+            return default
+        raw = hit.iloc[-1].get("設定値", "")
+        return _json_loads_safe(raw, default)
+    except Exception:
+        return default
+
+
+def set_app_setting(setting_key, value, category="一般設定", description=""):
+    """SQLite app_settings へ設定値を保存する。"""
+    setting_key = clean_text(setting_key)
+    if not setting_key:
+        return
+    try:
+        ensure_app_settings_table()
+        df = load_sqlite_table(SQLITE_TABLE_APP_SETTINGS, APP_SETTING_COLUMNS)
+        df = df[df["設定キー"].astype(str) != setting_key].copy()
+        row = {
+            "設定キー": setting_key,
+            "設定値": _json_dumps_safe(value),
+            "分類": clean_text(category, "一般設定"),
+            "説明": clean_text(description),
+            "更新日時": format_now_jst("%Y-%m-%d %H:%M:%S"),
+            "更新者": current_login_user() if "current_login_user" in globals() else "",
+        }
+        df = pd.concat([df, pd.DataFrame([row], columns=APP_SETTING_COLUMNS)], ignore_index=True)
+        save_sqlite_table(df, SQLITE_TABLE_APP_SETTINGS, APP_SETTING_COLUMNS, unique_cols=["設定キー"])
+    except Exception:
+        pass
+
+
+def delete_app_setting(setting_key):
+    setting_key = clean_text(setting_key)
+    try:
+        ensure_app_settings_table()
+        df = load_sqlite_table(SQLITE_TABLE_APP_SETTINGS, APP_SETTING_COLUMNS)
+        df = df[df["設定キー"].astype(str) != setting_key].copy()
+        save_sqlite_table(df, SQLITE_TABLE_APP_SETTINGS, APP_SETTING_COLUMNS, unique_cols=["設定キー"])
+    except Exception:
+        pass
+
+
+def migrate_json_file_setting_to_db(setting_key, json_path, category="移行設定", default=None):
+    """
+    旧JSONファイルからSQLiteへ初回移行する。
+    DB側に既に値があれば上書きしない。
+    """
+    existing = get_app_setting(setting_key, None)
+    if existing is not None:
+        return existing
+    value = default
+    try:
+        path = Path(json_path)
+        if path.exists():
+            value = json.loads(path.read_text(encoding="utf-8"))
+    except Exception:
+        value = default
+    set_app_setting(setting_key, value, category=category, description=f"{Path(json_path).name} から移行")
+    return value
+
+
+def get_all_app_settings_df():
+    ensure_app_settings_table()
+    return load_sqlite_table(SQLITE_TABLE_APP_SETTINGS, APP_SETTING_COLUMNS)
+
+
+def initialize_default_app_settings():
+    """商品化前提の標準設定をSQLiteへ初期投入する。既存設定は維持する。"""
+    ensure_app_settings_table()
+
+    # メニューカテゴリ設定：旧JSONがあれば初回移行
+    try:
+        if "MENU_CATEGORY_SETTINGS_FILE" in globals():
+            migrate_json_file_setting_to_db(
+                "menu_category_settings_all",
+                MENU_CATEGORY_SETTINGS_FILE,
+                category="メニュー設定",
+                default={},
+            )
+    except Exception:
+        pass
+
+    # 自分専用ダッシュボード設定：旧JSONがあれば初回移行
+    try:
+        if "DASHBOARD_SETTINGS_FILE" in globals():
+            migrate_json_file_setting_to_db(
+                "dashboard_settings_all",
+                DASHBOARD_SETTINGS_FILE,
+                category="ダッシュボード設定",
+                default={},
+            )
+    except Exception:
+        pass
+
+    if get_app_setting("ui_settings", None) is None:
+        set_app_setting(
+            "ui_settings",
+            {
+                "テーマ": "ひだまり標準",
+                "iPad最適化": True,
+                "ボタン大型化": True,
+                "カード表示": True,
+                "フォント倍率": 1.0,
+            },
+            category="UI設定",
+            description="画面表示・iPad対応の基本設定",
+        )
+
+    if get_app_setting("color_settings", None) is None:
+        set_app_setting(
+            "color_settings",
+            {
+                "staff_bg": "#FFFDF7",
+                "staff_accent": "#C9705C",
+                "admin_bg": "#F6F8F7",
+                "admin_accent": "#2F6F5E",
+                "alert": "#C9705C",
+                "success": "#2F6F5E",
+            },
+            category="色設定",
+            description="ブランドカラー・注意色・管理者色の設定",
+        )
+
+    if get_app_setting("life_settings", None) is None:
+        set_app_setting(
+            "life_settings",
+            {
+                "対象月初期値": "当月",
+                "LIFE不足表示": True,
+                "CSV出力前確認": True,
+                "診断表現を避ける": True,
+                "AIは整理係": True,
+            },
+            category="LIFE設定",
+            description="LIFE管理・CSV出力・AI整理に関する設定",
+        )
+
+    if get_app_setting("facility_settings", None) is None:
+        set_app_setting(
+            "facility_settings",
+            {
+                "施設名": "ひだまり",
+                "事業種別": "小規模介護施設",
+                "定員": "",
+                "所在地": "",
+                "管理者名": "",
+                "連絡先": "",
+            },
+            category="施設設定",
+            description="施設名・管理者名・帳票表示用の基本設定",
+        )
+
+
+
+
+
+def get_storage_unification_status():
+    """商品版向け：保存先の簡易表示用。"""
+    if "supabase_is_enabled" in globals() and supabase_is_enabled():
+        return {
+            "正データ": "Supabase（健康チェック・排泄チェック・申し送り）／SQLite（その他）",
+            "Excel保存": "廃止（ダウンロード出力のみ）",
+            "JSON保存": "廃止（app_settingsテーブルへ統合）",
+            "バックアップ": "主要3機能はSupabase正本＋SQLiteミラー／その他はSQLite DB + 添付ファイル",
+        }
+    return {
+        "正データ": "SQLite",
+        "Excel保存": "廃止（ダウンロード出力のみ）",
+        "JSON保存": "廃止（app_settingsテーブルへ統合）",
+        "バックアップ": "SQLite DB + 添付ファイル",
+    }
+
+def migrate_excel_to_sqlite_if_needed(table_name: str, excel_path: Path, sheet_name: str, columns: list, date_cols=None, unique_cols=None):
+    """初回起動時のみ、既存ExcelデータをSQLiteへ移行する。DBに1件でもあれば上書きしない。"""
+    ensure_dirs()
+    if sqlite_table_row_count(table_name) > 0:
+        return
+
+    if not excel_path.exists():
+        save_sqlite_table(pd.DataFrame(columns=columns), table_name, columns, date_cols=date_cols, unique_cols=unique_cols)
+        return
+
+    try:
+        df = pd.read_excel(excel_path, sheet_name=sheet_name)
+    except Exception:
+        df = pd.DataFrame(columns=columns)
+
+    df = normalize_df_columns(df, columns)
+    save_sqlite_table(df, table_name, columns, date_cols=date_cols, unique_cols=unique_cols)
+
+
+def ensure_hidamari_db():
+    """主要テーブルを作成し、起動時にDB整合性を確認する。"""
+    ensure_dirs()
+    initialize_sqlite_engine()
+    save_sqlite_table(load_sqlite_table(SQLITE_TABLE_HEALTH, HEALTH_COLUMNS, date_cols=["記録日"]), SQLITE_TABLE_HEALTH, HEALTH_COLUMNS, date_cols=["記録日"], unique_cols=["記録日", "利用者名"])
+    save_sqlite_table(load_sqlite_table(SQLITE_TABLE_EXCRETION, EXCRETION_COLUMNS, date_cols=["記録日"]), SQLITE_TABLE_EXCRETION, EXCRETION_COLUMNS, date_cols=["記録日"], unique_cols=["記録日", "利用者名", "時間帯"])
+    save_sqlite_table(load_sqlite_table(SQLITE_TABLE_HANDOVER, BUSINESS_HANDOVER_COLUMNS, date_cols=["日付"]), SQLITE_TABLE_HANDOVER, BUSINESS_HANDOVER_COLUMNS, date_cols=["日付"], unique_cols=["記録ID"])
+    save_sqlite_table(load_sqlite_table(SQLITE_TABLE_SHORT_GOAL_MASTER, SHORT_GOAL_MASTER_COLUMNS, date_cols=["開始日", "終了予定日"]), SQLITE_TABLE_SHORT_GOAL_MASTER, SHORT_GOAL_MASTER_COLUMNS, date_cols=["開始日", "終了予定日"], unique_cols=["目標ID"])
+    save_sqlite_table(load_sqlite_table(SQLITE_TABLE_SHORT_GOAL_CHECKS, SHORT_GOAL_CHECK_COLUMNS, date_cols=["日付"]), SQLITE_TABLE_SHORT_GOAL_CHECKS, SHORT_GOAL_CHECK_COLUMNS, date_cols=["日付"], unique_cols=["記録ID"])
+    save_sqlite_table(load_sqlite_table(SQLITE_TABLE_MONITORING_DRAFTS, MONITORING_DRAFT_COLUMNS, date_cols=["作成日"]), SQLITE_TABLE_MONITORING_DRAFTS, MONITORING_DRAFT_COLUMNS, date_cols=["作成日"], unique_cols=["下書きID"])
+    save_sqlite_table(load_sqlite_table(SQLITE_TABLE_ALERT_CONDITIONS, ALERT_CONDITION_COLUMNS), SQLITE_TABLE_ALERT_CONDITIONS, ALERT_CONDITION_COLUMNS, unique_cols=["条件ID"])
+    save_sqlite_table(load_sqlite_table(SQLITE_TABLE_ALERTS, ["通知ID", "日付", "利用者名", "重要度", "分類", "通知内容", "対応状況", "作成日時"], date_cols=["日付"]), SQLITE_TABLE_ALERTS, ["通知ID", "日付", "利用者名", "重要度", "分類", "通知内容", "対応状況", "作成日時"], date_cols=["日付"], unique_cols=["通知ID"])
+    ensure_account_file()
+    ensure_login_history_file()
+    ensure_user_file()
+    ensure_user_name_alias_table()
+    try:
+        ensure_handover_keyword_table()
+    except Exception:
+        pass
+    try:
+        ensure_life_adl_file()
+    except Exception:
+        pass
+    try:
+        ensure_ai_insight_log_file()
+    except Exception:
+        pass
+    initialize_default_app_settings()
+    run_db_integrity_check(auto_repair=True)
+
+# =========================
+# セキュリティ・保守機能（Ver2.1）
+# 自動バックアップ／監査ログ／権限管理／データ復元
+# =========================
+BACKUP_DIR = DATA_DIR / "backups"
+RESTORE_DIR = DATA_DIR / "restore_uploads"
+
+SQLITE_TABLE_AUDIT_LOGS = "audit_logs"
+SQLITE_TABLE_ROLE_PERMISSIONS = "role_permissions"
+SQLITE_TABLE_BACKUP_HISTORY = "backup_history"
+
+AUDIT_LOG_COLUMNS = [
+    "監査ID",
+    "日時",
+    "ログインID",
+    "表示名",
+    "権限",
+    "操作種別",
+    "対象テーブル",
+    "対象キー",
+    "概要",
+    "変更前",
+    "変更後",
+]
+
+ROLE_PERMISSION_COLUMNS = [
+    "権限",
+    "機能",
+    "閲覧",
+    "登録更新",
+    "削除",
+    "復元",
+    "備考",
+]
+
+BACKUP_HISTORY_COLUMNS = [
+    "バックアップID",
+    "日時",
+    "種類",
+    "ファイル名",
+    "サイズKB",
+    "実行者",
+    "結果",
+    "メモ",
+]
+
+DEFAULT_ROLE_PERMISSIONS = [
+    {"権限": "admin", "機能": "全機能", "閲覧": 1, "登録更新": 1, "削除": 1, "復元": 1, "備考": "管理者は全機能を利用可能"},
+    {"権限": "staff", "機能": "健康チェック入力", "閲覧": 1, "登録更新": 1, "削除": 0, "復元": 0, "備考": "職員は日々の入力中心"},
+    {"権限": "staff", "機能": "排泄チェック入力", "閲覧": 1, "登録更新": 1, "削除": 0, "復元": 0, "備考": "職員は日々の入力中心"},
+    {"権限": "staff", "機能": "業務全体申し送り", "閲覧": 1, "登録更新": 1, "削除": 0, "復元": 0, "備考": "職員は申し送り入力可能"},
+    {"権限": "staff", "機能": "日々の実施チェック", "閲覧": 1, "登録更新": 1, "削除": 0, "復元": 0, "備考": "職員は短期目標の実施入力可能"},
+]
+
+
+def ensure_security_dirs():
+    ensure_dirs()
+    BACKUP_DIR.mkdir(parents=True, exist_ok=True)
+    RESTORE_DIR.mkdir(parents=True, exist_ok=True)
+
+
+def ensure_security_tables():
+    """セキュリティ関連テーブルを作成する。"""
+    ensure_security_dirs()
+    save_sqlite_table(
+        load_sqlite_table(SQLITE_TABLE_AUDIT_LOGS, AUDIT_LOG_COLUMNS),
+        SQLITE_TABLE_AUDIT_LOGS,
+        AUDIT_LOG_COLUMNS,
+        unique_cols=["監査ID"],
+        sort_cols=["日時"],
+    )
+    perms = load_sqlite_table(SQLITE_TABLE_ROLE_PERMISSIONS, ROLE_PERMISSION_COLUMNS)
+    if perms.empty:
+        perms = pd.DataFrame(DEFAULT_ROLE_PERMISSIONS, columns=ROLE_PERMISSION_COLUMNS)
+    save_sqlite_table(
+        perms,
+        SQLITE_TABLE_ROLE_PERMISSIONS,
+        ROLE_PERMISSION_COLUMNS,
+        unique_cols=["権限", "機能"],
+    )
+    save_sqlite_table(
+        load_sqlite_table(SQLITE_TABLE_BACKUP_HISTORY, BACKUP_HISTORY_COLUMNS),
+        SQLITE_TABLE_BACKUP_HISTORY,
+        BACKUP_HISTORY_COLUMNS,
+        unique_cols=["バックアップID"],
+        sort_cols=["日時"],
+    )
+
+
+def get_current_user_info_for_log():
+    login_id = current_login_user()
+    role = clean_text(st.session_state.get("role", ""))
+    label = clean_text(st.session_state.get("user_label", login_id), login_id)
+    info = st.session_state.get("login_user_info", {})
+    if isinstance(info, dict):
+        role = role or clean_text(info.get("role", ""))
+        label = label or clean_text(info.get("label", login_id), login_id)
+    return login_id, label, role
+
+
+def add_audit_log(operation, table_name="", target_key="", summary="", before="", after=""):
+    """誰が、いつ、何をしたかをSQLiteに保存する。"""
+    try:
+        ensure_security_tables()
+        login_id, label, role = get_current_user_info_for_log()
+        df = load_sqlite_table(SQLITE_TABLE_AUDIT_LOGS, AUDIT_LOG_COLUMNS)
+        row = {
+            "監査ID": str(uuid.uuid4()),
+            "日時": format_now_jst("%Y-%m-%d %H:%M:%S"),
+            "ログインID": login_id,
+            "表示名": label,
+            "権限": role,
+            "操作種別": clean_text(operation),
+            "対象テーブル": clean_text(table_name),
+            "対象キー": clean_text(target_key),
+            "概要": clean_text(summary),
+            "変更前": clean_text(before),
+            "変更後": clean_text(after),
+        }
+        df = pd.concat([df, pd.DataFrame([row], columns=AUDIT_LOG_COLUMNS)], ignore_index=True)
+        # 長期運用で肥大化しすぎないよう直近5000件を保持
+        if len(df) > 5000:
+            df = df.tail(5000)
+        save_sqlite_table(df, SQLITE_TABLE_AUDIT_LOGS, AUDIT_LOG_COLUMNS, unique_cols=["監査ID"], sort_cols=["日時"])
+    except Exception:
+        # 監査ログ失敗で本体入力を止めない
+        pass
+
+
+def has_permission(feature_name, action="閲覧"):
+    """権限表に基づいて操作可否を返す。adminは常に許可。"""
+    role = clean_text(st.session_state.get("role", "staff"), "staff")
+    if role == "admin":
+        return True
+    try:
+        ensure_security_tables()
+        perms = load_sqlite_table(SQLITE_TABLE_ROLE_PERMISSIONS, ROLE_PERMISSION_COLUMNS)
+        if perms.empty:
+            return False
+        # 全機能または対象機能の行を見る
+        candidates = perms[
+            (perms["権限"].astype(str) == role)
+            & ((perms["機能"].astype(str) == feature_name) | (perms["機能"].astype(str) == "全機能"))
+        ]
+        if candidates.empty:
+            return False
+        col = action if action in ["閲覧", "登録更新", "削除", "復元"] else "閲覧"
+        return any(str(v).lower() in ["1", "true", "yes", "有", "可"] for v in candidates[col].tolist())
+    except Exception:
+        return role == "admin"
+
+
+def require_permission(feature_name, action="閲覧"):
+    if not has_permission(feature_name, action):
+        st.warning(f"この操作は権限がありません：{feature_name}／{action}")
+        add_audit_log("権限エラー", "role_permissions", feature_name, f"{action} が拒否されました")
+        return False
+    return True
+
+
+def record_backup_history(kind, file_path, result="成功", memo=""):
+    try:
+        ensure_security_tables()
+        df = load_sqlite_table(SQLITE_TABLE_BACKUP_HISTORY, BACKUP_HISTORY_COLUMNS)
+        size_kb = 0
+        try:
+            size_kb = round(Path(file_path).stat().st_size / 1024, 1)
+        except Exception:
+            pass
+        row = {
+            "バックアップID": str(uuid.uuid4()),
+            "日時": format_now_jst("%Y-%m-%d %H:%M:%S"),
+            "種類": kind,
+            "ファイル名": Path(file_path).name if file_path else "",
+            "サイズKB": size_kb,
+            "実行者": current_login_user(),
+            "結果": result,
+            "メモ": memo,
+        }
+        df = pd.concat([df, pd.DataFrame([row], columns=BACKUP_HISTORY_COLUMNS)], ignore_index=True)
+        if len(df) > 1000:
+            df = df.tail(1000)
+        save_sqlite_table(df, SQLITE_TABLE_BACKUP_HISTORY, BACKUP_HISTORY_COLUMNS, unique_cols=["バックアップID"], sort_cols=["日時"])
+    except Exception:
+        pass
+
+
+
+def create_backup_zip(kind="手動"):
+    """
+    SQLite正本のDBと添付ファイルをZIP化して保存する。
+    商品版ではExcel/JSON互換ファイルをバックアップ対象にしません。
+    """
+    ensure_security_dirs()
+    timestamp = format_now_jst("%Y%m%d_%H%M%S")
+    zip_path = BACKUP_DIR / f"hidamari_backup_{kind}_{timestamp}.zip"
+
+    try:
+        if HIDAMARI_DB_FILE.exists():
+            with get_hidamari_conn() as conn:
+                conn.execute("PRAGMA wal_checkpoint(FULL);")
+
+        with zipfile.ZipFile(zip_path, "w", zipfile.ZIP_DEFLATED) as zf:
+            if HIDAMARI_DB_FILE.exists():
+                zf.write(HIDAMARI_DB_FILE, arcname=f"data/{HIDAMARI_DB_FILE.name}")
+
+            for life_db in [DATA_DIR / "hidamari_life.db", Path("hidamari_life.db")]:
+                if life_db.exists():
+                    zf.write(life_db, arcname=f"data/{life_db.name}")
+
+            for folder in [BUSINESS_HANDOVER_PHOTO_DIR, BUSINESS_HANDOVER_EXCEL_DIR]:
+                if folder.exists():
+                    for file in folder.rglob("*"):
+                        if file.is_file():
+                            zf.write(file, arcname=str(file))
+
+        record_backup_history(kind, zip_path, "成功", "SQLite正本バックアップ作成")
+        add_audit_log("バックアップ作成", "backup_history", zip_path.name, f"{kind}バックアップを作成")
+        return zip_path, ""
+    except Exception as e:
+        record_backup_history(kind, zip_path, "失敗", str(e))
+        add_audit_log("バックアップ失敗", "backup_history", zip_path.name, str(e))
+        return None, str(e)
+def run_daily_auto_backup():
+    """1日1回だけ自動バックアップを作成する。"""
+    try:
+        ensure_security_dirs()
+        today_key = today_jst().strftime("%Y%m%d")
+        marker = BACKUP_DIR / f".auto_backup_{today_key}.done"
+        if marker.exists():
+            return
+        zip_path, err = create_backup_zip(kind="自動")
+        if zip_path and not err:
+            marker.write_text(format_now_jst("%Y-%m-%d %H:%M:%S"), encoding="utf-8")
+            # 古い自動バックアップは30世代程度に整理
+            auto_files = sorted(BACKUP_DIR.glob("hidamari_backup_自動_*.zip"), key=lambda x: x.stat().st_mtime, reverse=True)
+            for old in auto_files[30:]:
+                try:
+                    old.unlink()
+                except Exception:
+                    pass
+    except Exception:
+        # 自動バックアップ失敗で本体起動を止めない
+        pass
+
+
+
+def restore_from_backup_zip(uploaded_file):
+    """SQLite正本バックアップZIPからDB等を復元する。管理者のみ。"""
+    if not is_admin_user():
+        return False, "管理者のみ復元できます。"
+    ensure_security_dirs()
+
+    pre_backup, pre_err = create_backup_zip(kind="復元前")
+    if pre_err:
+        return False, f"復元前バックアップに失敗しました：{pre_err}"
+
+    try:
+        filename = clean_text(getattr(uploaded_file, "name", "restore.zip"), "restore.zip")
+        restore_zip_path = RESTORE_DIR / f"{format_now_jst('%Y%m%d_%H%M%S')}_{filename}"
+        uploaded_file.seek(0)
+        restore_zip_path.write_bytes(uploaded_file.read())
+
+        with zipfile.ZipFile(restore_zip_path, "r") as zf:
+            names = zf.namelist()
+            if f"data/{HIDAMARI_DB_FILE.name}" not in names:
+                return False, "このZIPには hidamari_health.db が含まれていません。"
+
+            HIDAMARI_DB_FILE.write_bytes(zf.read(f"data/{HIDAMARI_DB_FILE.name}"))
+
+            if "data/hidamari_life.db" in names:
+                (DATA_DIR / "hidamari_life.db").write_bytes(zf.read("data/hidamari_life.db"))
+
+            for folder in [BUSINESS_HANDOVER_PHOTO_DIR, BUSINESS_HANDOVER_EXCEL_DIR]:
+                for name in names:
+                    if name.startswith(str(folder)) and not name.endswith("/"):
+                        target = Path(name)
+                        target.parent.mkdir(parents=True, exist_ok=True)
+                        target.write_bytes(zf.read(name))
+
+        add_audit_log("データ復元", "restore", restore_zip_path.name, "SQLite正本バックアップZIPから復元")
+        record_backup_history("復元", restore_zip_path, "成功", "SQLite正本バックアップZIPから復元")
+        return True, f"復元しました。復元前バックアップも作成済みです：{pre_backup.name if pre_backup else ''}"
+    except Exception as e:
+        add_audit_log("データ復元失敗", "restore", "", str(e))
+        return False, f"復元に失敗しました：{e}"
+def show_security_maintenance_menu():
+    if not is_admin_user():
+        st.warning("このメニューは管理者専用です。")
+        return
+
+    ensure_security_tables()
+    st.header("セキュリティ・保守管理")
+    st.caption("DBバックアップ・復元・監査ログ・権限管理を、この画面にまとめています。")
+
+    tab1, tab2, tab3, tab4, tab5, tab6 = st.tabs(["バックアップ", "監査ログ", "権限管理", "データ復元", "DB整合性", "Supabase設定"])
+
+    with tab1:
+        st.subheader("バックアップ")
+        st.write("SQLite DB、利用者マスタ、ログイン情報、写真・添付ファイルをZIPで保存します。")
+        if st.button("今すぐ手動バックアップを作成", type="primary", use_container_width=True):
+            zip_path, err = create_backup_zip(kind="手動")
+            if err:
+                st.error(err)
+            else:
+                st.success(f"バックアップを作成しました：{zip_path.name}")
+
+        backups = sorted(BACKUP_DIR.glob("hidamari_backup_*.zip"), key=lambda x: x.stat().st_mtime, reverse=True)
+        if backups:
+            selected = st.selectbox("ダウンロードするバックアップ", [b.name for b in backups])
+            target = BACKUP_DIR / selected
+            with open(target, "rb") as f:
+                st.download_button(
+                    "選択したバックアップをダウンロード",
+                    data=f.read(),
+                    file_name=target.name,
+                    mime="application/zip",
+                    use_container_width=True,
+                )
+        else:
+            st.info("バックアップファイルはまだありません。")
+
+        st.divider()
+        st.subheader("バックアップ履歴")
+        history = load_sqlite_table(SQLITE_TABLE_BACKUP_HISTORY, BACKUP_HISTORY_COLUMNS)
+        if history.empty:
+            st.info("履歴はまだありません。")
+        else:
+            st.dataframe(history.sort_values("日時", ascending=False).head(200), use_container_width=True, hide_index=True)
+
+    with tab2:
+        st.subheader("監査ログ")
+        logs = load_sqlite_table(SQLITE_TABLE_AUDIT_LOGS, AUDIT_LOG_COLUMNS)
+        c1, c2, c3 = st.columns(3)
+        with c1:
+            op_filter = st.text_input("操作種別で検索", key="audit_op_filter")
+        with c2:
+            user_filter = st.text_input("ログインIDで検索", key="audit_user_filter")
+        with c3:
+            limit = st.number_input("表示件数", min_value=50, max_value=1000, value=200, step=50)
+        view = logs.copy()
+        if not view.empty:
+            if clean_text(op_filter):
+                view = view[view["操作種別"].astype(str).str.contains(clean_text(op_filter), case=False, na=False)]
+            if clean_text(user_filter):
+                view = view[view["ログインID"].astype(str).str.contains(clean_text(user_filter), case=False, na=False)]
+            view = view.sort_values("日時", ascending=False).head(int(limit))
+            st.dataframe(view, use_container_width=True, hide_index=True)
+            st.download_button(
+                "監査ログをExcelでダウンロード",
+                data=to_excel_download(view),
+                file_name=f"audit_logs_{today_jst().strftime('%Y%m%d')}.xlsx",
+                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                use_container_width=True,
+            )
+        else:
+            st.info("監査ログはまだありません。")
+
+    with tab3:
+        st.subheader("権限管理")
+        st.caption("職員権限で閲覧・登録更新・削除・復元をどこまで許可するかを管理します。")
+        perms = load_sqlite_table(SQLITE_TABLE_ROLE_PERMISSIONS, ROLE_PERMISSION_COLUMNS)
+        edited = st.data_editor(
+            perms,
+            use_container_width=True,
+            hide_index=True,
+            num_rows="dynamic",
+            column_config={
+                "閲覧": st.column_config.CheckboxColumn("閲覧"),
+                "登録更新": st.column_config.CheckboxColumn("登録更新"),
+                "削除": st.column_config.CheckboxColumn("削除"),
+                "復元": st.column_config.CheckboxColumn("復元"),
+            },
+        )
+        if st.button("権限設定を保存", type="primary", use_container_width=True):
+            save_sqlite_table(edited, SQLITE_TABLE_ROLE_PERMISSIONS, ROLE_PERMISSION_COLUMNS, unique_cols=["権限", "機能"])
+            add_audit_log("権限設定更新", "role_permissions", "", "権限設定を更新")
+            st.success("権限設定を保存しました。")
+            st.rerun()
+
+    with tab4:
+        st.subheader("データ復元")
+        st.warning("復元すると現在のDBがバックアップ時点に戻ります。実行前に自動で『復元前バックアップ』を作成します。")
+        uploaded = st.file_uploader("復元するバックアップZIPを選択", type=["zip"])
+        confirm = st.checkbox("現在のデータが上書きされることを理解しました")
+        if st.button("選択したバックアップから復元", type="primary", use_container_width=True):
+            if not uploaded:
+                st.error("復元するZIPを選択してください。")
+            elif not confirm:
+                st.error("確認チェックを入れてください。")
+            else:
+                ok, msg = restore_from_backup_zip(uploaded)
+                if ok:
+                    st.success(msg)
+                    st.info("復元後はアプリを再読み込みしてください。")
+                else:
+                    st.error(msg)
+
+    with tab5:
+        st.subheader("DB整合性チェック")
+        st.caption("SQLiteのWALモード、quick_check、チェックポイント状態を確認します。")
+        status_text = get_db_integrity_status_text() if "get_db_integrity_status_text" in globals() else "DB整合性: 未確認"
+        if DB_LAST_INTEGRITY_RESULT.get("ok", True):
+            st.success(status_text)
+        else:
+            st.error(status_text)
+        if st.button("DB整合性を今すぐ再チェック", type="primary", use_container_width=True):
+            result = run_db_integrity_check(auto_repair=True)
+            if result.get("ok"):
+                st.success(get_db_integrity_status_text())
+                add_audit_log("DB整合性チェック", "sqlite", "", "quick_check ok")
+            else:
+                st.error(get_db_integrity_status_text())
+                add_audit_log("DB整合性チェックエラー", "sqlite", "", " / ".join(result.get("messages", [])))
+            st.rerun()
+
+    with tab6:
+        st.subheader("Supabase設定")
+        st.caption("健康チェック・排泄チェック・業務全体申し送りの3機能だけを外部DBへ保存します。その他の機能は従来通りSQLite＋バックアップ方式です。")
+        status = get_supabase_storage_status() if "get_supabase_storage_status" in globals() else "Supabase設定関数が見つかりません。"
+        if "接続OK" in status:
+            st.success(status)
+        elif "未設定" in status or "未有効" in status:
+            st.info(status)
+        else:
+            st.warning(status)
+
+        st.markdown("#### Streamlit Secrets 設定例")
+        st.code('''[supabase]
+enabled = true
+url = "https://xxxxxxxx.supabase.co"
+key = "SUPABASE_SERVICE_ROLE_KEY"''', language="toml")
+
+        st.markdown("#### Supabase SQL Editorで実行するSQL")
+        st.code(get_supabase_create_table_sql() if "get_supabase_create_table_sql" in globals() else "", language="sql")
+
+        st.markdown("#### 保存方針")
+        st.write(get_storage_unification_status() if "get_storage_unification_status" in globals() else {})
+
+        st.markdown("#### 既存SQLiteデータの移行")
+        st.caption("手元や旧環境のSQLiteに残っている主要3機能データを、Supabaseへ初回移行するためのボタンです。")
+        if st.button("ローカルSQLiteから主要3機能をSupabaseへ移行", use_container_width=True):
+            if not supabase_is_enabled():
+                st.error("Supabaseが未設定または接続できません。Secretsとテーブル作成を確認してください。")
+            else:
+                migrated = []
+                targets = [
+                    (SQLITE_TABLE_HEALTH, HEALTH_COLUMNS, ["記録日", "利用者名"]),
+                    (SQLITE_TABLE_EXCRETION, EXCRETION_COLUMNS, ["記録日", "利用者名", "時間帯"]),
+                    (SQLITE_TABLE_HANDOVER, BUSINESS_HANDOVER_COLUMNS, ["記録ID"]),
+                ]
+                for table_name, cols, keys in targets:
+                    local_df = _original_load_sqlite_table(table_name, cols)
+                    ok = supabase_replace_table(local_df, table_name, columns=cols, unique_cols=keys)
+                    migrated.append({"テーブル": table_name, "件数": len(local_df), "結果": "移行OK" if ok else "移行失敗"})
+                st.dataframe(pd.DataFrame(migrated), use_container_width=True, hide_index=True)
+
+
+
+HEALTH_SHEET = "健康チェック"
+EXCRETION_SHEET = "排泄チェック"
+USER_SHEET = "利用者マスタ"
+
+DEFAULT_USERS = [
+    "さくら様",
+    "谷様",
+    "磯崎様",
+    "川上様",
+    "和波様",
+    "桜井様",
+    "國枝様",
+    "中野様",
+    "山口様",
+]
+
+ASSESSMENT_COLUMNS = [
+    "基本情報",
+    "主訴",
+    "生活状況",
+    "ADL",
+    "IADL",
+    "認知機能",
+    "健康状態",
+    "課題",
+    "支援内容",
+]
+
+HEALTH_COLUMNS = [
+    "記録日",
+    "利用者名",
+    "user_id",
+    "体温",
+    "血圧上",
+    "血圧下",
+    "脈拍",
+    "SpO2",
+    "体重",
+    "朝食摂取率",
+    "昼食摂取率",
+    "夕食摂取率",
+    # LIFE向け標準化項目（コード化しやすい入力基準）
+    "朝食摂取区分",
+    "昼食摂取区分",
+    "夕食摂取区分",
+    "水分摂取量ml",
+    "栄養リスク",
+    "口腔状態",
+    "義歯使用",
+    "LIFE補助メモ",
+    # 現場の自由記述は残す
+    "家族共有メモ",
+    "気になる変化",
+    "登録日時",
+    "入力者",
+]
+
+EXCRETION_SLOTS = [
+    ("午前", "9時?12時"),
+    ("午後", "12時?15時"),
+    ("夕方", "15時?17時"),
+    ("夜", "18時?22時"),
+    ("深夜", "22時?5時"),
+    ("朝方", "5時?8時"),
+]
+
+URINE_AMOUNT_OPTIONS = ["なし", "少", "中", "大"]
+URINE_TYPE_OPTIONS = ["なし", "普通尿", "濃縮尿"]
+STOOL_AMOUNT_OPTIONS = ["なし", "少", "中", "大"]
+STOOL_TYPE_OPTIONS = ["なし", "普通便", "下痢便", "水様便"]
+
+# LIFE向けの標準化コード。画面では日本語で選び、保存時にコードも残す。
+MEAL_INTAKE_OPTIONS = [
+    "1: 全量（90%以上）",
+    "2: 7〜8割（70〜89%）",
+    "3: 半量（40〜69%）",
+    "4: 1〜3割（1〜39%）",
+    "5: 未摂取（0%）",
+]
+MEAL_INTAKE_PERCENT = {
+    "1: 全量（90%以上）": 100,
+    "2: 7〜8割（70〜89%）": 80,
+    "3: 半量（40〜69%）": 50,
+    "4: 1〜3割（1〜39%）": 30,
+    "5: 未摂取（0%）": 0,
+}
+NUTRITION_RISK_OPTIONS = ["0: 通常", "1: 注意", "2: 低下傾向あり", "3: 要確認"]
+ORAL_STATUS_OPTIONS = ["0: 通常", "1: 口腔内汚れあり", "2: むせあり", "3: 痛み・出血等あり", "9: 未確認"]
+DENTURE_OPTIONS = ["0: なし", "1: あり（問題なし）", "2: あり（不具合あり）", "9: 未確認"]
+
+URINE_AMOUNT_CODE = {"なし": "0", "少": "1", "中": "2", "大": "3"}
+URINE_TYPE_CODE = {"なし": "0", "普通尿": "1", "濃縮尿": "2"}
+STOOL_AMOUNT_CODE = {"なし": "0", "少": "1", "中": "2", "大": "3"}
+STOOL_TYPE_CODE = {"なし": "0", "普通便": "1", "硬便": "2", "下痢便": "3", "水様便": "4"}
+
+ADL_LEVEL_OPTIONS = ["1: 自立", "2: 見守り", "3: 一部介助", "4: 全介助", "9: 未確認"]
+COGNITIVE_OPTIONS = ["0: 普段通り", "1: 物忘れ・混乱あり", "2: 不安・拒否あり", "3: 昼夜逆転・不眠傾向", "9: 未確認"]
+
+EXCRETION_COLUMNS = [
+    "記録日",
+    "利用者名",
+    "user_id",
+    "時間帯",
+    "時間帯目安",
+    "尿量",
+    "尿量コード",
+    "尿性状",
+    "尿性状コード",
+    "便量",
+    "便量コード",
+    "便性状",
+    "便性状コード",
+    "排泄メモ",
+    "入力者",
+    "登録日時",
+]
+
+USER_COLUMNS = ["user_id", "利用者名", "表示"] + ASSESSMENT_COLUMNS
+
+BUSINESS_HANDOVER_COLUMNS = [
+    "記録ID",
+    "日付",
+    "勤務帯",
+    "記入者",
+    "対象区分",
+    "user_id",
+    "利用者名",
+    "全体申し送り",
+    "要確認事項",
+    "優先度",
+    "対応状況",
+    "写真1",
+    "写真2",
+    "Excel自動抽出情報",
+    "入力Excelファイル",
+    "入力Excel表示情報",
+    "記録日時",
+]
+
+ALERT_CONDITION_COLUMNS = [
+    "条件ID",
+    "使用",
+    "条件名",
+    "重要度",
+    "分類",
+    "条件種別",
+    "閾値1",
+    "閾値2",
+    "日数",
+    "キーワード",
+    "表示メッセージ",
+    "並び順",
+]
+
+ACCOUNT_COLUMNS = [
+    "ログインID",
+    "表示名",
+    "パスワードハッシュ",
+    "権限",
+    "状態",
+    "備考",
+    "作成日時",
+    "更新日時",
+    "初回パスワード変更必須",
+    "最終パスワード変更日時",
+]
+
+LOGIN_HISTORY_COLUMNS = [
+    "日時",
+    "ログインID",
+    "表示名",
+    "権限",
+    "結果",
+    "メモ",
+]
+
+USER_NAME_ALIAS_COLUMNS = [
+    "alias_id",
+    "表記ゆれ名",
+    "紐づけ先 user_id",
+    "正式利用者名",
+    "有効/無効",
+    "備考",
+    "更新日時",
+    "更新者",
+]
+
+DEFAULT_ALERT_CONDITIONS = [
+    {"条件ID": "C001", "使用": True, "条件名": "未排便3日", "重要度": "注意", "分類": "排泄", "条件種別": "未排便", "閾値1": 3, "閾値2": "", "日数": 3, "キーワード": "", "表示メッセージ": "直近{日数}日間、排便記録がありません。水分・食事量・腹部症状を確認してください。", "並び順": 10},
+    {"条件ID": "C002", "使用": True, "条件名": "水様便・下痢便あり", "重要度": "注意", "分類": "排泄", "条件種別": "便性状", "閾値1": "", "閾値2": "", "日数": 1, "キーワード": "水様便,下痢便", "表示メッセージ": "水様便・下痢便の記録があります。回数・腹部症状・感染症状を確認してください。", "並び順": 20},
+    {"条件ID": "C003", "使用": True, "条件名": "濃縮尿あり", "重要度": "観察", "分類": "排泄", "条件種別": "尿性状", "閾値1": "", "閾値2": "", "日数": 1, "キーワード": "濃縮尿", "表示メッセージ": "濃縮尿の記録があります。水分摂取量や発熱の有無を確認してください。", "並び順": 30},
+    {"条件ID": "C004", "使用": True, "条件名": "食事量50%以下", "重要度": "観察", "分類": "食事", "条件種別": "食事低下", "閾値1": 50, "閾値2": "", "日数": 1, "キーワード": "", "表示メッセージ": "食事摂取率が{閾値1}%以下です。食欲・口腔状態・体調変化を確認してください。", "並び順": 40},
+    {"条件ID": "C005", "使用": True, "条件名": "食事量50%以下が2日続く", "重要度": "注意", "分類": "食事", "条件種別": "食事低下連続", "閾値1": 50, "閾値2": "", "日数": 2, "キーワード": "", "表示メッセージ": "食事摂取率{閾値1}%以下が{日数}日続いています。継続観察と共有が必要です。", "並び順": 50},
+    {"条件ID": "C006", "使用": True, "条件名": "発熱37.5℃以上", "重要度": "注意", "分類": "バイタル", "条件種別": "発熱", "閾値1": 37.5, "閾値2": "", "日数": 1, "キーワード": "", "表示メッセージ": "体温が{閾値1}℃以上です。再検・水分・食事・普段との違いを確認してください。", "並び順": 60},
+    {"条件ID": "C007", "使用": True, "条件名": "SpO2 93%以下", "重要度": "注意", "分類": "バイタル", "条件種別": "SpO2低下", "閾値1": 93, "閾値2": "", "日数": 1, "キーワード": "", "表示メッセージ": "SpO2が{閾値1}%以下です。再測定・呼吸状態・顔色・傾眠の有無を確認してください。", "並び順": 70},
+    {"条件ID": "C008", "使用": True, "条件名": "血圧上160以上", "重要度": "観察", "分類": "バイタル", "条件種別": "血圧高値", "閾値1": 160, "閾値2": "", "日数": 1, "キーワード": "", "表示メッセージ": "血圧上が{閾値1}以上です。再測定と普段との差を確認してください。", "並び順": 80},
+    {"条件ID": "C009", "使用": True, "条件名": "1週間で体重1kg以上減少", "重要度": "観察", "分類": "体重", "条件種別": "体重減少", "閾値1": 1.0, "閾値2": "", "日数": 7, "キーワード": "", "表示メッセージ": "直近{日数}日で体重が{閾値1}kg以上減少しています。食事量・水分・むくみ等を確認してください。", "並び順": 90},
+    {"条件ID": "C010", "使用": True, "条件名": "気になる変化キーワード", "重要度": "注意", "分類": "変化", "条件種別": "キーワード", "閾値1": "", "閾値2": "", "日数": 1, "キーワード": "不穏,傾眠,ふらつき,転倒,食欲なし,いつもと違う,拒否,痛み,息苦しい", "表示メッセージ": "気になる変化に注意キーワードがあります：{該当内容}", "並び順": 100},
+    {"条件ID": "C011", "使用": True, "条件名": "発熱＋食事低下", "重要度": "至急", "分類": "複合", "条件種別": "複合:発熱+食事低下", "閾値1": 37.5, "閾値2": 50, "日数": 1, "キーワード": "", "表示メッセージ": "発熱と食事量低下が重なっています。体調変化として優先的に共有してください。", "並び順": 110},
+    {"条件ID": "C012", "使用": True, "条件名": "濃縮尿＋食事水分低下", "重要度": "注意", "分類": "複合", "条件種別": "複合:濃縮尿+食事低下", "閾値1": 50, "閾値2": "", "日数": 1, "キーワード": "", "表示メッセージ": "濃縮尿と食事量低下が重なっています。脱水傾向に注意して水分摂取を確認してください。", "並び順": 120},
+    {"条件ID": "C013", "使用": True, "条件名": "SpO2低下＋傾眠等", "重要度": "至急", "分類": "複合", "条件種別": "複合:SpO2低下+キーワード", "閾値1": 93, "閾値2": "", "日数": 1, "キーワード": "傾眠,息苦しい,顔色,呼吸,ぐったり", "表示メッセージ": "SpO2低下と気になる変化が重なっています。呼吸状態を優先確認してください。", "並び順": 130},
+]
+
+SHORT_GOAL_MASTER_COLUMNS = [
+    "目標ID",
+    "利用者名",
+    "user_id",
+    "短期目標",
+    "支援内容",
+    "開始日",
+    "終了予定日",
+    "状態",
+    "備考",
+    "登録日時",
+]
+
+SHORT_GOAL_CHECK_COLUMNS = [
+    "記録ID",
+    "日付",
+    "利用者名",
+    "user_id",
+    "目標ID",
+    "短期目標",
+    "実施状況",
+    "本人の様子",
+    "未実施理由",
+    "職員メモ",
+    "入力職員",
+    "モニタリング反映",
+    "登録日時",
+]
+
+MONITORING_DRAFT_COLUMNS = [
+    "下書きID",
+    "作成日",
+    "対象月",
+    "利用者名",
+    "user_id",
+    "短期目標",
+    "実施率",
+    "実施回数",
+    "一部実施回数",
+    "未実施回数",
+    "本人の様子まとめ",
+    "未実施理由まとめ",
+    "モニタリング下書き",
+    "今後の方向性",
+    "作成日時",
+]
+
+
+LIFE_ADL_COLUMNS = [
+    "評価ID",
+    "評価日",
+    "対象月",
+    "利用者名",
+    "user_id",
+    "歩行",
+    "移乗",
+    "食事動作",
+    "排泄動作",
+    "更衣",
+    "認知・行動",
+    "評価メモ",
+    "入力者",
+    "登録日時",
+]
+
+
+# =========================
+# 共通関数
+# =========================
+def ensure_dirs():
+    DATA_DIR.mkdir(exist_ok=True)
+    REPORT_DIR.mkdir(exist_ok=True)
+    BUSINESS_HANDOVER_PHOTO_DIR.mkdir(parents=True, exist_ok=True)
+    BUSINESS_HANDOVER_EXCEL_DIR.mkdir(parents=True, exist_ok=True)
+
+
+def clean_text(value, default=""):
+    try:
+        if pd.isna(value):
+            return default
+    except Exception:
+        pass
+
+    text = str(value).strip()
+    if text.lower() in ["nan", "none", "nat"]:
+        return default
+    return text
+
+
+def safe_float(value, default=0.0):
+    try:
+        if pd.isna(value) or value == "":
+            return default
+        return float(value)
+    except Exception:
+        return default
+
+
+def safe_int(value, default=0):
+    try:
+        if pd.isna(value) or value == "":
+            return default
+        return int(float(value))
+    except Exception:
+        return default
+
+
+def to_number(series):
+    return pd.to_numeric(series, errors="coerce")
+
+
+def make_date_user_key(record_date, user_name):
+    d = pd.to_datetime(record_date, errors="coerce")
+    if pd.isna(d):
+        return ""
+    return f"{d.strftime('%Y-%m-%d')}__{clean_text(user_name)}"
+
+
+def make_excretion_key(record_date, user_name, slot):
+    d = pd.to_datetime(record_date, errors="coerce")
+    if pd.isna(d):
+        return ""
+    return f"{d.strftime('%Y-%m-%d')}__{clean_text(user_name)}__{clean_text(slot)}"
+
+
+def get_option_index(options, value, default="なし"):
+    value = clean_text(value, default)
+    if value in options:
+        return options.index(value)
+    if default in options:
+        return options.index(default)
+    return 0
+
+
+def get_life_option_index(options, value, default_index=0):
+    """保存済みの値が完全一致または先頭コード一致する場合に選択肢位置を返す。"""
+    value = clean_text(value)
+    if value in options:
+        return options.index(value)
+    if value:
+        code = value.split(":")[0].strip()
+        for i, opt in enumerate(options):
+            if opt.split(":")[0].strip() == code:
+                return i
+    return default_index
+
+
+def meal_option_from_percent(percent):
+    value = safe_int(percent, 80)
+    if value >= 90:
+        return "1: 全量（90%以上）"
+    if value >= 70:
+        return "2: 7〜8割（70〜89%）"
+    if value >= 40:
+        return "3: 半量（40〜69%）"
+    if value >= 1:
+        return "4: 1〜3割（1〜39%）"
+    return "5: 未摂取（0%）"
+
+
+def option_code(option_text):
+    return clean_text(option_text).split(":")[0].strip()
+
+
+
+# =========================
+# Ver4.0 利用者ID移行準備
+# =========================
+def normalize_user_name_for_match(name: str) -> str:
+    """利用者名の表記ゆれ確認用。保存値は変えず、照合だけに使う。"""
+    text = clean_text(name)
+    text = re.sub(r"\s+", "", text)
+    text = text.replace("　", "")
+    text = text.replace("様", "").replace("さん", "").replace("殿", "")
+    return text.lower()
+
+
+def make_user_id_from_name(user_name: str) -> str:
+    """既存利用者名から安定したuser_idを生成する。"""
+    base = normalize_user_name_for_match(user_name) or clean_text(user_name)
+    digest = hashlib.sha1(base.encode("utf-8")).hexdigest()[:12]
+    return f"usr_{digest}"
+
+
+def ensure_user_id_value(user_id, user_name) -> str:
+    user_id = clean_text(user_id)
+    return user_id if user_id else make_user_id_from_name(user_name)
+
+
+def ensure_user_name_alias_table():
+    """利用者名ゆれ紐づけマスタをSQLiteに用意する。"""
+    try:
+        if not sqlite_table_exists(SQLITE_TABLE_USER_NAME_ALIASES):
+            save_sqlite_table(
+                pd.DataFrame(columns=USER_NAME_ALIAS_COLUMNS),
+                SQLITE_TABLE_USER_NAME_ALIASES,
+                USER_NAME_ALIAS_COLUMNS,
+                unique_cols=["alias_id"],
+            )
+    except Exception:
+        pass
+
+
+def normalize_user_name_alias_df(df: pd.DataFrame) -> pd.DataFrame:
+    """表記ゆれマスタの列・値を整える。"""
+    if df is None:
+        df = pd.DataFrame(columns=USER_NAME_ALIAS_COLUMNS)
+    work = df.copy()
+    for col in USER_NAME_ALIAS_COLUMNS:
+        if col not in work.columns:
+            work[col] = ""
+    work = work[USER_NAME_ALIAS_COLUMNS].copy()
+    work["alias_id"] = work["alias_id"].map(lambda x: clean_text(x))
+    work["表記ゆれ名"] = work["表記ゆれ名"].map(lambda x: clean_text(x))
+    work["紐づけ先 user_id"] = work["紐づけ先 user_id"].map(lambda x: clean_text(x))
+    work["正式利用者名"] = work["正式利用者名"].map(lambda x: clean_text(x))
+    work["有効/無効"] = work["有効/無効"].map(lambda x: clean_text(x, "有効"))
+    work.loc[~work["有効/無効"].isin(["有効", "無効"]), "有効/無効"] = "有効"
+    work["備考"] = work["備考"].map(lambda x: clean_text(x))
+    work["更新日時"] = work["更新日時"].map(lambda x: clean_text(x))
+    work["更新者"] = work["更新者"].map(lambda x: clean_text(x))
+    # 空の表記ゆれ名は除外。同じ表記ゆれ名は最後の設定を優先。
+    work = work[work["表記ゆれ名"] != ""].copy()
+    for idx, row in work.iterrows():
+        if not clean_text(row.get("alias_id")):
+            source = f"{clean_text(row.get('表記ゆれ名'))}__{clean_text(row.get('紐づけ先 user_id'))}"
+            work.at[idx, "alias_id"] = "alias_" + hashlib.sha1(source.encode("utf-8")).hexdigest()[:12]
+    work = work.drop_duplicates(subset=["表記ゆれ名"], keep="last")
+    return work.reset_index(drop=True)
+
+
+def load_user_name_aliases(include_disabled=False) -> pd.DataFrame:
+    ensure_user_name_alias_table()
+    df = load_sqlite_table(SQLITE_TABLE_USER_NAME_ALIASES, USER_NAME_ALIAS_COLUMNS)
+    df = normalize_user_name_alias_df(df)
+    if not include_disabled:
+        df = df[df["有効/無効"] == "有効"].copy()
+    return df.reset_index(drop=True)
+
+
+def save_user_name_aliases(df: pd.DataFrame):
+    work = normalize_user_name_alias_df(df)
+    save_sqlite_table(work, SQLITE_TABLE_USER_NAME_ALIASES, USER_NAME_ALIAS_COLUMNS, unique_cols=["alias_id"])
+
+
+def build_user_name_to_id_map(include_hidden=True, include_aliases=True) -> dict:
+    """
+    利用者名→user_idの対応表を作る。
+    安全のため、正式利用者名は原則「完全一致」のみ。
+    表記ゆれは、管理者が利用者名ゆれ紐づけマスタで有効登録したものだけ自動補完する。
+    """
+    try:
+        users = load_users(include_hidden=include_hidden)
+    except Exception:
+        users = pd.DataFrame(columns=USER_COLUMNS)
+    mapping = {}
+    official_by_id = {}
+    for _, row in users.iterrows():
+        name = clean_text(row.get("利用者名"))
+        uid = ensure_user_id_value(row.get("user_id", ""), name)
+        if name and uid:
+            mapping[name] = uid
+            official_by_id[uid] = name
+
+    if include_aliases:
+        try:
+            aliases = load_user_name_aliases(include_disabled=False)
+            for _, row in aliases.iterrows():
+                alias_name = clean_text(row.get("表記ゆれ名"))
+                uid = clean_text(row.get("紐づけ先 user_id"))
+                if alias_name and uid and uid in official_by_id:
+                    # 表記ゆれ名は完全一致・照合キー一致の両方を登録するが、管理者登録済みのものに限る。
+                    mapping[alias_name] = uid
+                    mapping[normalize_user_name_for_match(alias_name)] = uid
+        except Exception:
+            pass
+    return mapping
+
+
+def attach_user_ids(df: pd.DataFrame, name_col="利用者名", id_col="user_id") -> pd.DataFrame:
+    """
+    既存データへuser_id列を安全に補完する。
+    正式利用者名の完全一致、または管理者が登録した表記ゆれマスタに一致した場合のみ補完する。
+    未確認の名称は空欄のまま残し、管理者の確認対象にする。
+    """
+    if df is None:
+        return df
+    work = df.copy()
+    if id_col not in work.columns:
+        work[id_col] = ""
+    if name_col not in work.columns:
+        return work
+    mapping = build_user_name_to_id_map(include_hidden=True, include_aliases=True)
+
+    def resolve(row):
+        existing = clean_text(row.get(id_col, ""))
+        if existing:
+            return existing
+        name = clean_text(row.get(name_col, ""))
+        return mapping.get(name) or mapping.get(normalize_user_name_for_match(name)) or ""
+
+    if not work.empty:
+        work[id_col] = work.apply(resolve, axis=1)
+    return work
+
+
+def get_user_id_by_name(user_name: str) -> str:
+    mapping = build_user_name_to_id_map(include_hidden=True, include_aliases=True)
+    name = clean_text(user_name)
+    return mapping.get(name) or mapping.get(normalize_user_name_for_match(name)) or ""
+
+
+def get_user_name_by_id(user_id: str) -> str:
+    user_id = clean_text(user_id)
+    if not user_id:
+        return ""
+    try:
+        users = load_users(include_hidden=True)
+        hit = users[users["user_id"].astype(str) == user_id]
+        if not hit.empty:
+            return clean_text(hit.iloc[0].get("利用者名"))
+    except Exception:
+        pass
+    return ""
+
+def build_handover_target_options():
+    """業務全体申し送り用の対象選択肢を作る。先頭は施設全体の申し送り。"""
+    options = ["業務全般"]
+    try:
+        users = load_users(include_hidden=False)
+        if not users.empty:
+            for _, row in users.iterrows():
+                name = clean_text(row.get("利用者名"))
+                uid = clean_text(row.get("user_id"))
+                if name:
+                    options.append(f"{name}（ID:{uid}）" if uid else name)
+    except Exception:
+        pass
+    return options
+
+
+def resolve_handover_target(selection_text: str) -> tuple[str, str, str]:
+    """対象選択肢から 対象区分・user_id・利用者名 を返す。"""
+    value = clean_text(selection_text, "業務全般")
+    if value == "業務全般":
+        return "業務全般", "", "業務全般"
+
+    # 「山田様（ID:usr_xxx）」形式からIDを拾う
+    m = re.search(r"（ID:(.*?)）", value)
+    user_id = clean_text(m.group(1)) if m else ""
+    user_name = re.sub(r"（ID:.*?）", "", value).strip()
+
+    if not user_id and user_name:
+        user_id = get_user_id_by_name(user_name)
+    if not user_name and user_id:
+        user_name = get_user_name_by_id(user_id)
+
+    return "利用者", user_id, user_name
+
+
+def make_handover_target_label(user_id: str, user_name: str, target_type: str = "") -> str:
+    """保存済みの対象情報から画面用ラベルを作る。"""
+    target_type = clean_text(target_type)
+    user_id = clean_text(user_id)
+    user_name = clean_text(user_name)
+    if target_type == "業務全般" or (not user_id and (not user_name or user_name == "業務全般")):
+        return "業務全般"
+    if user_name and user_id:
+        return f"{user_name}（ID:{user_id}）"
+    return user_name or "業務全般"
+
+
+
+def apply_user_id_migration_preview():
+    """主要テーブルの利用者名→user_id補完状況を確認する。保存はしない。"""
+    targets = [
+        ("健康チェック", SQLITE_TABLE_HEALTH, HEALTH_COLUMNS, ["記録日", "利用者名"]),
+        ("排泄チェック", SQLITE_TABLE_EXCRETION, EXCRETION_COLUMNS, ["記録日", "利用者名", "時間帯"]),
+        ("短期目標マスタ", SQLITE_TABLE_SHORT_GOAL_MASTER, SHORT_GOAL_MASTER_COLUMNS, ["目標ID"]),
+        ("短期目標実施", SQLITE_TABLE_SHORT_GOAL_CHECKS, SHORT_GOAL_CHECK_COLUMNS, ["記録ID"]),
+        ("モニタリング下書き", SQLITE_TABLE_MONITORING_DRAFTS, MONITORING_DRAFT_COLUMNS, ["下書きID"]),
+        ("LIFE ADL評価", SQLITE_TABLE_LIFE_ADL, LIFE_ADL_COLUMNS, ["評価ID"]),
+    ]
+    rows = []
+    for label, table, columns, key_cols in targets:
+        try:
+            df = load_sqlite_table(table, columns)
+            before_missing = 0 if "user_id" not in df.columns else int((df["user_id"].astype(str).str.strip() == "").sum())
+            after_df = attach_user_ids(df)
+            after_missing = int((after_df["user_id"].astype(str).str.strip() == "").sum()) if "user_id" in after_df.columns else len(after_df)
+            rows.append({
+                "対象": label,
+                "テーブル": table,
+                "件数": len(df),
+                "移行前 user_id空欄": before_missing,
+                "移行後 user_id空欄見込み": after_missing,
+                "状態": "OK" if after_missing == 0 else "要確認",
+            })
+        except Exception as e:
+            rows.append({"対象": label, "テーブル": table, "件数": 0, "移行前 user_id空欄": "", "移行後 user_id空欄見込み": "", "状態": f"エラー: {e}"})
+    return pd.DataFrame(rows)
+
+
+def run_user_id_migration_apply():
+    """主要テーブルにuser_id列を追加・補完する。画面表示の利用者名は残す。"""
+    # 利用者マスタを先に正規化保存
+    users = load_users(include_hidden=True)
+    save_users(users)
+
+    targets = [
+        (SQLITE_TABLE_HEALTH, HEALTH_COLUMNS, ["記録日"], ["記録日", "利用者名"]),
+        (SQLITE_TABLE_EXCRETION, EXCRETION_COLUMNS, ["記録日"], ["記録日", "利用者名", "時間帯"]),
+        (SQLITE_TABLE_SHORT_GOAL_MASTER, SHORT_GOAL_MASTER_COLUMNS, ["開始日", "終了予定日"], ["目標ID"]),
+        (SQLITE_TABLE_SHORT_GOAL_CHECKS, SHORT_GOAL_CHECK_COLUMNS, ["日付"], ["記録ID"]),
+        (SQLITE_TABLE_MONITORING_DRAFTS, MONITORING_DRAFT_COLUMNS, ["作成日"], ["下書きID"]),
+        (SQLITE_TABLE_LIFE_ADL, LIFE_ADL_COLUMNS, ["評価日"], ["評価ID"]),
+    ]
+    results = []
+    for table, columns, date_cols, unique_cols in targets:
+        df = load_sqlite_table(table, columns, date_cols=date_cols)
+        df = attach_user_ids(df)
+        save_sqlite_table(df, table, columns, date_cols=date_cols, unique_cols=unique_cols)
+        results.append({"テーブル": table, "件数": len(df), "結果": "user_id補完済み"})
+    try:
+        add_audit_log("利用者ID移行準備", "users", "", "主要テーブルへuser_idを補完しました")
+    except Exception:
+        pass
+    return pd.DataFrame(results)
+
+
+def build_user_name_variation_df():
+    """表記ゆれ候補を確認するための一覧を作る。"""
+    users = load_users(include_hidden=True)
+    if users.empty:
+        return pd.DataFrame(columns=["照合キー", "利用者名一覧", "件数", "状態"])
+    tmp = users.copy()
+    tmp["照合キー"] = tmp["利用者名"].map(normalize_user_name_for_match)
+    grouped = tmp.groupby("照合キー")["利用者名"].apply(lambda s: " / ".join(sorted(set([clean_text(x) for x in s if clean_text(x)])))).reset_index()
+    grouped["件数"] = grouped["利用者名"].map(lambda x: len([v for v in x.split(" / ") if v]))
+    grouped["状態"] = grouped["件数"].map(lambda n: "表記ゆれ候補" if n >= 2 else "OK")
+    return grouped.sort_values(["状態", "照合キー"], ascending=[False, True])
+
+
+def show_user_id_migration_check():
+    if not is_admin_user():
+        st.warning("このメニューは管理者専用です。")
+        return
+    st.header("利用者ID移行チェック")
+    st.caption("職員画面では今まで通り利用者名を表示し、内部保存だけ user_id で安定化するための準備画面です。")
+
+    st.subheader("1. 利用者マスタの user_id")
+    users = load_users(include_hidden=True)
+    st.dataframe(users[["user_id", "利用者名", "表示"]], use_container_width=True, hide_index=True)
+
+    st.subheader("2. 表記ゆれ候補")
+    variations = build_user_name_variation_df()
+    st.dataframe(variations, use_container_width=True, hide_index=True)
+    if not variations.empty and (variations["状態"] == "表記ゆれ候補").any():
+        st.warning("表記ゆれ候補があります。必要に応じて「利用者名ゆれ紐づけマスタ」で正式利用者に紐づけてから補完してください。")
+    else:
+        st.success("大きな表記ゆれ候補は見つかっていません。")
+
+    st.subheader("3. 主要テーブルの移行見込み")
+    preview = apply_user_id_migration_preview()
+    st.dataframe(preview, use_container_width=True, hide_index=True)
+
+    st.divider()
+    st.subheader("4. user_id補完を実行")
+    st.info("この処理は、既存の利用者名を残したまま user_id 列を補完します。画面表示や職員の入力方法は変わりません。")
+    confirm = st.checkbox("既存データへ user_id を補完することを理解しました", key="confirm_user_id_migration")
+    if st.button("利用者ID移行準備を実行", type="primary", use_container_width=True):
+        if not confirm:
+            st.error("確認チェックを入れてください。")
+        else:
+            result = run_user_id_migration_apply()
+            st.success("user_id補完を実行しました。")
+            st.dataframe(result, use_container_width=True, hide_index=True)
+            st.rerun()
+
+
+
+
+def build_unmatched_user_names_df():
+    """主要テーブルから、user_id未補完の利用者名を集める。"""
+    targets = [
+        ("健康チェック", SQLITE_TABLE_HEALTH, HEALTH_COLUMNS),
+        ("排泄チェック", SQLITE_TABLE_EXCRETION, EXCRETION_COLUMNS),
+        ("短期目標マスタ", SQLITE_TABLE_SHORT_GOAL_MASTER, SHORT_GOAL_MASTER_COLUMNS),
+        ("短期目標実施", SQLITE_TABLE_SHORT_GOAL_CHECKS, SHORT_GOAL_CHECK_COLUMNS),
+        ("モニタリング下書き", SQLITE_TABLE_MONITORING_DRAFTS, MONITORING_DRAFT_COLUMNS),
+        ("LIFE ADL評価", SQLITE_TABLE_LIFE_ADL, LIFE_ADL_COLUMNS),
+    ]
+    rows = []
+    for label, table, columns in targets:
+        try:
+            df = load_sqlite_table(table, columns)
+            if df.empty or "利用者名" not in df.columns:
+                continue
+            df = attach_user_ids(df)
+            if "user_id" not in df.columns:
+                df["user_id"] = ""
+            missing = df[df["user_id"].astype(str).str.strip() == ""]
+            for name, g in missing.groupby("利用者名", dropna=False):
+                name = clean_text(name)
+                if name:
+                    rows.append({
+                        "対象": label,
+                        "表記ゆれ名": name,
+                        "照合キー": normalize_user_name_for_match(name),
+                        "件数": len(g),
+                    })
+        except Exception:
+            pass
+    if not rows:
+        return pd.DataFrame(columns=["対象", "表記ゆれ名", "照合キー", "件数"])
+    out = pd.DataFrame(rows)
+    out = out.groupby(["表記ゆれ名", "照合キー"], as_index=False).agg({"対象": lambda s: " / ".join(sorted(set(s))), "件数": "sum"})
+    return out.sort_values(["件数", "表記ゆれ名"], ascending=[False, True]).reset_index(drop=True)
+
+
+def add_user_name_alias(alias_name, target_user_id, memo=""):
+    """管理者確認済みの表記ゆれ→user_id紐づけを追加する。"""
+    alias_name = clean_text(alias_name)
+    target_user_id = clean_text(target_user_id)
+    if not alias_name:
+        return False, "表記ゆれ名を入力してください。"
+    if not target_user_id:
+        return False, "紐づけ先利用者を選択してください。"
+    official_name = get_user_name_by_id(target_user_id)
+    if not official_name:
+        return False, "紐づけ先の正式利用者が見つかりません。"
+    if alias_name == official_name:
+        return False, "正式利用者名と同じ名前は登録不要です。"
+
+    df = load_user_name_aliases(include_disabled=True)
+    now_text = format_now_jst("%Y-%m-%d %H:%M:%S")
+    alias_id = "alias_" + hashlib.sha1(f"{alias_name}__{target_user_id}".encode("utf-8")).hexdigest()[:12]
+    # 同じ表記ゆれ名は最後の設定で上書きする。
+    df = df[df["表記ゆれ名"].astype(str) != alias_name].copy()
+    row = {
+        "alias_id": alias_id,
+        "表記ゆれ名": alias_name,
+        "紐づけ先 user_id": target_user_id,
+        "正式利用者名": official_name,
+        "有効/無効": "有効",
+        "備考": clean_text(memo),
+        "更新日時": now_text,
+        "更新者": current_login_user(),
+    }
+    df = pd.concat([df, pd.DataFrame([row], columns=USER_NAME_ALIAS_COLUMNS)], ignore_index=True)
+    save_user_name_aliases(df)
+    try:
+        add_audit_log("利用者名ゆれ紐づけ登録", SQLITE_TABLE_USER_NAME_ALIASES, alias_name, f"{alias_name} → {target_user_id} {official_name}")
+    except Exception:
+        pass
+    return True, f"{alias_name} → {official_name} として登録しました。"
+
+
+def apply_user_name_aliases_to_records():
+    """登録済みの表記ゆれマスタに基づき、未補完user_idだけを補完する。"""
+    targets = [
+        (SQLITE_TABLE_HEALTH, HEALTH_COLUMNS, ["記録日"], ["記録日", "利用者名"]),
+        (SQLITE_TABLE_EXCRETION, EXCRETION_COLUMNS, ["記録日"], ["記録日", "利用者名", "時間帯"]),
+        (SQLITE_TABLE_SHORT_GOAL_MASTER, SHORT_GOAL_MASTER_COLUMNS, ["開始日", "終了予定日"], ["目標ID"]),
+        (SQLITE_TABLE_SHORT_GOAL_CHECKS, SHORT_GOAL_CHECK_COLUMNS, ["日付"], ["記録ID"]),
+        (SQLITE_TABLE_MONITORING_DRAFTS, MONITORING_DRAFT_COLUMNS, ["作成日"], ["下書きID"]),
+        (SQLITE_TABLE_LIFE_ADL, LIFE_ADL_COLUMNS, ["評価日"], ["評価ID"]),
+    ]
+    rows = []
+    for table, columns, date_cols, unique_cols in targets:
+        df = load_sqlite_table(table, columns, date_cols=date_cols)
+        before = 0 if "user_id" not in df.columns else int((df["user_id"].astype(str).str.strip() == "").sum())
+        df2 = attach_user_ids(df)
+        after = int((df2["user_id"].astype(str).str.strip() == "").sum()) if "user_id" in df2.columns else len(df2)
+        save_sqlite_table(df2, table, columns, date_cols=date_cols, unique_cols=unique_cols)
+        rows.append({"テーブル": table, "件数": len(df2), "補完前未紐づけ": before, "補完後未紐づけ": after, "今回補完": max(before - after, 0)})
+    try:
+        add_audit_log("利用者名ゆれ紐づけ適用", SQLITE_TABLE_USER_NAME_ALIASES, "", "表記ゆれマスタに基づいて未補完user_idを補完")
+    except Exception:
+        pass
+    return pd.DataFrame(rows)
+
+
+def show_user_name_alias_master_menu():
+    """管理者確認済みの利用者名ゆれ紐づけマスタ。"""
+    if not is_admin_user():
+        st.warning("このメニューは管理者専用です。")
+        return
+
+    st.header("利用者名ゆれ紐づけマスタ")
+    st.caption("完全自動ではなく、管理者が確認した表記ゆれだけを user_id に紐づけます。正式な利用者名は画面表示に残し、内部だけ安全に統一します。")
+
+    tab1, tab2, tab3 = st.tabs(["未紐づけ候補", "マスタ編集", "補完実行"])
+
+    users = load_users(include_hidden=True)
+    user_options = []
+    user_label_to_id = {}
+    for _, row in users.iterrows():
+        uid = ensure_user_id_value(row.get("user_id", ""), row.get("利用者名", ""))
+        name = clean_text(row.get("利用者名"))
+        if uid and name:
+            label = f"{name}（{uid}）"
+            user_options.append(label)
+            user_label_to_id[label] = uid
+
+    with tab1:
+        st.subheader("未紐づけ候補")
+        st.info("ここに出る名前は、まだ正式利用者または登録済み表記ゆれに紐づいていない名称です。内容を確認して、必要なものだけマスタ登録してください。")
+        unmatched = build_unmatched_user_names_df()
+        if unmatched.empty:
+            st.success("未紐づけ候補はありません。")
+        else:
+            st.dataframe(unmatched, use_container_width=True, hide_index=True)
+            selected_alias = st.selectbox("登録する表記ゆれ名", unmatched["表記ゆれ名"].tolist(), key="alias_candidate_select")
+            selected_user = st.selectbox("紐づけ先の正式利用者", user_options, key="alias_candidate_user_select") if user_options else ""
+            memo = st.text_input("備考", value="未紐づけ候補から登録", key="alias_candidate_memo")
+            if st.button("この候補を紐づけマスタへ登録", type="primary", use_container_width=True):
+                ok, msg = add_user_name_alias(selected_alias, user_label_to_id.get(selected_user, ""), memo)
+                if ok:
+                    st.success(msg)
+                    st.rerun()
+                else:
+                    st.error(msg)
+
+    with tab2:
+        st.subheader("マスタ編集")
+        aliases = load_user_name_aliases(include_disabled=True)
+        st.caption("表記ゆれ名を直接追加・無効化できます。紐づけ先 user_id は上の候補登録を使うと安全です。")
+        edited = st.data_editor(
+            aliases,
+            use_container_width=True,
+            hide_index=True,
+            num_rows="dynamic",
+            column_config={
+                "有効/無効": st.column_config.SelectboxColumn("有効/無効", options=["有効", "無効"]),
+                "紐づけ先 user_id": st.column_config.TextColumn("紐づけ先 user_id"),
+                "正式利用者名": st.column_config.TextColumn("正式利用者名"),
+            },
+            key="user_name_alias_editor",
+        )
+        if st.button("マスタを保存", type="primary", use_container_width=True):
+            work = normalize_user_name_alias_df(edited)
+            # user_idから正式利用者名を補完する。存在しないuser_idは保存前に警告。
+            valid_ids = set(users["user_id"].astype(str).tolist()) if "user_id" in users.columns else set()
+            invalid = work[(work["紐づけ先 user_id"].astype(str) != "") & (~work["紐づけ先 user_id"].astype(str).isin(valid_ids))]
+            if not invalid.empty:
+                st.error("存在しない user_id が含まれています。候補登録から選ぶか、正式な user_id に修正してください。")
+                st.dataframe(invalid, use_container_width=True, hide_index=True)
+            else:
+                for idx, row in work.iterrows():
+                    uid = clean_text(row.get("紐づけ先 user_id"))
+                    name = get_user_name_by_id(uid)
+                    if name:
+                        work.at[idx, "正式利用者名"] = name
+                    work.at[idx, "更新日時"] = format_now_jst("%Y-%m-%d %H:%M:%S")
+                    work.at[idx, "更新者"] = current_login_user()
+                save_user_name_aliases(work)
+                add_audit_log("利用者名ゆれ紐づけマスタ保存", SQLITE_TABLE_USER_NAME_ALIASES, "", "マスタを保存")
+                st.success("利用者名ゆれ紐づけマスタを保存しました。")
+                st.rerun()
+
+    with tab3:
+        st.subheader("登録済みマスタを既存データへ適用")
+        st.warning("この処理は、登録済みの表記ゆれマスタに一致した未補完データだけ user_id を入れます。名称自体は書き換えません。")
+        preview = apply_user_id_migration_preview()
+        st.dataframe(preview, use_container_width=True, hide_index=True)
+        confirm = st.checkbox("管理者が確認した紐づけマスタだけを既存データへ適用する", key="confirm_apply_aliases")
+        if st.button("利用者名ゆれ紐づけを適用", type="primary", use_container_width=True):
+            if not confirm:
+                st.error("確認チェックを入れてください。")
+            else:
+                result = apply_user_name_aliases_to_records()
+                st.success("登録済みの表記ゆれマスタに基づいて user_id を補完しました。")
+                st.dataframe(result, use_container_width=True, hide_index=True)
+                st.rerun()
+
+
+# =========================
+# Ver4.2 体重は「測定した日だけ入力」
+# =========================
+def parse_optional_weight(value):
+    """体重は毎日必須にせず、未測定なら空欄で保存する。"""
+    text = clean_text(value)
+    if text == "":
+        return "", ""
+    text = text.replace("kg", "").replace("ＫＧ", "").replace("ｋｇ", "").strip()
+    try:
+        weight = float(text)
+    except Exception:
+        return "", "体重は数値で入力してください。未測定の場合は空欄でOKです。"
+    if weight <= 0:
+        return "", "体重は0より大きい数値で入力してください。未測定の場合は空欄でOKです。"
+    if weight > 200:
+        return "", "体重が200kgを超えています。入力値を確認してください。"
+    return round(weight, 1), ""
+
+
+def format_weight_value(value):
+    w = safe_float(value, 0)
+    if w <= 0:
+        return ""
+    return f"{w:.1f}"
+
+
+def build_latest_weight_summary(health_df, users=None, target_date=None):
+    """利用者ごとの最新体重を返す。体重0・空欄は未測定として扱う。"""
+    if target_date is None:
+        target_date = today_jst()
+    try:
+        target_date = pd.to_datetime(target_date).date()
+    except Exception:
+        target_date = today_jst()
+
+    users = users or []
+    rows = []
+    work = health_df.copy() if health_df is not None else pd.DataFrame(columns=HEALTH_COLUMNS)
+    if not work.empty:
+        work["記録日"] = pd.to_datetime(work["記録日"], errors="coerce")
+        work["体重_num"] = pd.to_numeric(work.get("体重", ""), errors="coerce")
+        work = work[(work["記録日"].notna()) & (work["体重_num"].notna()) & (work["体重_num"] > 0)].copy()
+
+    for user in users:
+        user = clean_text(user)
+        if not user:
+            continue
+        latest = pd.DataFrame()
+        if not work.empty and "利用者名" in work.columns:
+            latest = work[work["利用者名"].astype(str).str.strip() == user].sort_values("記録日")
+        if latest.empty:
+            rows.append({
+                "利用者名": user,
+                "最新体重": "未測定",
+                "測定日": "",
+                "経過日数": "",
+                "状態": "体重記録なし",
+            })
+        else:
+            r = latest.iloc[-1]
+            measured_date = pd.to_datetime(r.get("記録日"), errors="coerce").date()
+            days = (target_date - measured_date).days
+            rows.append({
+                "利用者名": user,
+                "最新体重": f"{float(r.get('体重_num')):.1f}kg",
+                "測定日": measured_date.strftime("%Y/%m/%d"),
+                "経過日数": f"{days}日前" if days >= 0 else "確認日より後",
+                "状態": "14日以上未測定" if days >= 14 else "OK",
+            })
+    return pd.DataFrame(rows, columns=["利用者名", "最新体重", "測定日", "経過日数", "状態"])
+
+
+def build_weight_not_measured_users(health_df, users=None, target_date=None, threshold_days=14):
+    """14日以上体重未測定、または体重記録なしの利用者を返す。"""
+    summary = build_latest_weight_summary(health_df, users, target_date)
+    if summary.empty:
+        return summary
+
+    def is_overdue(row):
+        status = clean_text(row.get("状態"))
+        if status == "体重記録なし":
+            return True
+        days_text = clean_text(row.get("経過日数"))
+        m = re.search(r"(\d+)", days_text)
+        return bool(m and int(m.group(1)) >= threshold_days)
+
+    out = summary[summary.apply(is_overdue, axis=1)].copy()
+    if not out.empty:
+        out["確認すること"] = "体重測定の予定を確認してください。未測定には理由がある場合があります。"
+    return out
+
+
+def show_latest_weight_block(health_df, users=None, target_date=None):
+    st.subheader("最新体重")
+    st.caption("体重は毎日入力ではなく、測定した日だけ入力します。最新の測定値を確認します。")
+    summary = build_latest_weight_summary(health_df, users, target_date)
+    if summary.empty:
+        st.info("利用者または健康チェックデータがありません。")
+    else:
+        st.dataframe(summary, use_container_width=True, hide_index=True)
+
+
+def show_weight_overdue_block(health_df, users=None, target_date=None, threshold_days=14):
+    st.subheader(f"{threshold_days}日以上体重未測定")
+    st.caption("未入力を責めるためではなく、測定予定・拒否・体調などを確認するための表示です。")
+    overdue = build_weight_not_measured_users(health_df, users, target_date, threshold_days=threshold_days)
+    if overdue.empty:
+        st.success(f"{threshold_days}日以上体重未測定の利用者はいません。")
+    else:
+        st.warning("体重測定の予定を確認したい利用者がいます。")
+        st.dataframe(overdue, use_container_width=True, hide_index=True)
+
+
+def ensure_excel_file(path, sheet_name, columns):
+    """
+    Ver3.4以降の互換用。
+    商品版ではExcelファイルを正データとして作成しません。
+    既存Excelからの初回移行だけは各ensure_*関数側で行います。
+    """
+    ensure_dirs()
+    return
+
+def is_bcrypt_available() -> bool:
+    """bcryptライブラリが利用できるか確認する。"""
+    return bcrypt is not None
+
+
+def is_bcrypt_hash(password_hash: str) -> bool:
+    """保存済みハッシュがbcrypt形式か判定する。"""
+    h = clean_text(password_hash)
+    return h.startswith("$2a$") or h.startswith("$2b$") or h.startswith("$2y$")
+
+
+def is_legacy_sha256_hash(password_hash: str) -> bool:
+    """旧SHA256形式のハッシュか判定する。"""
+    h = clean_text(password_hash)
+    if h.startswith("sha256$"):
+        return True
+    return bool(re.fullmatch(r"[0-9a-fA-F]{64}", h))
+
+
+def make_sha256_hash(password: str) -> str:
+    """互換用SHA256ハッシュ。bcrypt未導入時の緊急フォールバックにも使う。"""
+    password = clean_text(password)
+    return "sha256$" + hashlib.sha256(password.encode("utf-8")).hexdigest()
+
+
+def hash_password(password: str) -> str:
+    """
+    パスワードをbcryptでハッシュ化して保存する。
+    bcryptが未インストールの場合のみ、アプリ停止を避けるためSHA256形式で保存する。
+    ※本番運用では requirements.txt に bcrypt を追加してください。
+    """
+    password = clean_text(password)
+    if is_bcrypt_available():
+        return bcrypt.hashpw(password.encode("utf-8"), bcrypt.gensalt(rounds=12)).decode("utf-8")
+    return make_sha256_hash(password)
+
+
+def verify_password(password: str, password_hash: str) -> bool:
+    """入力パスワードと保存済みハッシュを照合する。bcrypt優先、旧SHA256互換。"""
+    password = clean_text(password)
+    stored = clean_text(password_hash)
+
+    if not password or not stored:
+        return False
+
+    # 新方式：bcrypt
+    if is_bcrypt_hash(stored):
+        if not is_bcrypt_available():
+            return False
+        try:
+            return bcrypt.checkpw(password.encode("utf-8"), stored.encode("utf-8"))
+        except Exception:
+            return False
+
+    # 旧方式：SHA256（64桁hex、または sha256$付き）
+    if is_legacy_sha256_hash(stored):
+        raw = stored.replace("sha256$", "", 1)
+        return hashlib.sha256(password.encode("utf-8")).hexdigest() == raw
+
+    # さらに古い平文保存が紛れていた場合の救済。ログイン成功後にbcryptへ自動更新する。
+    return password == stored
+
+
+def password_hash_needs_upgrade(password_hash: str) -> bool:
+    """bcryptでないハッシュは、ログイン成功時にbcryptへ自動更新する。"""
+    return is_bcrypt_available() and not is_bcrypt_hash(password_hash)
+
+
+def upgrade_account_password_hash(login_id: str, password: str):
+    """旧SHA256／平文パスワードをbcryptへ自動移行する。"""
+    if not is_bcrypt_available():
+        return
+    try:
+        accounts = load_accounts()
+        login_id = clean_text(login_id).lower()
+        matches = accounts[accounts["ログインID"] == login_id].index.tolist()
+        if not matches:
+            return
+        idx = matches[-1]
+        current_hash = clean_text(accounts.at[idx, "パスワードハッシュ"])
+        if password_hash_needs_upgrade(current_hash):
+            accounts.at[idx, "パスワードハッシュ"] = hash_password(password)
+            accounts.at[idx, "更新日時"] = format_now_jst("%Y-%m-%d %H:%M:%S")
+            save_accounts(accounts)
+            try:
+                add_audit_log("パスワードハッシュ自動移行", "login_account_master", login_id, "旧形式からbcryptへ自動移行")
+            except Exception:
+                pass
+    except Exception:
+        pass
+
+
+def default_account_rows():
+    """初期アカウントを返す。DBが空の場合のみ使用する。"""
+    now_text = format_now_jst("%Y-%m-%d %H:%M:%S")
+    return [
+        {
+            "ログインID": "kanri",
+            "表示名": "管理者",
+            "パスワードハッシュ": hash_password("rui"),
+            "権限": "admin",
+            "状態": "有効",
+            "備考": "初期管理者。削除・無効化するとログインできなくなるため注意してください。",
+            "作成日時": now_text,
+            "更新日時": now_text,
+            "初回パスワード変更必須": "はい",
+            "最終パスワード変更日時": "",
+        },
+        {
+            "ログインID": "staff",
+            "表示名": "職員",
+            "パスワードハッシュ": hash_password("rui"),
+            "権限": "staff",
+            "状態": "有効",
+            "備考": "初期職員アカウント",
+            "作成日時": now_text,
+            "更新日時": now_text,
+            "初回パスワード変更必須": "はい",
+            "最終パスワード変更日時": "",
+        },
+    ]
+
+
+def normalize_accounts_df(df):
+    """ログインアカウントDataFrameを正規化する。"""
+    if df is None:
+        df = pd.DataFrame(columns=ACCOUNT_COLUMNS)
+    work = df.copy()
+    for col in ACCOUNT_COLUMNS:
+        if col not in work.columns:
+            work[col] = ""
+    work = work[ACCOUNT_COLUMNS].copy()
+    work["ログインID"] = work["ログインID"].fillna("").astype(str).str.strip().str.lower()
+    work["表示名"] = work["表示名"].fillna("").astype(str).str.strip()
+    work["権限"] = work["権限"].fillna("staff").astype(str).str.strip()
+    work["状態"] = work["状態"].fillna("有効").astype(str).str.strip()
+    work = work[work["ログインID"] != ""].drop_duplicates(subset=["ログインID"], keep="last")
+
+    # Ver3.9：初回パスワード変更必須化。
+    # 既存DBに列がない場合はここで安全に補完する。
+    # 初期ID（kanri/staff）で、まだ既定パスワード rui のままなら必ず変更対象にする。
+    if "初回パスワード変更必須" in work.columns:
+        work["初回パスワード変更必須"] = work["初回パスワード変更必須"].map(lambda x: clean_text(x))
+        for idx, row in work.iterrows():
+            current_value = clean_text(row.get("初回パスワード変更必須"))
+            login_id = clean_text(row.get("ログインID")).lower()
+            password_hash = clean_text(row.get("パスワードハッシュ"))
+            if current_value == "":
+                try:
+                    default_pw = verify_password("rui", password_hash)
+                except Exception:
+                    default_pw = False
+                work.at[idx, "初回パスワード変更必須"] = "はい" if (login_id in ["kanri", "staff"] and default_pw) else "いいえ"
+            elif current_value.lower() in ["true", "1", "yes", "有", "必須", "on"]:
+                work.at[idx, "初回パスワード変更必須"] = "はい"
+            else:
+                work.at[idx, "初回パスワード変更必須"] = "いいえ"
+
+    if "最終パスワード変更日時" in work.columns:
+        work["最終パスワード変更日時"] = work["最終パスワード変更日時"].map(lambda x: clean_text(x))
+
+    return work.reset_index(drop=True)
+
+
+def ensure_account_file():
+    """
+    ログインアカウントをSQLiteで管理する。
+    既存の login_account_master.xlsx がある場合は初回のみSQLiteへ移行し、
+    以後はSQLiteを正とする。
+    """
+    ensure_dirs()
+
+    # 既にSQLiteにデータがあれば何もしない
+    if sqlite_table_row_count(SQLITE_TABLE_ACCOUNTS) > 0:
+        return
+
+    # 旧Excelがあれば移行
+    if ACCOUNT_FILE.exists():
+        try:
+            df = pd.read_excel(ACCOUNT_FILE, sheet_name="ログインアカウント")
+        except Exception:
+            df = pd.DataFrame(columns=ACCOUNT_COLUMNS)
+        df = normalize_accounts_df(df)
+        if not df.empty:
+            save_sqlite_table(df, SQLITE_TABLE_ACCOUNTS, ACCOUNT_COLUMNS, unique_cols=["ログインID"])
+            return
+
+    # 何もなければ初期アカウントを作成
+    df = pd.DataFrame(default_account_rows(), columns=ACCOUNT_COLUMNS)
+    save_sqlite_table(df, SQLITE_TABLE_ACCOUNTS, ACCOUNT_COLUMNS, unique_cols=["ログインID"])
+
+
+def load_accounts():
+    ensure_account_file()
+    df = load_sqlite_table(SQLITE_TABLE_ACCOUNTS, ACCOUNT_COLUMNS)
+    return normalize_accounts_df(df)
+
+
+def save_accounts(df):
+    work = normalize_accounts_df(df)
+    save_sqlite_table(work, SQLITE_TABLE_ACCOUNTS, ACCOUNT_COLUMNS, unique_cols=["ログインID"])
+
+
+def ensure_login_history_file():
+    """
+    ログイン履歴をSQLiteで管理する。
+    既存の login_history.xlsx がある場合は初回のみSQLiteへ移行し、
+    以後はSQLiteを正とする。
+    """
+    ensure_dirs()
+
+    if sqlite_table_row_count(SQLITE_TABLE_LOGIN_HISTORY) > 0:
+        return
+
+    if LOGIN_HISTORY_FILE.exists():
+        try:
+            df = pd.read_excel(LOGIN_HISTORY_FILE, sheet_name="ログイン履歴")
+        except Exception:
+            df = pd.DataFrame(columns=LOGIN_HISTORY_COLUMNS)
+        for col in LOGIN_HISTORY_COLUMNS:
+            if col not in df.columns:
+                df[col] = ""
+        df = df[LOGIN_HISTORY_COLUMNS].copy()
+        if not df.empty:
+            save_sqlite_table(df, SQLITE_TABLE_LOGIN_HISTORY, LOGIN_HISTORY_COLUMNS, sort_cols=["日時"])
+            return
+
+    save_sqlite_table(pd.DataFrame(columns=LOGIN_HISTORY_COLUMNS), SQLITE_TABLE_LOGIN_HISTORY, LOGIN_HISTORY_COLUMNS, sort_cols=["日時"])
+
+
+def load_login_history():
+    ensure_login_history_file()
+    df = load_sqlite_table(SQLITE_TABLE_LOGIN_HISTORY, LOGIN_HISTORY_COLUMNS)
+    for col in LOGIN_HISTORY_COLUMNS:
+        if col not in df.columns:
+            df[col] = ""
+    return df[LOGIN_HISTORY_COLUMNS].copy()
+
+
+def save_login_history(df):
+    work = df.copy()
+    for col in LOGIN_HISTORY_COLUMNS:
+        if col not in work.columns:
+            work[col] = ""
+    work = work[LOGIN_HISTORY_COLUMNS]
+    save_sqlite_table(work, SQLITE_TABLE_LOGIN_HISTORY, LOGIN_HISTORY_COLUMNS, sort_cols=["日時"])
+
+
+def add_login_history(login_id, label, role, result, memo=""):
+    df = load_login_history()
+    row = {
+        "日時": format_now_jst("%Y-%m-%d %H:%M:%S"),
+        "ログインID": clean_text(login_id).lower(),
+        "表示名": clean_text(label),
+        "権限": clean_text(role),
+        "結果": clean_text(result),
+        "メモ": clean_text(memo),
+    }
+    df = pd.concat([df, pd.DataFrame([row], columns=LOGIN_HISTORY_COLUMNS)], ignore_index=True)
+    # 履歴が大きくなりすぎないよう、直近1000件まで保持
+    if len(df) > 1000:
+        df = df.tail(1000)
+    save_login_history(df)
+
+
+def account_requires_password_change(account_row) -> bool:
+    """アカウントが初回パスワード変更必須か判定する。"""
+    if not isinstance(account_row, dict):
+        try:
+            account_row = account_row.to_dict()
+        except Exception:
+            return False
+    value = clean_text(account_row.get("初回パスワード変更必須"))
+    return value in ["はい", "必須", "1", "true", "True", "TRUE"]
+
+
+def validate_new_password(login_id, new_password, confirm_password, current_hash=""):
+    """商品化向けの最低限のパスワード安全性チェック。"""
+    login_id = clean_text(login_id).lower()
+    new_password = clean_text(new_password)
+    confirm_password = clean_text(confirm_password)
+
+    if not new_password:
+        return False, "新しいパスワードを入力してください。"
+    if new_password != confirm_password:
+        return False, "確認用パスワードが一致しません。"
+    if len(new_password) < 8:
+        return False, "パスワードは8文字以上にしてください。"
+    if new_password.lower() in ["rui", "password", "password123", "12345678", "admin123"]:
+        return False, "推測されやすいパスワードは使用できません。"
+    if login_id and login_id in new_password.lower():
+        return False, "ログインIDを含むパスワードは使用できません。"
+    if not re.search(r"[A-Za-z]", new_password) or not re.search(r"[0-9]", new_password):
+        return False, "英字と数字を両方含めてください。"
+    if current_hash and verify_password(new_password, current_hash):
+        return False, "現在と同じパスワードは使用できません。"
+    return True, ""
+
+
+def update_account_password(login_id, new_password, force_change="いいえ"):
+    """パスワードを更新し、初回変更必須フラグを更新する。"""
+    accounts = load_accounts()
+    login_id = clean_text(login_id).lower()
+    matches = accounts[accounts["ログインID"] == login_id].index.tolist()
+    if not matches:
+        return False, "アカウントが見つかりません。"
+    idx = matches[-1]
+    now_text = format_now_jst("%Y-%m-%d %H:%M:%S")
+    accounts.at[idx, "パスワードハッシュ"] = hash_password(new_password)
+    accounts.at[idx, "初回パスワード変更必須"] = "はい" if force_change in [True, "はい", "1", "true"] else "いいえ"
+    accounts.at[idx, "最終パスワード変更日時"] = now_text
+    accounts.at[idx, "更新日時"] = now_text
+    save_accounts(accounts)
+    try:
+        add_audit_log("パスワード変更", "login_accounts", login_id, "パスワードを更新し、初回変更必須フラグを解除/設定")
+    except Exception:
+        pass
+    return True, "パスワードを更新しました。"
+
+
+def authenticate_user(login_id, password):
+    """ログインID・パスワードを認証し、アカウント情報dictを返す。"""
+    login_id = clean_text(login_id).lower()
+    password = clean_text(password)
+    accounts = load_accounts()
+    hit = accounts[accounts["ログインID"] == login_id]
+    if hit.empty:
+        add_login_history(login_id, "", "", "失敗", "IDなし")
+        return None, "IDまたはパスワードが違います。"
+    row = hit.iloc[-1].to_dict()
+    if clean_text(row.get("状態")) != "有効":
+        add_login_history(login_id, row.get("表示名", ""), row.get("権限", ""), "失敗", "無効アカウント")
+        return None, "このアカウントは無効です。管理者へ確認してください。"
+    if not verify_password(password, row.get("パスワードハッシュ", "")):
+        add_login_history(login_id, row.get("表示名", ""), row.get("権限", ""), "失敗", "パスワード違い")
+        return None, "IDまたはパスワードが違います。"
+
+    # 旧SHA256／平文形式だった場合、ログイン成功時にbcryptへ自動移行する
+    if password_hash_needs_upgrade(row.get("パスワードハッシュ", "")):
+        upgrade_account_password_hash(login_id, password)
+        row["パスワードハッシュ"] = "********"
+
+    add_login_history(login_id, row.get("表示名", ""), row.get("権限", ""), "成功", "")
+    return row, ""
+
+
+def show_login_user_management_menu():
+    if not is_admin_user():
+        st.warning("このメニューは管理者専用です。")
+        return
+
+    st.header("ログイン・職員ID管理")
+    st.caption("職員のログインID、パスワード、権限、状態を管理します。ログイン履歴も確認できます。")
+    if is_bcrypt_available():
+        st.success("パスワード保存方式：bcrypt（安全性の高いハッシュ保存）")
+    else:
+        st.warning("bcryptライブラリが未導入です。requirements.txt に bcrypt を追加すると、パスワードがbcrypt形式で保存されます。")
+
+    tab1, tab2, tab3 = st.tabs(["職員ID管理", "新規ID追加", "ログイン履歴"])
+
+    with tab1:
+        st.subheader("登録済みアカウント")
+        accounts = load_accounts()
+        if accounts.empty:
+            st.info("アカウントがありません。")
+        else:
+            display_df = accounts.copy()
+            display_df["パスワードハッシュ"] = "********"
+            st.dataframe(display_df, use_container_width=True, hide_index=True)
+
+        st.divider()
+        st.subheader("アカウント編集")
+        accounts = load_accounts()
+        id_list = accounts["ログインID"].tolist()
+        if not id_list:
+            st.info("編集できるアカウントがありません。")
+        else:
+            selected_id = st.selectbox("編集するログインID", id_list, key="account_edit_select")
+            row = accounts[accounts["ログインID"] == selected_id].iloc[-1]
+            with st.form("account_edit_form", clear_on_submit=False):
+                c1, c2, c3 = st.columns(3)
+                with c1:
+                    label = st.text_input("表示名", value=clean_text(row.get("表示名")))
+                with c2:
+                    role = st.selectbox("権限", ["admin", "staff"], index=0 if clean_text(row.get("権限")) == "admin" else 1)
+                with c3:
+                    status = st.selectbox("状態", ["有効", "無効"], index=0 if clean_text(row.get("状態"), "有効") == "有効" else 1)
+                new_password = st.text_input("新しいパスワード（変更しない場合は空欄）", type="password")
+                force_change_next = st.checkbox(
+                    "次回ログイン時にパスワード変更を求める",
+                    value=account_requires_password_change(row.to_dict()),
+                    help="仮パスワードを管理者が設定した場合はONにしてください。",
+                )
+                memo = st.text_area("備考", value=clean_text(row.get("備考")), height=80)
+                submitted = st.form_submit_button("この内容で更新", type="primary", use_container_width=True)
+
+            if submitted:
+                if selected_id == "kanri" and status != "有効":
+                    st.error("初期管理者 kanri は無効化できません。")
+                elif selected_id == "kanri" and role != "admin":
+                    st.error("初期管理者 kanri の権限は admin のままにしてください。")
+                else:
+                    idx = accounts[accounts["ログインID"] == selected_id].index[-1]
+                    accounts.at[idx, "表示名"] = clean_text(label, selected_id)
+                    accounts.at[idx, "権限"] = role
+                    accounts.at[idx, "状態"] = status
+                    if clean_text(new_password):
+                        ok_pw, pw_msg = validate_new_password(selected_id, new_password, new_password, clean_text(accounts.at[idx, "パスワードハッシュ"]))
+                        if not ok_pw:
+                            st.error(pw_msg)
+                            st.stop()
+                        accounts.at[idx, "パスワードハッシュ"] = hash_password(new_password)
+                        accounts.at[idx, "最終パスワード変更日時"] = format_now_jst("%Y-%m-%d %H:%M:%S")
+                    accounts.at[idx, "初回パスワード変更必須"] = "はい" if force_change_next else "いいえ"
+                    accounts.at[idx, "備考"] = clean_text(memo)
+                    accounts.at[idx, "更新日時"] = format_now_jst("%Y-%m-%d %H:%M:%S")
+                    save_accounts(accounts)
+                    add_audit_log("アカウント更新", "login_accounts", selected_id, "アカウント情報を更新")
+                    st.success("アカウントを更新しました。")
+                    st.rerun()
+
+        st.divider()
+        st.subheader("アカウント削除")
+        st.caption("退職者など、不要になったIDを削除できます。通常は削除より『無効』がおすすめです。")
+        accounts = load_accounts()
+        deletable = [x for x in accounts["ログインID"].tolist() if x != "kanri"]
+        if deletable:
+            del_id = st.selectbox("削除するログインID", deletable, key="account_delete_select")
+            if st.button("選択したIDを削除", type="secondary"):
+                accounts = accounts[accounts["ログインID"] != del_id]
+                save_accounts(accounts)
+                st.success(f"{del_id} を削除しました。")
+                st.rerun()
+        else:
+            st.info("削除可能なアカウントはありません。")
+
+    with tab2:
+        st.subheader("新規ID追加")
+        with st.form("account_add_form", clear_on_submit=False):
+            c1, c2 = st.columns(2)
+            with c1:
+                new_id = st.text_input("ログインID", placeholder="例：tanaka")
+                new_label = st.text_input("表示名", placeholder="例：田中")
+            with c2:
+                new_role = st.selectbox("権限", ["staff", "admin"], index=0)
+                new_status = st.selectbox("状態", ["有効", "無効"], index=0)
+            new_force_change = st.checkbox("初回ログイン時にパスワード変更を必須にする", value=True)
+            pw1 = st.text_input("パスワード", type="password")
+            pw2 = st.text_input("パスワード確認", type="password")
+            new_memo = st.text_area("備考", height=80)
+            add_submitted = st.form_submit_button("新規IDを追加", type="primary", use_container_width=True)
+
+        if add_submitted:
+            login_id = clean_text(new_id).lower()
+            if not login_id:
+                st.error("ログインIDを入力してください。")
+            elif not re.match(r"^[a-zA-Z0-9_\-\.]+$", login_id):
+                st.error("ログインIDは半角英数字、_、-、. のみ使用できます。")
+            elif not clean_text(pw1):
+                st.error("パスワードを入力してください。")
+            elif pw1 != pw2:
+                st.error("パスワード確認が一致しません。")
+            else:
+                ok_pw, pw_msg = validate_new_password(login_id, pw1, pw2, "")
+                if not ok_pw:
+                    st.error(pw_msg)
+                    st.stop()
+                accounts = load_accounts()
+                if login_id in accounts["ログインID"].tolist():
+                    st.error("同じログインIDが既に存在します。")
+                else:
+                    now_text = format_now_jst("%Y-%m-%d %H:%M:%S")
+                    row = {
+                        "ログインID": login_id,
+                        "表示名": clean_text(new_label, login_id),
+                        "パスワードハッシュ": hash_password(pw1),
+                        "権限": new_role,
+                        "状態": new_status,
+                        "備考": clean_text(new_memo),
+                        "作成日時": now_text,
+                        "更新日時": now_text,
+                        "初回パスワード変更必須": "はい" if new_force_change else "いいえ",
+                        "最終パスワード変更日時": "",
+                    }
+                    accounts = pd.concat([accounts, pd.DataFrame([row], columns=ACCOUNT_COLUMNS)], ignore_index=True)
+                    save_accounts(accounts)
+                    st.success("新規IDを追加しました。")
+                    st.rerun()
+
+    with tab3:
+        st.subheader("ログイン履歴")
+        logs = load_login_history()
+        if logs.empty:
+            st.info("ログイン履歴はまだありません。")
+        else:
+            c1, c2, c3 = st.columns(3)
+            with c1:
+                result_filter = st.selectbox("結果", ["すべて", "成功", "失敗"], key="login_result_filter")
+            with c2:
+                id_filter = st.text_input("ログインIDで検索", key="login_id_filter")
+            with c3:
+                show_count = st.number_input("表示件数", min_value=10, max_value=500, value=100, step=10)
+            view = logs.copy()
+            if result_filter != "すべて":
+                view = view[view["結果"].astype(str) == result_filter]
+            if clean_text(id_filter):
+                view = view[view["ログインID"].astype(str).str.contains(clean_text(id_filter).lower(), case=False, na=False)]
+            view = view.tail(int(show_count)).sort_index(ascending=False)
+            st.dataframe(view, use_container_width=True, hide_index=True)
+
+            output = BytesIO()
+            view.to_excel(output, index=False, sheet_name="ログイン履歴")
+            st.download_button(
+                "表示中のログイン履歴をExcelでダウンロード",
+                data=output.getvalue(),
+                file_name=f"login_history_{today_jst().strftime('%Y%m%d')}.xlsx",
+                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                use_container_width=True,
+            )
+
+# =========================
+# 利用者マスタ
+# =========================
+def default_user_rows():
+    """初期利用者マスタを返す。DBが空の場合のみ使用する。"""
+    rows = []
+    for name in DEFAULT_USERS:
+        row = {"user_id": make_user_id_from_name(name), "利用者名": name, "表示": "表示"}
+        for col in ASSESSMENT_COLUMNS:
+            row[col] = ""
+        rows.append(row)
+    return rows
+
+
+def normalize_users_df(df):
+    """利用者マスタDataFrameを正規化する。"""
+    if df is None:
+        df = pd.DataFrame(columns=USER_COLUMNS)
+    work = df.copy()
+
+    for col in USER_COLUMNS:
+        if col not in work.columns:
+            work[col] = ""
+
+    work = work[USER_COLUMNS].copy()
+    work["利用者名"] = work["利用者名"].fillna("").astype(str).str.strip()
+    work["user_id"] = work.apply(lambda row: ensure_user_id_value(row.get("user_id", ""), row.get("利用者名", "")), axis=1)
+    work["表示"] = work["表示"].fillna("表示").astype(str).str.strip()
+    work.loc[~work["表示"].isin(["表示", "非表示"]), "表示"] = "表示"
+    work = work[work["利用者名"] != ""].drop_duplicates(subset=["user_id"], keep="first")
+    return work.reset_index(drop=True)
+
+
+def ensure_user_file():
+    """
+    利用者マスタをSQLiteで管理する。
+    既存の user_master.xlsx がある場合は初回のみSQLiteへ移行し、
+    以後はSQLiteを正とする。
+    """
+    ensure_dirs()
+
+    # 既にSQLiteにデータがあれば何もしない
+    if sqlite_table_row_count(SQLITE_TABLE_USERS) > 0:
+        return
+
+    # 旧Excelがあれば移行
+    if USER_FILE.exists():
+        try:
+            df = pd.read_excel(USER_FILE, sheet_name=USER_SHEET)
+        except Exception:
+            try:
+                df = pd.read_excel(USER_FILE)
+            except Exception:
+                df = pd.DataFrame(columns=USER_COLUMNS)
+        df = normalize_users_df(df)
+        if not df.empty:
+            save_sqlite_table(df, SQLITE_TABLE_USERS, USER_COLUMNS, unique_cols=["user_id"])
+            return
+
+    # 何もなければ初期利用者マスタを作成
+    df = pd.DataFrame(default_user_rows(), columns=USER_COLUMNS)
+    save_sqlite_table(df, SQLITE_TABLE_USERS, USER_COLUMNS, unique_cols=["user_id"])
+
+
+def load_users(include_hidden=False):
+    ensure_user_file()
+    df = load_sqlite_table(SQLITE_TABLE_USERS, USER_COLUMNS)
+    df = normalize_users_df(df)
+
+    if not include_hidden:
+        df = df[df["表示"].fillna("表示") == "表示"]
+
+    return df.reset_index(drop=True)
+
+
+def save_users(df):
+    work = normalize_users_df(df)
+    save_sqlite_table(work, SQLITE_TABLE_USERS, USER_COLUMNS, unique_cols=["user_id"])
+
+
+def export_user_master_excel_bytes():
+    """SQLite上の利用者マスタをExcel形式で出力する。"""
+    return to_excel_download(load_users(include_hidden=True))
+
+
+def add_user(user_name):
+    user_name = clean_text(user_name)
+
+    if not user_name:
+        return False, "利用者名を入力してください。"
+
+    df = load_users(include_hidden=True)
+
+    if user_name in df["利用者名"].tolist():
+        df.loc[df["利用者名"] == user_name, "表示"] = "表示"
+        save_users(df)
+        return True, f"{user_name}を表示に戻しました。"
+
+    row = {"user_id": make_user_id_from_name(user_name), "利用者名": user_name, "表示": "表示"}
+    for col in ASSESSMENT_COLUMNS:
+        row[col] = ""
+
+    df = pd.concat([df, pd.DataFrame([row])], ignore_index=True)
+    save_users(df)
+
+    return True, f"{user_name}を追加しました。"
+
+
+def hide_user(user_name):
+    df = load_users(include_hidden=True)
+
+    if user_name not in df["利用者名"].tolist():
+        return False, "対象の利用者が見つかりません。"
+
+    df.loc[df["利用者名"] == user_name, "表示"] = "非表示"
+    save_users(df)
+
+    return True, f"{user_name}を入力候補から外しました。"
+
+
+def get_user_assessment(user_name):
+    df = load_users(include_hidden=True)
+    row = df[df["利用者名"] == user_name]
+
+    if row.empty:
+        return {}
+
+    row = row.iloc[0]
+
+    return {
+        col: clean_text(row.get(col, ""))
+        for col in ASSESSMENT_COLUMNS
+        if clean_text(row.get(col, ""))
+    }
+
+
+def build_assessment_context_text(user_name):
+    data = get_user_assessment(user_name)
+
+    if not data:
+        return ""
+
+    order = ["主訴", "生活状況", "ADL", "IADL", "認知機能", "健康状態", "課題", "支援内容"]
+    lines = []
+
+    for col in order:
+        if data.get(col):
+            lines.append(f"{col}：{data[col]}")
+
+    return "\n".join(lines)
+
+
+
+# =========================
+# 健康チェックデータ
+# =========================
+def ensure_health_file():
+    """互換用。実データはSQLite（hidamari_health.db / health_records）へ保存します。"""
+    migrate_excel_to_sqlite_if_needed(
+        SQLITE_TABLE_HEALTH,
+        HEALTH_FILE,
+        HEALTH_SHEET,
+        HEALTH_COLUMNS,
+        date_cols=["記録日"],
+        unique_cols=["記録日", "利用者名"],
+    )
+
+
+def load_health_data():
+    """健康チェックをSQLiteから読み込む。"""
+    ensure_health_file()
+    df = load_sqlite_table(SQLITE_TABLE_HEALTH, HEALTH_COLUMNS, date_cols=["記録日"])
+    df = attach_user_ids(df)
+
+    if not df.empty:
+        df["記録日"] = pd.to_datetime(df["記録日"], errors="coerce")
+        df["利用者名"] = df["利用者名"].astype(str).str.strip()
+
+    return df.astype("object")
+
+
+def save_health_data(df):
+    """健康チェックをSQLiteへ保存する。"""
+    ensure_dirs()
+    df = normalize_df_columns(df, HEALTH_COLUMNS)
+    df = attach_user_ids(df)
+
+    if not df.empty:
+        df["記録日"] = pd.to_datetime(df["記録日"], errors="coerce")
+        df["利用者名"] = df["利用者名"].astype(str).str.strip()
+        df["_key"] = df.apply(lambda row: make_date_user_key(row["記録日"], row["利用者名"]), axis=1)
+        df = df[df["_key"] != ""]
+        df = df.drop_duplicates(subset=["_key"], keep="last")
+        df = df.drop(columns=["_key"])
+
+    save_sqlite_table(
+        df,
+        SQLITE_TABLE_HEALTH,
+        HEALTH_COLUMNS,
+        date_cols=["記録日"],
+        unique_cols=["記録日", "利用者名"],
+    )
+
+
+def find_health_index(df, record_date, user_name):
+    if df.empty:
+        return None
+
+    work = df.copy()
+    work["記録日"] = pd.to_datetime(work["記録日"], errors="coerce")
+    work["利用者名"] = work["利用者名"].astype(str).str.strip()
+
+    target_date = pd.to_datetime(record_date, errors="coerce")
+    if pd.isna(target_date):
+        return None
+
+    mask = (work["記録日"].dt.date == target_date.date()) & (work["利用者名"] == clean_text(user_name))
+    matches = work.index[mask].tolist()
+
+    if not matches:
+        return None
+
+    return matches[0]
+
+
+def upsert_health_record(record):
+    record["user_id"] = ensure_user_id_value(record.get("user_id", ""), record.get("利用者名", ""))
+    df = load_health_data()
+    df = df.astype("object")
+
+    idx = find_health_index(df, record["記録日"], record["利用者名"])
+
+    if idx is None:
+        new_df = pd.DataFrame([record], columns=HEALTH_COLUMNS).astype("object")
+        df = pd.concat([df, new_df], ignore_index=True)
+        action = "登録"
+    else:
+        for col in HEALTH_COLUMNS:
+            df.at[idx, col] = record.get(col, "")
+        action = "更新"
+
+    save_health_data(df)
+    add_audit_log(action, SQLITE_TABLE_HEALTH, make_date_user_key(record["記録日"], record["利用者名"]), "健康チェックを保存しました")
+
+    return action
+
+
+def get_month_health_data(df, user_name, year, month):
+    if df.empty:
+        return df
+
+    work = df.copy()
+    work["記録日"] = pd.to_datetime(work["記録日"], errors="coerce")
+
+    return work[
+        (work["利用者名"] == user_name)
+        & (work["記録日"].dt.year == int(year))
+        & (work["記録日"].dt.month == int(month))
+    ].sort_values("記録日")
+
+
+# =========================
+# 排泄チェックデータ
+# =========================
+def ensure_excretion_file():
+    """互換用。実データはSQLite（hidamari_health.db / excretion_records）へ保存します。"""
+    migrate_excel_to_sqlite_if_needed(
+        SQLITE_TABLE_EXCRETION,
+        EXCRETION_FILE,
+        EXCRETION_SHEET,
+        EXCRETION_COLUMNS,
+        date_cols=["記録日"],
+        unique_cols=["記録日", "利用者名", "時間帯"],
+    )
+
+
+def normalize_excretion_record(record):
+    urine_amount = clean_text(record.get("尿量", "なし"), "なし")
+    urine_type = clean_text(record.get("尿性状", "なし"), "なし")
+    stool_amount = clean_text(record.get("便量", "なし"), "なし")
+    stool_type = clean_text(record.get("便性状", "なし"), "なし")
+
+    if urine_amount == "":
+        urine_amount = "なし"
+    if urine_type == "":
+        urine_type = "なし"
+    if stool_amount == "":
+        stool_amount = "なし"
+    if stool_type == "":
+        stool_type = "なし"
+
+    if urine_amount == "なし":
+        urine_type = "なし"
+
+    if stool_amount == "なし":
+        stool_type = "なし"
+
+    record["尿量"] = urine_amount
+    record["尿量コード"] = URINE_AMOUNT_CODE.get(urine_amount, "")
+    record["尿性状"] = urine_type
+    record["尿性状コード"] = URINE_TYPE_CODE.get(urine_type, "")
+    record["便量"] = stool_amount
+    record["便量コード"] = STOOL_AMOUNT_CODE.get(stool_amount, "")
+    record["便性状"] = stool_type
+    record["便性状コード"] = STOOL_TYPE_CODE.get(stool_type, "")
+
+    return record
+
+
+def load_excretion_data():
+    """排泄チェックをSQLiteから読み込む。"""
+    ensure_excretion_file()
+    df = load_sqlite_table(SQLITE_TABLE_EXCRETION, EXCRETION_COLUMNS, date_cols=["記録日"])
+
+    if not df.empty:
+        df["記録日"] = pd.to_datetime(df["記録日"], errors="coerce")
+        for col in ["利用者名", "時間帯", "時間帯目安", "尿量", "尿性状", "便量", "便性状", "排泄メモ", "入力者", "登録日時"]:
+            df[col] = df[col].fillna("").astype(str)
+
+    return df.astype("object")
+
+
+def save_excretion_data(df):
+    """排泄チェックをSQLiteへ保存する。"""
+    ensure_dirs()
+    df = normalize_df_columns(df, EXCRETION_COLUMNS)
+    df = attach_user_ids(df)
+
+    records = []
+    for _, row in df.iterrows():
+        rec = row.to_dict()
+        rec = normalize_excretion_record(rec)
+        records.append(rec)
+
+    df = pd.DataFrame(records, columns=EXCRETION_COLUMNS).astype("object")
+
+    if not df.empty:
+        df["記録日"] = pd.to_datetime(df["記録日"], errors="coerce")
+        df["利用者名"] = df["利用者名"].astype(str).str.strip()
+        df["時間帯"] = df["時間帯"].astype(str).str.strip()
+        df["_key"] = df.apply(lambda row: make_excretion_key(row["記録日"], row["利用者名"], row["時間帯"]), axis=1)
+        df = df[df["_key"] != ""]
+        df = df.drop_duplicates(subset=["_key"], keep="last")
+        df = df.drop(columns=["_key"])
+
+    df = df[EXCRETION_COLUMNS]
+    save_sqlite_table(
+        df,
+        SQLITE_TABLE_EXCRETION,
+        EXCRETION_COLUMNS,
+        date_cols=["記録日"],
+        unique_cols=["記録日", "利用者名", "時間帯"],
+    )
+
+
+def find_excretion_index(df, record_date, user_name, slot):
+    if df.empty:
+        return None
+
+    work = df.copy()
+    work["記録日"] = pd.to_datetime(work["記録日"], errors="coerce")
+    work["利用者名"] = work["利用者名"].astype(str).str.strip()
+    work["時間帯"] = work["時間帯"].astype(str).str.strip()
+
+    target_date = pd.to_datetime(record_date, errors="coerce")
+    if pd.isna(target_date):
+        return None
+
+    mask = (
+        (work["記録日"].dt.date == target_date.date())
+        & (work["利用者名"] == clean_text(user_name))
+        & (work["時間帯"] == clean_text(slot))
+    )
+
+    matches = work.index[mask].tolist()
+
+    if not matches:
+        return None
+
+    return matches[0]
+
+
+def get_excretion_row(df, record_date, user_name, slot):
+    idx = find_excretion_index(df, record_date, user_name, slot)
+
+    if idx is None:
+        return None
+
+    return df.loc[idx]
+
+
+def upsert_excretion_record(record):
+    record["user_id"] = ensure_user_id_value(record.get("user_id", ""), record.get("利用者名", ""))
+    record = normalize_excretion_record(record)
+
+    df = load_excretion_data()
+    idx = find_excretion_index(
+        df,
+        record["記録日"],
+        record["利用者名"],
+        record["時間帯"],
+    )
+
+    if idx is None:
+        df = pd.concat(
+            [df, pd.DataFrame([record], columns=EXCRETION_COLUMNS).astype("object")],
+            ignore_index=True,
+        )
+        action = "登録"
+    else:
+        for col in EXCRETION_COLUMNS:
+            df.at[idx, col] = record.get(col, "")
+        action = "更新"
+
+    save_excretion_data(df)
+    add_audit_log(action, SQLITE_TABLE_EXCRETION, make_excretion_key(record["記録日"], record["利用者名"], record["時間帯"]), "排泄チェックを保存しました")
+
+    return action
+
+
+def get_day_excretion_data(df, record_date, user_name=None):
+    if df.empty:
+        return df
+
+    work = df.copy()
+    work["記録日"] = pd.to_datetime(work["記録日"], errors="coerce")
+
+    target_date = pd.to_datetime(record_date, errors="coerce")
+    if pd.isna(target_date):
+        return pd.DataFrame(columns=EXCRETION_COLUMNS)
+
+    work = work[work["記録日"].dt.date == target_date.date()]
+
+    if user_name and user_name != "全員":
+        work = work[work["利用者名"] == user_name]
+
+    slot_order = {slot: i for i, (slot, _) in enumerate(EXCRETION_SLOTS)}
+    work["_slot_order"] = work["時間帯"].map(slot_order).fillna(99)
+    work = work.sort_values(["利用者名", "_slot_order"]).drop(columns=["_slot_order"])
+
+    return work
+
+
+def get_month_excretion_data(df, user_name, year, month):
+    if df.empty:
+        return df
+
+    work = df.copy()
+    work["記録日"] = pd.to_datetime(work["記録日"], errors="coerce")
+
+    return work[
+        (work["利用者名"] == user_name)
+        & (work["記録日"].dt.year == int(year))
+        & (work["記録日"].dt.month == int(month))
+    ].sort_values(["記録日", "時間帯"])
+
+
+def summarize_excretion(df):
+    if df.empty:
+        return {
+            "排尿回数": 0,
+            "排便回数": 0,
+            "濃縮尿": 0,
+            "下痢便": 0,
+            "水様便": 0,
+            "排便なし枠": 0,
+        }
+
+    return {
+        "排尿回数": int((df["尿量"].fillna("なし") != "なし").sum()),
+        "排便回数": int((df["便量"].fillna("なし") != "なし").sum()),
+        "濃縮尿": int((df["尿性状"].fillna("") == "濃縮尿").sum()),
+        "下痢便": int((df["便性状"].fillna("") == "下痢便").sum()),
+        "水様便": int((df["便性状"].fillna("") == "水様便").sum()),
+        "排便なし枠": int((df["便量"].fillna("なし") == "なし").sum()),
+    }
+
+
+def build_excretion_text(df):
+    if df.empty:
+        return "排泄記録はありません。"
+
+    lines = []
+
+    for _, row in df.iterrows():
+        lines.append(
+            f"{row['記録日'].strftime('%m/%d') if pd.notna(row['記録日']) else ''} "
+            f"{row['時間帯']}：尿 {row['尿量']}・{row['尿性状']} ／ 便 {row['便量']}・{row['便性状']}"
+        )
+
+    return "\\n".join(lines)
+
+
+
+
+# =========================
+# 入力チェック・注意通知・差分検知
+# =========================
+def validate_health_record(record):
+    """健康チェック入力の整合性を確認する。"""
+    warnings = []
+    errors = []
+
+    temp = safe_float(record.get("体温"), 0)
+    spo2 = safe_int(record.get("SpO2"), 0)
+    bp_high = safe_int(record.get("血圧上"), 0)
+    bp_low = safe_int(record.get("血圧下"), 0)
+    pulse = safe_int(record.get("脈拍"), 0)
+    weight = safe_float(record.get("体重"), 0)
+
+    if temp == 0:
+        warnings.append("体温が0です。未測定の場合はそのままでもよいですが、入力漏れでないか確認してください。")
+    elif temp < 34.0 or temp > 42.0:
+        errors.append("体温が通常の入力範囲から外れています。入力値を確認してください。")
+    elif temp >= 37.5:
+        warnings.append("体温が37.5℃以上です。発熱傾向として申し送り対象になります。")
+
+    if spo2 == 0:
+        warnings.append("SpO2が0です。未測定か入力漏れか確認してください。")
+    elif spo2 < 80:
+        errors.append("SpO2が80未満です。入力ミスの可能性があります。")
+    elif spo2 <= 93:
+        warnings.append("SpO2が93％以下です。注意して確認してください。")
+
+    if bp_high == 0 or bp_low == 0:
+        warnings.append("血圧が0です。未測定か入力漏れか確認してください。")
+    elif bp_low > bp_high:
+        errors.append("血圧下が血圧上を上回っています。入力値を確認してください。")
+    elif bp_high >= 160:
+        warnings.append("血圧上が160以上です。注意して確認してください。")
+
+    if pulse == 0:
+        warnings.append("脈拍が0です。未測定か入力漏れか確認してください。")
+    elif pulse < 40 or pulse > 130:
+        warnings.append("脈拍が通常範囲から外れています。入力値と状態を確認してください。")
+
+    if weight < 0:
+        errors.append("体重がマイナスです。入力値を確認してください。")
+
+    for meal in ["朝食摂取率", "昼食摂取率", "夕食摂取率"]:
+        value = safe_int(record.get(meal), 0)
+        if value < 0 or value > 100:
+            errors.append(f"{meal}は0?100％で入力してください。")
+        elif value <= 50:
+            warnings.append(f"{meal}が50％以下です。食事量低下として確認してください。")
+
+    return errors, warnings
+
+
+def validate_excretion_record(record):
+    """排泄チェック入力の整合性を確認する。"""
+    warnings = []
+    errors = []
+
+    urine_amount = clean_text(record.get("尿量", "なし"), "なし")
+    urine_type = clean_text(record.get("尿性状", "なし"), "なし")
+    stool_amount = clean_text(record.get("便量", "なし"), "なし")
+    stool_type = clean_text(record.get("便性状", "なし"), "なし")
+
+    if urine_amount == "なし" and urine_type != "なし":
+        errors.append("尿量が「なし」の場合、尿性状も「なし」にしてください。")
+    if stool_amount == "なし" and stool_type != "なし":
+        errors.append("便量が「なし」の場合、便性状も「なし」にしてください。")
+
+    if urine_amount != "なし" and urine_type == "なし":
+        warnings.append("尿量がありますが、尿性状が「なし」です。普通尿・濃縮尿の確認をおすすめします。")
+    if stool_amount != "なし" and stool_type == "なし":
+        warnings.append("便量がありますが、便性状が「なし」です。普通便・下痢便・水様便の確認をおすすめします。")
+
+    if urine_type == "濃縮尿":
+        warnings.append("濃縮尿の記録があります。水分摂取や体調変化の確認対象です。")
+    if stool_type in ["下痢便", "水様便"]:
+        warnings.append(f"{stool_type}の記録があります。体調変化として確認対象です。")
+
+    return errors, warnings
+
+
+def get_previous_health_record(health_df, record_date, user_name):
+    """指定日より前の直近健康記録を取得する。"""
+    if health_df.empty:
+        return None
+
+    work = health_df.copy()
+    work["記録日"] = pd.to_datetime(work["記録日"], errors="coerce")
+    target_date = pd.to_datetime(record_date, errors="coerce")
+
+    if pd.isna(target_date):
+        return None
+
+    work = work[
+        (work["利用者名"] == user_name)
+        & (work["記録日"].dt.date < target_date.date())
+    ].sort_values("記録日")
+
+    if work.empty:
+        return None
+
+    return work.iloc[-1]
+
+
+def build_health_diff_text(health_df, record_date, user_name, current_record=None):
+    """前回記録との差分を文章化する。"""
+    prev = get_previous_health_record(health_df, record_date, user_name)
+
+    if prev is None:
+        return "前回比較：比較できる過去記録はありません。"
+
+    if current_record is None:
+        idx = find_health_index(health_df, record_date, user_name)
+        if idx is None:
+            return "前回比較：本日の健康記録がありません。"
+        current_record = health_df.loc[idx].to_dict()
+
+    lines = []
+
+    checks = [
+        ("体温", 0.5, "℃"),
+        ("SpO2", 3, "％"),
+        ("体重", 1.0, "kg"),
+        ("朝食摂取率", 30, "％"),
+        ("昼食摂取率", 30, "％"),
+        ("夕食摂取率", 30, "％"),
+    ]
+
+    for col, threshold, unit in checks:
+        now = safe_float(current_record.get(col), 0)
+        before = safe_float(prev.get(col), 0)
+
+        if now == 0 or before == 0:
+            continue
+
+        diff = now - before
+
+        if abs(diff) >= threshold:
+            direction = "上昇" if diff > 0 else "低下"
+            lines.append(f"{col}が前回より{abs(round(diff, 1))}{unit}{direction}")
+
+    if not lines:
+        return "前回比較：大きな差分は目立ちません。"
+
+    return "前回比較：" + "、".join(lines)
+
+
+def build_excretion_diff_text(ex_df, record_date, user_name):
+    """前回排泄記録との差分を文章化する。"""
+    if ex_df.empty:
+        return "排泄差分：比較できる過去記録はありません。"
+
+    work = ex_df.copy()
+    work["記録日"] = pd.to_datetime(work["記録日"], errors="coerce")
+    target_date = pd.to_datetime(record_date, errors="coerce")
+
+    if pd.isna(target_date):
+        return "排泄差分：日付を確認できません。"
+
+    today_df = get_day_excretion_data(work, target_date.date(), user_name)
+
+    prev_dates = work[
+        (work["利用者名"] == user_name)
+        & (work["記録日"].dt.date < target_date.date())
+    ]["記録日"].dt.date.dropna().unique()
+
+    if len(prev_dates) == 0:
+        return "排泄差分：比較できる過去排泄記録はありません。"
+
+    prev_date = sorted(prev_dates)[-1]
+    prev_df = get_day_excretion_data(work, prev_date, user_name)
+
+    now_sum = summarize_excretion(today_df)
+    prev_sum = summarize_excretion(prev_df)
+
+    lines = []
+
+    if now_sum["排尿回数"] > prev_sum["排尿回数"] + 2:
+        lines.append("排尿回数が前回より増えています")
+    if now_sum["排便回数"] == 0 and prev_sum["排便回数"] > 0:
+        lines.append("前回は排便記録がありましたが、本日は排便記録がありません")
+    if now_sum["濃縮尿"] > prev_sum["濃縮尿"]:
+        lines.append("濃縮尿の記録が前回より増えています")
+    if now_sum["下痢便"] + now_sum["水様便"] > prev_sum["下痢便"] + prev_sum["水様便"]:
+        lines.append("下痢便・水様便の記録が前回より増えています")
+
+    if not lines:
+        return "排泄差分：前回と比べて大きな変化は目立ちません。"
+
+    return "排泄差分：" + "、".join(lines)
+
+
+def build_attention_users(health_df, ex_df, target_date):
+    """今日の注意利用者一覧を作成する。
+
+    自分専用ダッシュボード・管理者ダッシュボードで使う注意一覧。
+    体温・SpO2・食事量などの注意項目に加えて、健康チェック入力の
+    「気になる変化」の具体内容も同じ一覧に表示する。
+    """
+    rows = []
+
+    for user in active_users:
+        notes = []
+        change_text = ""
+        family_memo = ""
+
+        # 健康記録
+        if not health_df.empty:
+            idx = find_health_index(health_df, target_date, user)
+            if idx is not None:
+                h = health_df.loc[idx]
+                if safe_float(h.get("体温"), 0) >= 37.5:
+                    notes.append("発熱傾向")
+                if safe_int(h.get("SpO2"), 100) <= 93 and safe_int(h.get("SpO2"), 100) != 0:
+                    notes.append("SpO2低下")
+                for meal in ["朝食摂取率", "昼食摂取率", "夕食摂取率"]:
+                    if safe_int(h.get(meal), 100) <= 50:
+                        notes.append(f"{meal.replace('摂取率','')}50％以下")
+
+                change_text = clean_text(h.get("気になる変化", ""))
+                family_memo = clean_text(h.get("家族共有メモ", ""))
+                if change_text:
+                    notes.append("気になる変化あり")
+
+        # 排泄記録
+        user_ex = get_day_excretion_data(ex_df, target_date, user)
+        if not user_ex.empty:
+            ex_sum = summarize_excretion(user_ex)
+            if ex_sum["水様便"] > 0:
+                notes.append("水様便")
+            if ex_sum["下痢便"] > 0:
+                notes.append("下痢便")
+            if ex_sum["濃縮尿"] > 0:
+                notes.append("濃縮尿")
+            if ex_sum["排便回数"] == 0:
+                notes.append("確認日排便記録なし")
+
+        # 未排便3日
+        if not ex_df.empty:
+            work = ex_df.copy()
+            work["記録日"] = pd.to_datetime(work["記録日"], errors="coerce")
+            recent_dates = sorted([
+                d for d in work[work["利用者名"] == user]["記録日"].dt.date.dropna().unique()
+                if d <= target_date
+            ])[-3:]
+
+            if len(recent_dates) >= 3:
+                no_stool_all = True
+                for d in recent_dates:
+                    ddf = get_day_excretion_data(work, d, user)
+                    if summarize_excretion(ddf)["排便回数"] > 0:
+                        no_stool_all = False
+                        break
+                if no_stool_all:
+                    notes.append("未排便3日")
+
+        if notes:
+            rows.append({
+                "利用者名": user,
+                "注意項目": "、".join(sorted(set(notes))),
+                "気になる変化": change_text,
+                "家族共有メモ": family_memo,
+            })
+
+    columns = ["利用者名", "注意項目", "気になる変化", "家族共有メモ"]
+    return pd.DataFrame(rows, columns=columns)
+
+
+
+def build_no_stool_3days_users(ex_df, target_date):
+    """確認日までの直近3日間で排便記録がない利用者を一覧化する。"""
+    rows = []
+
+    target = pd.to_datetime(target_date, errors="coerce")
+    if pd.isna(target):
+        return pd.DataFrame(columns=["利用者名", "対象期間", "最終排便記録", "確認メモ"])
+
+    target_day = target.date()
+    check_dates = [target_day - timedelta(days=i) for i in [2, 1, 0]]
+    period_text = f"{check_dates[0].strftime('%m/%d')}?{check_dates[-1].strftime('%m/%d')}"
+
+    work = ex_df.copy()
+    if not work.empty:
+        work["記録日"] = pd.to_datetime(work["記録日"], errors="coerce")
+
+    for user in active_users:
+        stool_counts = []
+        for d in check_dates:
+            day_df = get_day_excretion_data(work, d, user)
+            stool_counts.append(summarize_excretion(day_df)["排便回数"])
+
+        if sum(stool_counts) == 0:
+            last_stool_text = "確認できません"
+            if not work.empty:
+                user_df = work[
+                    (work["利用者名"] == user)
+                    & (work["記録日"].dt.date < check_dates[0])
+                ].copy()
+                if not user_df.empty:
+                    stool_df = user_df[user_df["便量"].fillna("なし") != "なし"].copy()
+                    if not stool_df.empty:
+                        last_date = stool_df["記録日"].max()
+                        if pd.notna(last_date):
+                            last_stool_text = last_date.strftime("%Y/%m/%d")
+
+            rows.append({
+                "利用者名": user,
+                "対象期間": period_text,
+                "最終排便記録": last_stool_text,
+                "確認メモ": "直近3日間、排便記録がありません。水分・食事量・腹部症状・普段の排便間隔を確認してください。",
+            })
+
+    return pd.DataFrame(rows, columns=["利用者名", "対象期間", "最終排便記録", "確認メモ"])
+
+
+
+
+
+# =========================
+# 写真から半自動入力（OCR補助）
+# =========================
+PHOTO_IMPORT_COLUMNS = [
+    "取り込む",
+    "記録日",
+    "利用者名",
+    "体温",
+    "血圧上",
+    "血圧下",
+    "脈拍",
+    "SpO2",
+    "体重",
+    "朝食摂取率",
+    "昼食摂取率",
+    "夕食摂取率",
+    "家族共有メモ",
+    "気になる変化",
+]
+
+def get_openai_api_key(input_key=""):
+    """OpenAI APIキーを取得。Streamlit Secrets → 環境変数 → 画面入力の順で使います。"""
+    try:
+        key = st.secrets.get("OPENAI_API_KEY", "")
+        if key:
+            return key
+    except Exception:
+        pass
+    key = os.environ.get("OPENAI_API_KEY", "")
+    if key:
+        return key
+    return clean_text(input_key)
+
+
+def try_ocr_image(uploaded_file):
+    """
+    旧方式OCR。Streamlit CloudではTesseract本体が入っていないことが多いため、
+    使えない場合は空文字を返します。
+    """
+    try:
+        from PIL import Image
+        import pytesseract
+        uploaded_file.seek(0)
+        image = Image.open(uploaded_file)
+        text = pytesseract.image_to_string(image, lang="jpn+eng")
+        return clean_text(text)
+    except Exception:
+        return ""
+
+
+def try_openai_vision_photo_import(uploaded_file, default_user, year, month, api_key=""):
+    """
+    OpenAI Visionで写真を読み取り、健康チェック候補表を返します。
+    AIは下書き作成のみ。保存前に必ず職員が確認します。
+    """
+    api_key = get_openai_api_key(api_key)
+    if not api_key:
+        return pd.DataFrame(columns=PHOTO_IMPORT_COLUMNS), "OpenAI APIキーが未設定です。"
+
+    try:
+        from openai import OpenAI
+    except Exception:
+        return pd.DataFrame(columns=PHOTO_IMPORT_COLUMNS), "openaiライブラリが未インストールです。requirements.txtに openai を追加してください。"
+
+    try:
+        uploaded_file.seek(0)
+        img_bytes = uploaded_file.read()
+        b64 = base64.b64encode(img_bytes).decode("utf-8")
+        mime = "image/png"
+        name = clean_text(getattr(uploaded_file, "name", "")).lower()
+        if name.endswith(".jpg") or name.endswith(".jpeg"):
+            mime = "image/jpeg"
+
+        client = OpenAI(api_key=api_key)
+        prompt = f"""
+あなたは介護施設の健康チェック表を読み取る補助者です。
+画像内の手書き表から、健康チェックデータの候補を抽出してください。
+対象年月は {int(year)}年{int(month)}月 です。
+
+重要ルール：
+- 推測で埋めない。読めない値は空欄または0にする。
+- 日付、体温、血圧上、血圧下、脈拍を優先する。
+- SpO2、体重が読める場合のみ入れる。
+- 排便の丸やメモは「気になる変化」に短く入れてよい。
+- 出力はJSONのみ。説明文は不要。
+
+JSON形式：
+{{
+  "rows": [
+    {{"day": 1, "temp": 36.5, "bp_high": 128, "bp_low": 70, "pulse": 82, "spo2": 0, "weight": 0, "memo": ""}}
+  ]
+}}
+"""
+        resp = client.chat.completions.create(
+            model="gpt-4o-mini",
+            messages=[
+                {"role": "system", "content": "画像から健康チェック表の候補データをJSONで抽出します。医療判断はしません。"},
+                {"role": "user", "content": [
+                    {"type": "text", "text": prompt},
+                    {"type": "image_url", "image_url": {"url": f"data:{mime};base64,{b64}"}},
+                ]},
+            ],
+            temperature=0,
+            response_format={"type": "json_object"},
+        )
+        content = resp.choices[0].message.content or "{}"
+        data = json.loads(content)
+        rows = []
+        for item in data.get("rows", []):
+            day = safe_int(item.get("day"), 0)
+            if day < 1 or day > 31:
+                continue
+            try:
+                record_date = date(int(year), int(month), day)
+            except Exception:
+                continue
+            rows.append({
+                "取り込む": True,
+                "記録日": record_date,
+                "利用者名": default_user,
+                "体温": safe_float(item.get("temp"), 0),
+                "血圧上": safe_int(item.get("bp_high"), 0),
+                "血圧下": safe_int(item.get("bp_low"), 0),
+                "脈拍": safe_int(item.get("pulse"), 0),
+                "SpO2": safe_int(item.get("spo2"), 0),
+                "体重": safe_float(item.get("weight"), 0),
+                "朝食摂取率": 100,
+                "昼食摂取率": 100,
+                "夕食摂取率": 100,
+                "家族共有メモ": "",
+                "気になる変化": clean_text(item.get("memo", "写真AI取込候補"), "写真AI取込候補"),
+            })
+        return pd.DataFrame(rows, columns=PHOTO_IMPORT_COLUMNS), ""
+    except Exception as e:
+        return pd.DataFrame(columns=PHOTO_IMPORT_COLUMNS), f"OpenAI画像読み取りでエラーが出ました：{e}"
+
+
+def parse_photo_ocr_text(raw_text, default_user, year, month, input_staff=""):
+    """
+    OCRテキストから候補データを作成します。
+    手書き帳票は誤読が起きるため、ここでは「候補作成」に留め、
+    必ず st.data_editor で職員が確認してから保存します。
+    """
+    rows = []
+    raw_text = clean_text(raw_text)
+
+    if not raw_text:
+        return pd.DataFrame(columns=PHOTO_IMPORT_COLUMNS)
+
+    lines = [line.strip() for line in raw_text.splitlines() if line.strip()]
+    last_day = None
+
+    for line in lines:
+        normalized = line.replace("／", "/").replace("｜", " ").replace("|", " ").replace("　", " ")
+        normalized = re.sub(r"\s+", " ", normalized)
+
+        # 日付候補：単独の1〜31、または 5/12 のような表記
+        day = None
+        m_md = re.search(r"(?:\d{1,2}/)?([1-9]|[12]\d|3[01])(?:日)?", normalized)
+        if m_md:
+            try:
+                candidate = int(m_md.group(1))
+                if 1 <= candidate <= 31:
+                    day = candidate
+                    last_day = day
+            except Exception:
+                day = None
+
+        if day is None:
+            day = last_day
+
+        # 体温候補：35.0〜42.0程度
+        temp = ""
+        temp_matches = re.findall(r"(3[5-9]\.\d|4[0-2]\.\d|3[5-9]|4[0-2])", normalized)
+        if temp_matches:
+            temp = temp_matches[0]
+
+        # 血圧候補：120/70 など
+        bp_high = ""
+        bp_low = ""
+        bp = re.search(r"(\d{2,3})\s*/\s*(\d{2,3})", normalized)
+        if bp:
+            bp_high = bp.group(1)
+            bp_low = bp.group(2)
+
+        # 脈拍候補：血圧の後ろに出る2〜3桁を優先
+        pulse = ""
+        if bp:
+            after_bp = normalized[bp.end():]
+            nums = re.findall(r"\b([4-9]\d|1[0-4]\d)\b", after_bp)
+            if nums:
+                pulse = nums[0]
+
+        # 体温または血圧がある行だけ候補化
+        if temp or bp_high or bp_low or pulse:
+            try:
+                record_date = date(int(year), int(month), int(day)) if day else today_jst()
+            except Exception:
+                record_date = today_jst()
+
+            rows.append({
+                "取り込む": True,
+                "記録日": record_date,
+                "利用者名": default_user,
+                "体温": safe_float(temp, 0) if temp != "" else 0,
+                "血圧上": safe_int(bp_high, 0),
+                "血圧下": safe_int(bp_low, 0),
+                "脈拍": safe_int(pulse, 0),
+                "SpO2": 0,
+                "体重": 0.0,
+                "朝食摂取率": 100,
+                "昼食摂取率": 100,
+                "夕食摂取率": 100,
+                "家族共有メモ": "",
+                "気になる変化": "写真取込候補",
+            })
+
+    return pd.DataFrame(rows, columns=PHOTO_IMPORT_COLUMNS)
+
+
+def make_blank_photo_import_rows(default_user, year, month):
+    """OCRが難しい時用に、選択月の1か月分の確認入力表を作成します。"""
+    rows = []
+    try:
+        year = int(year)
+        month = int(month)
+        if month == 12:
+            next_month = date(year + 1, 1, 1)
+        else:
+            next_month = date(year, month + 1, 1)
+        last_day = (next_month - timedelta(days=1)).day
+    except Exception:
+        year = today_jst().year
+        month = today_jst().month
+        last_day = 31
+
+    for d in range(1, last_day + 1):
+        rows.append({
+            "取り込む": False,
+            "記録日": date(year, month, d),
+            "利用者名": default_user,
+            "体温": 0.0,
+            "血圧上": 0,
+            "血圧下": 0,
+            "脈拍": 0,
+            "SpO2": 0,
+            "体重": 0.0,
+            "朝食摂取率": 100,
+            "昼食摂取率": 100,
+            "夕食摂取率": 100,
+            "家族共有メモ": "",
+            "気になる変化": "",
+        })
+    return pd.DataFrame(rows, columns=PHOTO_IMPORT_COLUMNS)
+
+
+def photo_import_rows_to_health_records(df, input_staff):
+    records = []
+    now_text = format_now_jst("%Y-%m-%d %H:%M:%S")
+
+    for _, row in df.iterrows():
+        if not bool(row.get("取り込む", False)):
+            continue
+
+        user_name = clean_text(row.get("利用者名"))
+        record_date = pd.to_datetime(row.get("記録日"), errors="coerce")
+        if not user_name or pd.isna(record_date):
+            continue
+
+        breakfast = safe_int(row.get("朝食摂取率"), 100)
+        lunch = safe_int(row.get("昼食摂取率"), 100)
+        dinner = safe_int(row.get("夕食摂取率"), 100)
+
+        record = {
+            "記録日": record_date.date(),
+            "利用者名": user_name,
+            "体温": safe_float(row.get("体温"), 0),
+            "血圧上": safe_int(row.get("血圧上"), 0),
+            "血圧下": safe_int(row.get("血圧下"), 0),
+            "脈拍": safe_int(row.get("脈拍"), 0),
+            "SpO2": safe_int(row.get("SpO2"), 0),
+            "体重": safe_float(row.get("体重"), 0),
+            "朝食摂取率": breakfast,
+            "昼食摂取率": lunch,
+            "夕食摂取率": dinner,
+            "朝食摂取区分": meal_option_from_percent(breakfast),
+            "昼食摂取区分": meal_option_from_percent(lunch),
+            "夕食摂取区分": meal_option_from_percent(dinner),
+            "水分摂取量ml": 0,
+            "栄養リスク": "0: 通常",
+            "口腔状態": "9: 未確認",
+            "義歯使用": "9: 未確認",
+            "LIFE補助メモ": "写真から半自動入力",
+            "家族共有メモ": clean_text(row.get("家族共有メモ")),
+            "気になる変化": clean_text(row.get("気になる変化")),
+            "登録日時": now_text,
+            "入力者": clean_text(input_staff, current_login_user()),
+        }
+        records.append(record)
+
+    return records
+
+
+def show_photo_import_menu():
+    st.header("写真から半自動入力")
+    st.caption("紙の健康チェック表の写真をもとに、候補データを作成します。必ず職員が確認してから保存します。")
+
+    if not active_users:
+        st.warning("利用者マスタに表示中の利用者がいません。")
+        return
+
+    st.info("手書き帳票は誤読が起きます。ここではAI/OCRを『下書き』として使い、保存前に人が確認する設計です。")
+
+    c1, c2, c3, c4 = st.columns(4)
+    with c1:
+        target_year = st.number_input("対象年", min_value=2024, max_value=2035, value=today_jst().year, step=1, key="photo_import_year")
+    with c2:
+        target_month = st.number_input("対象月", min_value=1, max_value=12, value=today_jst().month, step=1, key="photo_import_month")
+    with c3:
+        default_user = st.selectbox("主な利用者名", active_users, key="photo_import_default_user")
+    with c4:
+        input_staff = st.text_input("入力者", value=current_login_user(), key="photo_import_staff")
+
+    uploaded_file = st.file_uploader(
+        "健康チェック表の写真をアップロード",
+        type=["jpg", "jpeg", "png"],
+        key="photo_import_uploader",
+    )
+
+    if uploaded_file is not None:
+        st.image(uploaded_file, caption="アップロード画像", use_container_width=True)
+
+    st.subheader("1. 読み取り・候補作成")
+    st.caption("Streamlit Cloudでは通常のOCRが使えないことがあります。その場合はOpenAI画像読み取りで候補表を作ります。")
+
+    with st.expander("OpenAI APIキー設定（Streamlit Secretsに設定済みなら入力不要）", expanded=False):
+        openai_api_key_input = st.text_input(
+            "OPENAI_API_KEY",
+            type="password",
+            placeholder="sk-...（この画面入力は保存されません）",
+            key="photo_import_openai_api_key",
+        )
+        st.caption('Streamlit Cloudでは Settings → Secrets に OPENAI_API_KEY = "sk-..." と登録すると毎回入力不要です。')
+
+    if uploaded_file is not None:
+        c_ai, c_old = st.columns(2)
+        with c_ai:
+            if st.button("AIで写真から候補表を作成", use_container_width=True):
+                with st.spinner("画像を読み取り中です。読めない値は空欄になります。"):
+                    candidate_df, err = try_openai_vision_photo_import(
+                        uploaded_file,
+                        default_user,
+                        target_year,
+                        target_month,
+                        openai_api_key_input,
+                    )
+                if err:
+                    st.warning(err)
+                elif candidate_df.empty:
+                    st.warning("AI読み取り候補が作成できませんでした。空の確認表を作成して入力してください。")
+                else:
+                    st.session_state["photo_import_candidate_df"] = candidate_df
+                    st.success(f"AI読み取り候補を{len(candidate_df)}件作成しました。下の確認表で修正してください。")
+        with c_old:
+            if st.button("旧OCRで文字だけ読む", use_container_width=True):
+                ocr_text = try_ocr_image(uploaded_file)
+                if ocr_text:
+                    st.session_state["photo_import_ocr_text"] = ocr_text
+                    st.success("旧OCR読み取りが完了しました。下の欄で確認してください。")
+                else:
+                    st.session_state["photo_import_ocr_text"] = ""
+                    st.warning("この環境では旧OCRを利用できません。AI読み取り、または空の確認表を使ってください。")
+
+    raw_text = st.text_area(
+        "OCR結果・手入力テキスト",
+        value=st.session_state.get("photo_import_ocr_text", ""),
+        height=180,
+        placeholder="例：\n1 36.5 128/70 82\n2 36.4 120/68 78\n※読み取れない場合は空の確認表を作成して直接入力できます。",
+        key="photo_import_raw_text",
+    )
+
+    b1, b2 = st.columns(2)
+    with b1:
+        if st.button("テキストから候補表を作成", use_container_width=True):
+            candidate_df = parse_photo_ocr_text(raw_text, default_user, target_year, target_month, input_staff)
+            if candidate_df.empty:
+                st.warning("候補データを作成できませんでした。空の確認表を作成して入力してください。")
+            st.session_state["photo_import_candidate_df"] = candidate_df
+    with b2:
+        if st.button("空の確認表を作成", use_container_width=True):
+            st.session_state["photo_import_candidate_df"] = make_blank_photo_import_rows(default_user, target_year, target_month)
+
+    st.subheader("2. 職員確認・修正")
+    candidate_df = st.session_state.get("photo_import_candidate_df")
+    if candidate_df is None or len(candidate_df) == 0:
+        st.info("候補表はまだありません。写真を読み取るか、空の確認表を作成してください。")
+        return
+
+    edited_df = st.data_editor(
+        candidate_df,
+        use_container_width=True,
+        hide_index=True,
+        num_rows="dynamic",
+        column_config={
+            "取り込む": st.column_config.CheckboxColumn("取り込む"),
+            "記録日": st.column_config.DateColumn("記録日", format="YYYY-MM-DD"),
+            "利用者名": st.column_config.SelectboxColumn("利用者名", options=active_users),
+            "体温": st.column_config.NumberColumn("体温", min_value=0.0, max_value=42.0, step=0.1),
+            "血圧上": st.column_config.NumberColumn("血圧上", min_value=0, max_value=250, step=1),
+            "血圧下": st.column_config.NumberColumn("血圧下", min_value=0, max_value=200, step=1),
+            "脈拍": st.column_config.NumberColumn("脈拍", min_value=0, max_value=200, step=1),
+            "SpO2": st.column_config.NumberColumn("SpO2", min_value=0, max_value=100, step=1),
+            "体重": st.column_config.NumberColumn("体重", min_value=0.0, max_value=200.0, step=0.1),
+            "朝食摂取率": st.column_config.NumberColumn("朝食摂取率", min_value=0, max_value=100, step=10),
+            "昼食摂取率": st.column_config.NumberColumn("昼食摂取率", min_value=0, max_value=100, step=10),
+            "夕食摂取率": st.column_config.NumberColumn("夕食摂取率", min_value=0, max_value=100, step=10),
+        },
+        key="photo_import_editor",
+    )
+
+    st.subheader("3. 確認して保存")
+    selected_count = int(pd.Series(edited_df.get("取り込む", [])).fillna(False).astype(bool).sum())
+    st.caption(f"保存対象：{selected_count}件")
+
+    if st.button("確認済みデータを健康チェックへ保存", type="primary", use_container_width=True):
+        records = photo_import_rows_to_health_records(edited_df, input_staff)
+        if not records:
+            st.warning("保存対象がありません。取り込む行にチェックを入れてください。")
+            return
+
+        saved = 0
+        warning_rows = []
+        for record in records:
+            errors, warnings = validate_health_record(record)
+            if errors:
+                warning_rows.append({
+                    "利用者名": record["利用者名"],
+                    "記録日": record["記録日"],
+                    "内容": "／".join(errors),
+                })
+                continue
+            upsert_health_record(record)
+            saved += 1
+            if warnings:
+                warning_rows.append({
+                    "利用者名": record["利用者名"],
+                    "記録日": record["記録日"],
+                    "内容": "／".join(warnings),
+                })
+
+        st.success(f"{saved}件を健康チェックへ保存しました。")
+        if warning_rows:
+            st.warning("確認が必要な行があります。")
+            st.dataframe(pd.DataFrame(warning_rows), use_container_width=True, hide_index=True)
+
+        st.session_state["photo_import_candidate_df"] = edited_df
+
+
+
+# =========================
+# LIFE入力標準化・ADL評価データ
+# =========================
+
+def ensure_life_adl_file():
+    """
+    LIFE ADL評価をSQLiteで管理する。
+    旧Excelがある場合のみ初回移行し、以後はSQLiteを正とする。
+    """
+    ensure_dirs()
+    if sqlite_table_row_count(SQLITE_TABLE_LIFE_ADL) > 0:
+        return
+
+    df = pd.DataFrame(columns=LIFE_ADL_COLUMNS)
+    if LIFE_ADL_FILE.exists():
+        try:
+            df = pd.read_excel(LIFE_ADL_FILE, sheet_name="ADL評価")
+        except Exception:
+            try:
+                df = pd.read_excel(LIFE_ADL_FILE)
+            except Exception:
+                df = pd.DataFrame(columns=LIFE_ADL_COLUMNS)
+
+    df = normalize_df_columns(df, LIFE_ADL_COLUMNS)
+    df = attach_user_ids(df)
+    if not df.empty:
+        df["評価日"] = pd.to_datetime(df["評価日"], errors="coerce")
+        df["対象月"] = df["対象月"].astype(str)
+        df["利用者名"] = df["利用者名"].astype(str).str.strip()
+        if "評価ID" in df.columns:
+            df["評価ID"] = df["評価ID"].astype(str)
+            missing = df["評価ID"].astype(str).str.strip() == ""
+            df.loc[missing, "評価ID"] = [str(uuid.uuid4()) for _ in range(int(missing.sum()))]
+        df = df.drop_duplicates(subset=["対象月", "利用者名"], keep="last")
+
+    save_sqlite_table(
+        df,
+        SQLITE_TABLE_LIFE_ADL,
+        LIFE_ADL_COLUMNS,
+        date_cols=["評価日"],
+        unique_cols=["対象月", "利用者名"],
+    )
+
+
+def load_life_adl_data():
+    """LIFE ADL評価をSQLiteから読み込む。"""
+    ensure_life_adl_file()
+    df = load_sqlite_table(SQLITE_TABLE_LIFE_ADL, LIFE_ADL_COLUMNS, date_cols=["評価日"])
+    df = attach_user_ids(df)
+
+    if not df.empty:
+        df["評価日"] = pd.to_datetime(df["評価日"], errors="coerce")
+        for col in LIFE_ADL_COLUMNS:
+            if col != "評価日":
+                df[col] = df[col].fillna("").astype(str)
+    return df.astype("object")
+
+
+def save_life_adl_data(df):
+    """LIFE ADL評価をSQLiteへ保存する。Excelには保存しない。"""
+    ensure_dirs()
+    df = normalize_df_columns(df, LIFE_ADL_COLUMNS)
+    df = attach_user_ids(df)
+    if not df.empty:
+        df["評価日"] = pd.to_datetime(df["評価日"], errors="coerce")
+        df["対象月"] = df["対象月"].astype(str)
+        df["利用者名"] = df["利用者名"].astype(str).str.strip()
+        if "評価ID" in df.columns:
+            df["評価ID"] = df["評価ID"].astype(str)
+            missing = df["評価ID"].astype(str).str.strip() == ""
+            df.loc[missing, "評価ID"] = [str(uuid.uuid4()) for _ in range(int(missing.sum()))]
+        df = df.drop_duplicates(subset=["対象月", "利用者名"], keep="last")
+
+    save_sqlite_table(
+        df,
+        SQLITE_TABLE_LIFE_ADL,
+        LIFE_ADL_COLUMNS,
+        date_cols=["評価日"],
+        unique_cols=["対象月", "利用者名"],
+    )
+
+def upsert_life_adl_record(record):
+    df = load_life_adl_data()
+    target_month = clean_text(record.get("対象月"))
+    user_name = clean_text(record.get("利用者名"))
+    if df.empty:
+        idx = None
+    else:
+        mask = (df["対象月"].astype(str) == target_month) & (df["利用者名"].astype(str) == user_name)
+        matches = df.index[mask].tolist()
+        idx = matches[0] if matches else None
+
+    if idx is None:
+        df = pd.concat([df, pd.DataFrame([record], columns=LIFE_ADL_COLUMNS)], ignore_index=True)
+        action = "登録"
+    else:
+        for col in LIFE_ADL_COLUMNS:
+            df.at[idx, col] = record.get(col, "")
+        action = "更新"
+    save_life_adl_data(df)
+    return action
+
+
+def build_life_month_summary(user_name, target_year, target_month):
+    health_df = get_month_health_data(load_health_data(), user_name, target_year, target_month)
+    ex_df = get_month_excretion_data(load_excretion_data(), user_name, target_year, target_month)
+
+    result = {
+        "利用者名": user_name,
+        "対象月": f"{int(target_year):04d}-{int(target_month):02d}",
+        "健康記録日数": len(health_df),
+        "平均体温": "",
+        "平均SpO2": "",
+        "平均体重": "",
+        "平均食事摂取率": "",
+        "排尿回数": 0,
+        "排便回数": 0,
+        "水様便・下痢便回数": 0,
+        "気になる変化件数": 0,
+        "不足項目": "",
+    }
+
+    missing = []
+    if health_df.empty:
+        missing.append("健康チェック未入力")
+    else:
+        for col, label in [("体温", "体温"), ("SpO2", "SpO2"), ("体重", "体重")]:
+            vals = to_number(health_df[col]) if col in health_df.columns else pd.Series(dtype=float)
+            vals = vals[vals > 0]
+            if vals.empty:
+                missing.append(f"{label}未入力")
+            else:
+                result[f"平均{label}"] = round(float(vals.mean()), 1)
+
+        meal_cols = ["朝食摂取率", "昼食摂取率", "夕食摂取率"]
+        meal_vals = []
+        for col in meal_cols:
+            if col in health_df.columns:
+                meal_vals.extend(to_number(health_df[col]).dropna().tolist())
+        if meal_vals:
+            result["平均食事摂取率"] = round(float(pd.Series(meal_vals).mean()), 1)
+        else:
+            missing.append("食事摂取率未入力")
+
+        if "気になる変化" in health_df.columns:
+            result["気になる変化件数"] = int((health_df["気になる変化"].fillna("").astype(str).str.strip() != "").sum())
+
+    if ex_df.empty:
+        missing.append("排泄チェック未入力")
+    else:
+        ex_sum = summarize_excretion(ex_df)
+        result["排尿回数"] = ex_sum["排尿回数"]
+        result["排便回数"] = ex_sum["排便回数"]
+        result["水様便・下痢便回数"] = ex_sum["水様便"] + ex_sum["下痢便"]
+
+    adl_df = load_life_adl_data()
+    target_ym = f"{int(target_year):04d}-{int(target_month):02d}"
+    if adl_df.empty or adl_df[(adl_df["利用者名"] == user_name) & (adl_df["対象月"] == target_ym)].empty:
+        missing.append("ADL月次評価未入力")
+
+    result["不足項目"] = "、".join(missing) if missing else "不足なし"
+    return result
+
+
+def show_life_standardization_menu():
+    if not is_admin_user():
+        st.warning("このメニューは管理者専用です。")
+        return
+    st.header("LIFE入力標準化")
+    st.caption("日々の記録をLIFE提出補助へつなげるため、自由入力ではなく選択式・コード化した項目を増やします。")
+
+    if not active_users:
+        st.warning("利用者マスタに表示中の利用者がいません。")
+        return
+
+    tab1, tab2, tab3 = st.tabs(["ADL月次評価", "月次不足チェック", "入力基準表"])
+
+    with tab1:
+        st.subheader("ADL月次評価")
+        st.info("ADLは毎日ではなく、月1回または状態変化時に評価する想定です。")
+        adl_df = load_life_adl_data()
+        c1, c2, c3 = st.columns(3)
+        with c1:
+            eval_date = st.date_input("評価日", value=today_jst(), key="life_adl_eval_date")
+        with c2:
+            user_name = st.selectbox("利用者名", active_users, key="life_adl_user")
+        with c3:
+            input_staff = st.text_input("入力者", placeholder="例：藤野", key="life_adl_staff")
+
+        target_month = eval_date.strftime("%Y-%m")
+        existing = adl_df[(adl_df["対象月"].astype(str) == target_month) & (adl_df["利用者名"].astype(str) == user_name)]
+        row = existing.iloc[-1] if not existing.empty else None
+
+        def adl_default(col):
+            if row is None:
+                return 4  # 9: 未確認
+            return get_life_option_index(ADL_LEVEL_OPTIONS, row.get(col, "9: 未確認"), 4)
+
+        with st.form("life_adl_form", clear_on_submit=False):
+            a1, a2, a3 = st.columns(3)
+            with a1:
+                walk = st.selectbox("歩行", ADL_LEVEL_OPTIONS, index=adl_default("歩行"))
+            with a2:
+                transfer = st.selectbox("移乗", ADL_LEVEL_OPTIONS, index=adl_default("移乗"))
+            with a3:
+                meal_adl = st.selectbox("食事動作", ADL_LEVEL_OPTIONS, index=adl_default("食事動作"))
+
+            a4, a5, a6 = st.columns(3)
+            with a4:
+                toilet_adl = st.selectbox("排泄動作", ADL_LEVEL_OPTIONS, index=adl_default("排泄動作"))
+            with a5:
+                dressing = st.selectbox("更衣", ADL_LEVEL_OPTIONS, index=adl_default("更衣"))
+            with a6:
+                cognitive = st.selectbox("認知・行動", COGNITIVE_OPTIONS, index=get_life_option_index(COGNITIVE_OPTIONS, row.get("認知・行動", "9: 未確認") if row is not None else "9: 未確認", 4))
+
+            memo = st.text_area("評価メモ", value=clean_text(row.get("評価メモ", "")) if row is not None else "", placeholder="状態変化や判断理由を記録")
+            submitted = st.form_submit_button("ADL評価を保存", use_container_width=True)
+
+        if submitted:
+            record = {
+                "評価ID": clean_text(row.get("評価ID", "")) if row is not None else str(uuid.uuid4()),
+                "評価日": eval_date,
+                "対象月": target_month,
+                "利用者名": user_name,
+                "歩行": walk,
+                "移乗": transfer,
+                "食事動作": meal_adl,
+                "排泄動作": toilet_adl,
+                "更衣": dressing,
+                "認知・行動": cognitive,
+                "評価メモ": clean_text(memo),
+                "入力者": clean_text(input_staff),
+                "登録日時": format_now_jst("%Y-%m-%d %H:%M:%S"),
+            }
+            action = upsert_life_adl_record(record)
+            st.success(f"ADL月次評価を{action}しました。")
+            st.rerun()
+
+        st.subheader("ADL評価一覧")
+        if adl_df.empty:
+            st.info("ADL評価はまだ登録されていません。")
+        else:
+            st.dataframe(adl_df.drop(columns=["評価ID"], errors="ignore"), use_container_width=True, hide_index=True)
+
+    with tab2:
+        st.subheader("月次不足チェック")
+        today = today_jst()
+        c1, c2 = st.columns(2)
+        with c1:
+            target_year = st.number_input("年", min_value=2024, max_value=2035, value=today.year, step=1)
+        with c2:
+            target_month = st.number_input("月", min_value=1, max_value=12, value=today.month, step=1)
+
+        if st.button("月次チェックを表示", use_container_width=True):
+            rows = [build_life_month_summary(user, target_year, target_month) for user in active_users]
+            summary_df = pd.DataFrame(rows)
+            st.dataframe(summary_df, use_container_width=True, hide_index=True)
+            output = BytesIO()
+            with pd.ExcelWriter(output, engine="openpyxl") as writer:
+                summary_df.to_excel(writer, index=False, sheet_name="LIFE月次不足チェック")
+            st.download_button(
+                "月次不足チェックをExcelでダウンロード",
+                data=output.getvalue(),
+                file_name=f"LIFE月次不足チェック_{int(target_year)}-{int(target_month):02d}.xlsx",
+                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                use_container_width=True,
+            )
+
+    with tab3:
+        st.subheader("入力基準表")
+        rows = []
+        for label, opts in [
+            ("食事摂取区分", MEAL_INTAKE_OPTIONS),
+            ("栄養リスク", NUTRITION_RISK_OPTIONS),
+            ("口腔状態", ORAL_STATUS_OPTIONS),
+            ("義歯使用", DENTURE_OPTIONS),
+            ("ADL", ADL_LEVEL_OPTIONS),
+            ("認知・行動", COGNITIVE_OPTIONS),
+            ("尿量", [f"{v}: {k}" for k, v in URINE_AMOUNT_CODE.items()]),
+            ("尿性状", [f"{v}: {k}" for k, v in URINE_TYPE_CODE.items()]),
+            ("便量", [f"{v}: {k}" for k, v in STOOL_AMOUNT_CODE.items()]),
+            ("便性状", [f"{v}: {k}" for k, v in STOOL_TYPE_CODE.items()]),
+        ]:
+            for opt in opts:
+                rows.append({"項目": label, "入力基準": opt})
+        st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True)
+
+
+
+# =========================
+# 加算シミュレーション
+# =========================
+def get_yamato_gh_addon_candidates(resident_count=9, days_per_month=30):
+    """神奈川県大和市・認知症対応型共同生活介護（GH）向けの加算候補マスタ。
+    すべての加算を網羅するものではなく、9名GHで検討頻度が高い候補を画面から追加できるようにするための初期マスタ。
+    単位数・要件は制度改定や施設状況で変わるため、請求前に必ず最新資料・請求ソフトで確認する。
+    """
+    rc = int(resident_count) if resident_count else 9
+    dm = int(days_per_month) if days_per_month else 30
+    return pd.DataFrame([
+        {
+            "追加": False,
+            "サービス": "GH",
+            "地域": "神奈川県大和市",
+            "地域区分": "5級地",
+            "1単位単価": 10.80,
+            "加算カテゴリ": "LIFE・記録",
+            "加算名": "科学的介護推進体制加算（LIFE）",
+            "単位": 40,
+            "算定単位": "人/月",
+            "対象人数": rc,
+            "月回数": 1,
+            "取得": False,
+            "確認ポイント": "LIFE提出、フィードバック活用、記録・計画への反映。",
+            "メモ": "9名満床なら 40単位×9名×10.80円＝月3,888円。",
+        },
+        {
+            "追加": False,
+            "サービス": "GH",
+            "地域": "神奈川県大和市",
+            "地域区分": "5級地",
+            "1単位単価": 10.80,
+            "加算カテゴリ": "職員体制",
+            "加算名": "サービス提供体制強化加算Ⅰ（候補）",
+            "単位": 22,
+            "算定単位": "人/日",
+            "対象人数": rc,
+            "月回数": dm,
+            "取得": False,
+            "確認ポイント": "介護福祉士割合、勤続年数、常勤割合等の体制要件。",
+            "メモ": "候補値。Ⅰ・Ⅱ・Ⅲのどれに該当するか確認が必要。",
+        },
+        {
+            "追加": False,
+            "サービス": "GH",
+            "地域": "神奈川県大和市",
+            "地域区分": "5級地",
+            "1単位単価": 10.80,
+            "加算カテゴリ": "医療連携",
+            "加算名": "医療連携体制加算Ⅰ（候補）",
+            "単位": 39,
+            "算定単位": "人/日",
+            "対象人数": rc,
+            "月回数": dm,
+            "取得": False,
+            "確認ポイント": "看護師配置・連携体制、重度化対応、健康管理体制。",
+            "メモ": "施設の届出区分により単位が変わる可能性あり。",
+        },
+        {
+            "追加": False,
+            "サービス": "GH",
+            "地域": "神奈川県大和市",
+            "地域区分": "5級地",
+            "1単位単価": 10.80,
+            "加算カテゴリ": "医療連携",
+            "加算名": "協力医療機関連携加算（候補）",
+            "単位": 100,
+            "算定単位": "事業所/月",
+            "対象人数": 1,
+            "月回数": 1,
+            "取得": False,
+            "確認ポイント": "協力医療機関との実効性ある連携、会議・情報共有、届出。",
+            "メモ": "令和6年度改定で重要度が上がった候補。区分・経過措置の確認が必要。",
+        },
+        {
+            "追加": False,
+            "サービス": "GH",
+            "地域": "神奈川県大和市",
+            "地域区分": "5級地",
+            "1単位単価": 10.80,
+            "加算カテゴリ": "認知症ケア",
+            "加算名": "認知症チームケア推進加算（候補）",
+            "単位": 150,
+            "算定単位": "人/月",
+            "対象人数": rc,
+            "月回数": 1,
+            "取得": False,
+            "確認ポイント": "BPSD等の評価、チームケア体制、計画・会議・記録。",
+            "メモ": "Ⅰ・Ⅱ等の区分や対象者要件の確認が必要。",
+        },
+        {
+            "追加": False,
+            "サービス": "GH",
+            "地域": "神奈川県大和市",
+            "地域区分": "5級地",
+            "1単位単価": 10.80,
+            "加算カテゴリ": "夜間体制",
+            "加算名": "夜間支援体制加算（候補）",
+            "単位": 50,
+            "算定単位": "人/日",
+            "対象人数": rc,
+            "月回数": dm,
+            "取得": False,
+            "確認ポイント": "夜勤・宿直等の配置、ユニット数、届出区分。",
+            "メモ": "区分により単位差あり。施設の夜間配置で確認。",
+        },
+        {
+            "追加": False,
+            "サービス": "GH",
+            "地域": "神奈川県大和市",
+            "地域区分": "5級地",
+            "1単位単価": 10.80,
+            "加算カテゴリ": "口腔・栄養",
+            "加算名": "口腔・栄養スクリーニング加算（候補）",
+            "単位": 20,
+            "算定単位": "人/6か月",
+            "対象人数": rc,
+            "月回数": 1,
+            "取得": False,
+            "確認ポイント": "6か月ごとのスクリーニング、結果共有、記録保存。",
+            "メモ": "算定月だけ発生する加算として扱う。",
+        },
+        {
+            "追加": False,
+            "サービス": "GH",
+            "地域": "神奈川県大和市",
+            "地域区分": "5級地",
+            "1単位単価": 10.80,
+            "加算カテゴリ": "入退居支援",
+            "加算名": "退居時情報提供加算（候補）",
+            "単位": 250,
+            "算定単位": "人/回",
+            "対象人数": 0,
+            "月回数": 1,
+            "取得": False,
+            "確認ポイント": "医療機関等への情報提供、退居時の記録・様式。",
+            "メモ": "該当者がいる月だけ人数を入力。",
+        },
+        {
+            "追加": False,
+            "サービス": "GH",
+            "地域": "神奈川県大和市",
+            "地域区分": "5級地",
+            "1単位単価": 10.80,
+            "加算カテゴリ": "個別要件",
+            "加算名": "若年性認知症利用者受入加算（該当者のみ）",
+            "単位": 120,
+            "算定単位": "人/日",
+            "対象人数": 0,
+            "月回数": dm,
+            "取得": False,
+            "確認ポイント": "若年性認知症の該当者、個別担当者・支援内容の確認。",
+            "メモ": "該当利用者がいる場合のみ対象人数を入力。",
+        },
+        {
+            "追加": False,
+            "サービス": "GH",
+            "地域": "神奈川県大和市",
+            "地域区分": "5級地",
+            "1単位単価": 10.80,
+            "加算カテゴリ": "自由入力",
+            "加算名": "独自入力欄",
+            "単位": 0,
+            "算定単位": "人/月",
+            "対象人数": rc,
+            "月回数": 1,
+            "取得": False,
+            "確認ポイント": "請求ソフト・指定権者資料で確認した加算を入力。",
+            "メモ": "マスタにない加算を追加するための行。",
+        },
+    ])
+
+
+
+def should_sync_resident_count(row):
+    """基本設定の利用者数を反映する対象かを判定する。
+    個別該当者だけの加算や退居時などは、0人のまま手入力できるように残す。
+    """
+    unit = str(row.get("算定単位", ""))
+    name = str(row.get("加算名", ""))
+    category = str(row.get("加算カテゴリ", ""))
+
+    if not unit.startswith("人/"):
+        return False
+
+    # 該当者だけ入力する加算は自動上書きしない
+    exclusion_words = ["該当者", "若年性", "退居時", "退居", "個別要件"]
+    if any(w in name for w in exclusion_words) or any(w in category for w in ["個別要件", "入退居支援"]):
+        return False
+
+    return True
+
+
+def sync_addon_basic_settings(df, resident_count, days_per_month, unit_price, region_name, region_class):
+    """基本設定（人数・日数・単価・地域）を加算表へ反映する。
+    st.session_state に古い人数が残っていても、通常の人/月・人/日加算は現在の利用者数へ合わせる。
+    """
+    work = df.copy()
+    if work.empty:
+        return work
+
+    if "対象人数" not in work.columns:
+        work["対象人数"] = 0
+    if "月回数" not in work.columns:
+        work["月回数"] = 1
+    if "1単位単価" not in work.columns:
+        work["1単位単価"] = unit_price
+    if "地域" not in work.columns:
+        work["地域"] = region_name
+    if "地域区分" not in work.columns:
+        work["地域区分"] = region_class
+
+    work["対象人数"] = work.apply(
+        lambda r: int(resident_count) if should_sync_resident_count(r) else int(safe_int(r.get("対象人数"), 0)),
+        axis=1,
+    )
+    work["月回数"] = work.apply(
+        lambda r: int(days_per_month) if str(r.get("算定単位", "")).endswith("/日") else int(safe_int(r.get("月回数"), 1)),
+        axis=1,
+    )
+    work["1単位単価"] = float(unit_price)
+    work["地域"] = region_name
+    work["地域区分"] = region_class or "5級地"
+    return work
+
+def get_gh_addon_master_default(resident_count=9, days_per_month=30):
+    """初期表示用マスタ。大和市候補のうち、基本的な行だけを表示する。"""
+    candidates = get_yamato_gh_addon_candidates(resident_count, days_per_month)
+    base_names = [
+        "科学的介護推進体制加算（LIFE）",
+        "サービス提供体制強化加算Ⅰ（候補）",
+        "医療連携体制加算Ⅰ（候補）",
+        "口腔・栄養スクリーニング加算（候補）",
+        "若年性認知症利用者受入加算（該当者のみ）",
+        "独自入力欄",
+    ]
+    df = candidates[candidates["加算名"].isin(base_names)].copy()
+    df = df.drop(columns=["追加"], errors="ignore")
+    return df.reset_index(drop=True)
+
+
+def calc_addon_simulation(df, unit_price):
+    work = df.copy()
+    for col in ["単位", "対象人数", "月回数"]:
+        work[col] = pd.to_numeric(work[col], errors="coerce").fillna(0)
+    if "取得" not in work.columns:
+        work["取得"] = False
+    if "1単位単価" not in work.columns:
+        work["1単位単価"] = float(unit_price)
+    work["1単位単価"] = pd.to_numeric(work["1単位単価"], errors="coerce").fillna(float(unit_price))
+    work["月間単位"] = work.apply(
+        lambda r: int(r["単位"] * r["対象人数"] * r["月回数"]) if bool(r.get("取得", False)) else 0,
+        axis=1,
+    )
+    work["月額目安"] = (work["月間単位"] * work["1単位単価"]).round(0).astype(int)
+    work["年間目安"] = (work["月額目安"] * 12).astype(int)
+    return work
+
+
+def show_addon_simulation_menu():
+    st.header("加算シミュレーション")
+    st.caption("神奈川県大和市のグループホームを前提に、取得候補の加算をマスタから追加して概算します。")
+
+    st.info(
+        "この画面は概算用です。大和市は5級地として1単位10.80円を初期値にしています。"
+        "ただし、単位数・要件・届出区分は改定や施設状況で変わります。請求前には必ず最新資料・指定権者・請求ソフトで確認してください。"
+    )
+
+    with st.expander("基本設定", expanded=True):
+        c1, c2, c3, c4 = st.columns(4)
+        with c1:
+            facility_type = st.selectbox(
+                "サービス種別",
+                ["認知症対応型共同生活介護（グループホーム）", "通所介護", "小規模多機能", "その他"],
+                index=0,
+            )
+        with c2:
+            resident_count = st.number_input("利用者数", min_value=0, max_value=99, value=len(active_users) if active_users else 9, step=1)
+        with c3:
+            days_per_month = st.number_input("月の日数", min_value=1, max_value=31, value=30, step=1)
+        with c4:
+            unit_price = st.number_input("1単位単価（円）", min_value=1.0, max_value=20.0, value=10.80, step=0.01)
+
+        c5, c6 = st.columns(2)
+        with c5:
+            region_name = st.selectbox("地域", ["神奈川県大和市", "神奈川県綾瀬市", "神奈川県藤沢市", "神奈川県横浜市", "その他"], index=0)
+        with c6:
+            region_class = st.text_input("地域区分", value="5級地" if region_name == "神奈川県大和市" else "")
+
+    if "addon_editor_base" not in st.session_state:
+        st.session_state["addon_editor_base"] = get_gh_addon_master_default(resident_count, days_per_month)
+
+    st.subheader("1. 大和市で検討できる加算候補を追加")
+    st.caption("追加したい加算にチェックを入れて、下のボタンを押すとシミュレーション表へ行が追加されます。")
+
+    candidate_df = get_yamato_gh_addon_candidates(resident_count, days_per_month)
+    candidate_df["1単位単価"] = unit_price
+    candidate_df["地域"] = region_name
+    candidate_df["地域区分"] = region_class or candidate_df["地域区分"]
+
+    candidate_edited = st.data_editor(
+        candidate_df,
+        use_container_width=True,
+        hide_index=True,
+        column_config={
+            "追加": st.column_config.CheckboxColumn("追加", default=False),
+            "取得": st.column_config.CheckboxColumn("取得", default=False),
+            "単位": st.column_config.NumberColumn("単位", min_value=0, step=1),
+            "対象人数": st.column_config.NumberColumn("対象人数", min_value=0, step=1),
+            "月回数": st.column_config.NumberColumn("月回数", min_value=0, step=1),
+            "1単位単価": st.column_config.NumberColumn("1単位単価", min_value=1.0, max_value=20.0, step=0.01),
+            "算定単位": st.column_config.SelectboxColumn("算定単位", options=["人/月", "人/日", "人/回", "人/6か月", "事業所/月", "その他"]),
+        },
+        key="yamato_addon_candidate_editor",
+    )
+
+    b1, b2 = st.columns(2)
+    with b1:
+        if st.button("チェックした加算をシミュレーション表へ追加", use_container_width=True):
+            add_df = candidate_edited[candidate_edited.get("追加", False) == True].copy()
+            if add_df.empty:
+                st.warning("追加する加算にチェックを入れてください。")
+            else:
+                add_df = add_df.drop(columns=["追加"], errors="ignore")
+                add_df = sync_addon_basic_settings(add_df, resident_count, days_per_month, unit_price, region_name, region_class)
+                base_df = st.session_state.get("addon_editor_base", pd.DataFrame())
+                base_df = sync_addon_basic_settings(base_df, resident_count, days_per_month, unit_price, region_name, region_class)
+                merged = pd.concat([base_df, add_df], ignore_index=True)
+                if "加算名" in merged.columns:
+                    merged = merged.drop_duplicates(subset=["加算名"], keep="last")
+                st.session_state["addon_editor_base"] = merged.reset_index(drop=True)
+                st.success(f"{len(add_df)}件の加算候補を追加しました。")
+                st.rerun()
+    with b2:
+        if st.button("大和市GH候補マスタに戻す", use_container_width=True):
+            st.session_state["addon_editor_base"] = get_gh_addon_master_default(resident_count, days_per_month)
+            st.success("初期候補マスタに戻しました。")
+            st.rerun()
+
+    st.subheader("2. 加算マスタ入力・編集")
+    st.caption("単位数・人数・日数・取得チェックはここで編集できます。")
+
+    default_df = st.session_state.get("addon_editor_base", get_gh_addon_master_default(resident_count, days_per_month)).copy()
+    default_df = sync_addon_basic_settings(default_df, resident_count, days_per_month, unit_price, region_name, region_class)
+
+    edited_df = st.data_editor(
+        default_df,
+        use_container_width=True,
+        hide_index=True,
+        num_rows="dynamic",
+        column_config={
+            "取得": st.column_config.CheckboxColumn("取得", default=False),
+            "単位": st.column_config.NumberColumn("単位", min_value=0, step=1),
+            "対象人数": st.column_config.NumberColumn("対象人数", min_value=0, step=1),
+            "月回数": st.column_config.NumberColumn("月回数", min_value=0, step=1),
+            "1単位単価": st.column_config.NumberColumn("1単位単価", min_value=1.0, max_value=20.0, step=0.01),
+            "算定単位": st.column_config.SelectboxColumn("算定単位", options=["人/月", "人/日", "人/回", "人/6か月", "事業所/月", "その他"]),
+        },
+        key="addon_simulation_editor",
+    )
+
+    st.session_state["addon_editor_base"] = edited_df.copy()
+
+    result_df = calc_addon_simulation(edited_df, unit_price)
+
+    st.subheader("3. 概算結果")
+    st.caption("ここでも取得チェックを直接変更できます。チェック後、月間単位・月額目安・年間目安を再計算します。")
+
+    display_cols = [
+        "取得", "地域", "地域区分", "加算カテゴリ", "加算名", "単位", "算定単位", "対象人数", "月回数", "1単位単価",
+        "月間単位", "月額目安", "年間目安", "確認ポイント", "メモ"
+    ]
+    for col in display_cols:
+        if col not in result_df.columns:
+            result_df[col] = ""
+
+    # 概算結果でもチェック操作できるように st.data_editor を使う
+    result_input_df = result_df[display_cols].copy()
+    if "取得" in result_input_df.columns:
+        result_input_df["取得"] = result_input_df["取得"].fillna(False).astype(bool)
+
+    result_edited_df = st.data_editor(
+        result_input_df,
+        use_container_width=True,
+        hide_index=True,
+        column_config={
+            "取得": st.column_config.CheckboxColumn("取得", default=False),
+            "単位": st.column_config.NumberColumn("単位", min_value=0, step=1),
+            "対象人数": st.column_config.NumberColumn("対象人数", min_value=0, step=1),
+            "月回数": st.column_config.NumberColumn("月回数", min_value=0, step=1),
+            "1単位単価": st.column_config.NumberColumn("1単位単価", min_value=1.0, max_value=20.0, step=0.01),
+            "算定単位": st.column_config.SelectboxColumn("算定単位", options=["人/月", "人/日", "人/回", "人/6か月", "事業所/月", "その他"]),
+            "月間単位": st.column_config.NumberColumn("月間単位", disabled=True),
+            "月額目安": st.column_config.NumberColumn("月額目安", disabled=True),
+            "年間目安": st.column_config.NumberColumn("年間目安", disabled=True),
+        },
+        key="addon_result_checkbox_editor",
+    )
+
+    # 結果欄で変更した内容をもとに再計算し、次回表示にも反映する
+    result_df = calc_addon_simulation(result_edited_df, unit_price)
+    st.session_state["addon_editor_base"] = result_df.drop(columns=["月間単位", "月額目安", "年間目安"], errors="ignore").copy()
+
+    total_units = int(result_df["月間単位"].sum()) if not result_df.empty else 0
+    total_month_yen = int(result_df["月額目安"].sum()) if not result_df.empty else 0
+    total_year_yen = int(result_df["年間目安"].sum()) if not result_df.empty else 0
+
+    m1, m2, m3, m4 = st.columns(4)
+    m1.metric("月間単位", f"{total_units:,} 単位")
+    m2.metric("月額目安", f"{total_month_yen:,} 円")
+    m3.metric("年間目安", f"{total_year_yen:,} 円")
+    per_user = int(total_month_yen / resident_count) if resident_count else 0
+    m4.metric("1人あたり月額", f"{per_user:,} 円")
+
+    with st.expander("再計算後の明細を確認", expanded=False):
+        st.dataframe(result_df[display_cols], use_container_width=True, hide_index=True)
+
+    st.subheader("4. 取り漏れ確認メモ")
+    st.markdown(
+        """
+- LIFE系：科学的介護推進体制加算、口腔・栄養関連、ADL・モニタリング系の記録連携を確認
+- 医療連携系：医療連携体制加算、協力医療機関連携加算、退居時情報提供加算を確認
+- 体制系：サービス提供体制強化加算、夜間支援体制、認知症チームケア推進加算を確認
+- 書類系：計画書、同意、モニタリング、会議録、LIFE提出履歴、職員配置根拠を確認
+- 注意：加算は「取れるか」より「継続して根拠を残せるか」が重要
+        """
+    )
+
+    output = BytesIO()
+    with pd.ExcelWriter(output, engine="openpyxl") as writer:
+        pd.DataFrame([{
+            "サービス種別": facility_type,
+            "地域": region_name,
+            "地域区分": region_class,
+            "利用者数": resident_count,
+            "月の日数": days_per_month,
+            "1単位単価": unit_price,
+            "月間単位合計": total_units,
+            "月額目安合計": total_month_yen,
+            "年間目安合計": total_year_yen,
+            "注意": "概算用。請求前に最新の介護報酬・指定権者資料・請求ソフトで確認。",
+        }]).to_excel(writer, index=False, sheet_name="概算サマリー")
+        result_df.to_excel(writer, index=False, sheet_name="加算シミュレーション")
+        candidate_edited.to_excel(writer, index=False, sheet_name="大和市GH候補マスタ")
+
+    st.download_button(
+        "加算シミュレーション結果をExcelでダウンロード",
+        data=output.getvalue(),
+        file_name=f"大和市_GH_加算シミュレーション_{format_now_jst('%Y%m%d_%H%M')}.xlsx",
+        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        use_container_width=True,
+    )
+
+
+
+
+# =========================
+# 業務全体申し送りデータ
+# =========================
+def ensure_business_handover_file():
+    """互換用。実データはSQLite（hidamari_health.db / handover_logs）へ保存します。"""
+    migrate_excel_to_sqlite_if_needed(
+        SQLITE_TABLE_HANDOVER,
+        HANDOVER_FILE,
+        "業務全体申し送り",
+        BUSINESS_HANDOVER_COLUMNS,
+        date_cols=["日付"],
+        unique_cols=["記録ID"],
+    )
+
+
+def load_business_handover_data():
+    """業務全体申し送りをSQLiteから読み込む。"""
+    ensure_business_handover_file()
+    df = load_sqlite_table(SQLITE_TABLE_HANDOVER, BUSINESS_HANDOVER_COLUMNS, date_cols=["日付"])
+
+    if not df.empty:
+        df["日付"] = pd.to_datetime(df["日付"], errors="coerce")
+        for col in ["記録ID", "勤務帯", "記入者", "対象区分", "user_id", "利用者名", "全体申し送り", "要確認事項", "優先度", "対応状況", "写真1", "写真2", "Excel自動抽出情報", "入力Excelファイル", "入力Excel表示情報", "記録日時"]:
+            if col not in df.columns:
+                df[col] = ""
+            df[col] = df[col].fillna("").astype(str)
+
+    return df.astype("object")
+
+
+def save_business_handover_data(df):
+    """業務全体申し送りをSQLiteへ保存する。"""
+    ensure_dirs()
+    df = normalize_df_columns(df, BUSINESS_HANDOVER_COLUMNS)
+
+    if not df.empty:
+        df["日付"] = pd.to_datetime(df["日付"], errors="coerce")
+        df["_sort_dt"] = pd.to_datetime(df["記録日時"], errors="coerce")
+        df = df.sort_values(["日付", "_sort_dt"], ascending=[False, False]).drop(columns=["_sort_dt"])
+
+    save_sqlite_table(
+        df,
+        SQLITE_TABLE_HANDOVER,
+        BUSINESS_HANDOVER_COLUMNS,
+        date_cols=["日付"],
+        unique_cols=["記録ID"],
+        sort_cols=["記録日時"],
+    )
+    add_audit_log("保存", SQLITE_TABLE_HANDOVER, "", "業務全体申し送りを保存しました")
+
+
+def make_business_handover_id(record_date, shift_type, staff_name):
+    d = pd.to_datetime(record_date, errors="coerce")
+    date_text = d.strftime("%Y%m%d") if not pd.isna(d) else format_now_jst("%Y%m%d")
+    staff_text = clean_text(staff_name, "未入力").replace(" ", "").replace("　", "")
+    shift_text = clean_text(shift_type, "勤務")
+    now_text = format_now_jst("%H%M%S")
+    return f"BH-{date_text}-{shift_text}-{staff_text}-{now_text}"
+
+
+def get_business_handover_by_date(df, target_date):
+    if df.empty:
+        return pd.DataFrame(columns=BUSINESS_HANDOVER_COLUMNS)
+
+    work = df.copy()
+    work["日付"] = pd.to_datetime(work["日付"], errors="coerce")
+    target = pd.to_datetime(target_date, errors="coerce")
+
+    if pd.isna(target):
+        return pd.DataFrame(columns=BUSINESS_HANDOVER_COLUMNS)
+
+    work = work[work["日付"].dt.date == target.date()].copy()
+    if not work.empty:
+        work["_sort_dt"] = pd.to_datetime(work["記録日時"], errors="coerce")
+        work = work.sort_values("_sort_dt", ascending=False).drop(columns=["_sort_dt"])
+
+    return work
+
+
+
+def get_business_handover_in_progress(df, exclude_today=False):
+    """対応状況が「対応中」の申し送りを一覧化する。"""
+    if df.empty:
+        return pd.DataFrame(columns=BUSINESS_HANDOVER_COLUMNS)
+
+    work = df.copy()
+    work["日付"] = pd.to_datetime(work["日付"], errors="coerce")
+    work["対応状況"] = work["対応状況"].fillna("").astype(str).str.strip()
+    work = work[work["対応状況"] == "対応中"].copy()
+
+    if exclude_today:
+        today_value = today_jst()
+        work = work[work["日付"].dt.date != today_value].copy()
+
+    if not work.empty:
+        work["_sort_date"] = pd.to_datetime(work["日付"], errors="coerce")
+        work["_sort_dt"] = pd.to_datetime(work["記録日時"], errors="coerce")
+        work = work.sort_values(["_sort_date", "_sort_dt"], ascending=[False, False]).drop(columns=["_sort_date", "_sort_dt"])
+
+    return work
+
+
+def show_business_handover_in_progress_section(df):
+    """本日の申し送りの下に、未完了の対応中案件を表示する。"""
+    st.subheader("対応中案件")
+    in_progress_df = get_business_handover_in_progress(df, exclude_today=False)
+
+    if in_progress_df.empty:
+        st.info("現在、対応中の業務全体申し送りはありません。")
+        return
+
+    st.warning(f"対応中の案件が {len(in_progress_df)} 件あります。対応状況を確認してください。")
+    for _, row in in_progress_df.iterrows():
+        render_business_handover_card(row)
+
+
+def get_business_handover_alerts(df):
+    if df.empty:
+        return pd.DataFrame(columns=BUSINESS_HANDOVER_COLUMNS)
+
+    work = df.copy()
+    work["日付"] = pd.to_datetime(work["日付"], errors="coerce")
+    alert_df = work[
+        (work["対応状況"].isin(["未対応", "対応中"]))
+        | (work["優先度"] == "至急")
+    ].copy()
+
+    if not alert_df.empty:
+        alert_df["_sort_dt"] = pd.to_datetime(alert_df["記録日時"], errors="coerce")
+        alert_df = alert_df.sort_values(["日付", "_sort_dt"], ascending=[False, False]).drop(columns=["_sort_dt"])
+
+    return alert_df
+
+
+
+def save_business_handover_photo(uploaded_file, record_id, photo_no):
+    """業務全体申し送りに添付された写真を保存し、保存パスを返す。"""
+    if uploaded_file is None:
+        return ""
+
+    ensure_dirs()
+    original_name = clean_text(getattr(uploaded_file, "name", ""), "photo.jpg")
+    suffix = Path(original_name).suffix.lower()
+    if suffix not in [".jpg", ".jpeg", ".png", ".webp"]:
+        suffix = ".jpg"
+
+    safe_record_id = re.sub(r"[^A-Za-z0-9_-]", "_", clean_text(record_id, "handover"))
+    file_name = f"{safe_record_id}_photo{photo_no}{suffix}"
+    save_path = BUSINESS_HANDOVER_PHOTO_DIR / file_name
+
+    try:
+        uploaded_file.seek(0)
+        save_path.write_bytes(uploaded_file.read())
+        return str(save_path)
+    except Exception:
+        return ""
+
+
+def show_business_handover_photo(photo_path, caption="添付写真"):
+    """保存済み写真を画面表示する。"""
+    photo_path = clean_text(photo_path)
+    if not photo_path:
+        return
+    path = Path(photo_path)
+    if not path.exists():
+        st.caption(f"{caption}：保存ファイルが見つかりません。")
+        return
+    try:
+        st.image(str(path), caption=caption, use_container_width=True)
+    except Exception:
+        st.caption(f"{caption}：画像を表示できませんでした。")
+
+
+def save_business_handover_excel(uploaded_file, record_id):
+    """業務全体申し送りに添付されたExcel/CSVを保存し、保存パスを返す。"""
+    if uploaded_file is None:
+        return ""
+
+    ensure_dirs()
+    original_name = clean_text(getattr(uploaded_file, "name", ""), "handover.xlsx")
+    suffix = Path(original_name).suffix.lower()
+    if suffix not in [".xlsx", ".xls", ".csv"]:
+        suffix = ".xlsx"
+
+    safe_record_id = re.sub(r"[^A-Za-z0-9_-]", "_", clean_text(record_id, "handover"))
+    file_name = f"{safe_record_id}_input_excel{suffix}"
+    save_path = BUSINESS_HANDOVER_EXCEL_DIR / file_name
+
+    try:
+        uploaded_file.seek(0)
+        save_path.write_bytes(uploaded_file.read())
+        return str(save_path)
+    except Exception:
+        return ""
+
+
+def read_uploaded_excel_preview(uploaded_file_or_path, max_rows=20):
+    """アップロードExcel/CSVを読み込み、表示用の概要テキストとプレビューDataFrameを返す。"""
+    try:
+        if uploaded_file_or_path is None:
+            return "入力Excelデータはありません。", pd.DataFrame()
+
+        name = clean_text(getattr(uploaded_file_or_path, "name", "")) if not isinstance(uploaded_file_or_path, (str, Path)) else str(uploaded_file_or_path)
+        suffix = Path(name).suffix.lower()
+
+        if hasattr(uploaded_file_or_path, "seek"):
+            uploaded_file_or_path.seek(0)
+
+        if suffix == ".csv":
+            df = pd.read_csv(uploaded_file_or_path)
+        else:
+            df = pd.read_excel(uploaded_file_or_path)
+
+        if df is None or df.empty:
+            return "入力Excelデータは読み込めましたが、表示できる行がありません。", pd.DataFrame()
+
+        df = df.copy()
+        # 列名と値を安全に文字列化し、空白列を整理
+        df.columns = [clean_text(c, f"列{i+1}") for i, c in enumerate(df.columns)]
+        df = df.dropna(how="all")
+        preview_df = df.head(max_rows).copy()
+
+        summary = f"ファイル名：{Path(name).name}\n行数：{len(df)}行／列数：{len(df.columns)}列\n表示：先頭{min(len(df), max_rows)}行"
+        return summary, preview_df
+    except Exception as e:
+        return f"入力Excelデータを読み込めませんでした：{e}", pd.DataFrame()
+
+
+def build_uploaded_excel_display_text(uploaded_file):
+    """保存用に、入力Excelの概要と先頭行をテキスト化する。"""
+    summary, preview_df = read_uploaded_excel_preview(uploaded_file, max_rows=10)
+    if preview_df.empty:
+        return summary
+
+    lines = [summary, "", "【先頭データ】"]
+    for idx, row in preview_df.iterrows():
+        values = []
+        for col in preview_df.columns[:8]:
+            val = clean_text(row.get(col, ""))
+            if val:
+                values.append(f"{col}:{val}")
+        if values:
+            lines.append("・" + "／".join(values))
+    return "\n".join(lines)
+
+
+def show_business_handover_excel_preview(excel_path, display_text=""):
+    """保存済みの入力Excelを画面表示する。"""
+    excel_path = clean_text(excel_path)
+    display_text = clean_text(display_text)
+
+    if display_text:
+        st.markdown("**入力Excel表示情報**")
+        st.info(display_text)
+
+    if not excel_path:
+        return
+
+    path = Path(excel_path)
+    if not path.exists():
+        st.caption("入力Excel：保存ファイルが見つかりません。")
+        return
+
+    summary, preview_df = read_uploaded_excel_preview(path, max_rows=20)
+    st.markdown("**入力Excelプレビュー**")
+    st.caption(summary)
+    if not preview_df.empty:
+        st.dataframe(preview_df, use_container_width=True, hide_index=True)
+    try:
+        st.download_button(
+            "入力Excelをダウンロード",
+            data=path.read_bytes(),
+            file_name=path.name,
+            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet" if path.suffix.lower() != ".csv" else "text/csv",
+            use_container_width=True,
+            key=f"download_{path.name}_{uuid.uuid4().hex[:6]}",
+        )
+    except Exception:
+        pass
+
+
+
+def ensure_alert_condition_file():
+    """申し送り自動抽出の条件マスタをSQLiteへ作成する。"""
+    ensure_dirs()
+    if sqlite_table_row_count(SQLITE_TABLE_ALERT_CONDITIONS) == 0:
+        # 既存Excelがあれば初回移行、なければ標準条件を登録
+        if ALERT_CONDITION_FILE.exists():
+            try:
+                df = pd.read_excel(ALERT_CONDITION_FILE, sheet_name="条件マスタ")
+            except Exception:
+                df = pd.DataFrame(DEFAULT_ALERT_CONDITIONS, columns=ALERT_CONDITION_COLUMNS)
+        else:
+            df = pd.DataFrame(DEFAULT_ALERT_CONDITIONS, columns=ALERT_CONDITION_COLUMNS)
+        df = normalize_alert_condition_master_df(df)
+        save_sqlite_table(df, SQLITE_TABLE_ALERT_CONDITIONS, ALERT_CONDITION_COLUMNS, unique_cols=["条件ID"])
+
+
+def normalize_alert_condition_master_df(df):
+    """条件マスタを st.data_editor で安全に編集できる型へ整える。
+    ※ mixed/object 型のまま CheckboxColumn や NumberColumn に渡すと
+      StreamlitAPIException になるため、ここで明示的に型をそろえる。
+    """
+    if df is None or len(df) == 0:
+        df = pd.DataFrame(DEFAULT_ALERT_CONDITIONS, columns=ALERT_CONDITION_COLUMNS)
+    else:
+        df = df.copy()
+
+    for col in ALERT_CONDITION_COLUMNS:
+        if col not in df.columns:
+            df[col] = ""
+
+    df = df[ALERT_CONDITION_COLUMNS].copy()
+
+    def to_bool(v):
+        if isinstance(v, bool):
+            return v
+        text = str(v).strip().lower()
+        return text in ["true", "1", "yes", "on", "使用", "表示", "有効", "checked"]
+
+    df["使用"] = df["使用"].apply(to_bool).astype(bool)
+
+    text_cols = [
+        "条件ID", "条件名", "重要度", "分類", "条件種別",
+        "閾値1", "閾値2", "キーワード", "表示メッセージ"
+    ]
+    for col in text_cols:
+        df[col] = df[col].fillna("").astype(str)
+        df[col] = df[col].replace(["nan", "None", "NaT"], "")
+
+    df["日数"] = pd.to_numeric(df["日数"], errors="coerce").fillna(1).astype(int)
+    df["並び順"] = pd.to_numeric(df["並び順"], errors="coerce").fillna(999).astype(int)
+
+    allowed_severity = ["至急", "注意", "観察", "通常"]
+    df.loc[~df["重要度"].isin(allowed_severity), "重要度"] = "観察"
+
+    allowed_category = ["排泄", "食事", "バイタル", "体重", "変化", "複合", "その他"]
+    df.loc[~df["分類"].isin(allowed_category), "分類"] = "その他"
+
+    allowed_kind = [
+        "未排便", "便性状", "尿性状", "食事低下", "食事低下連続",
+        "発熱", "SpO2低下", "血圧高値", "体重減少", "キーワード",
+        "複合:発熱+食事低下", "複合:濃縮尿+食事低下", "複合:SpO2低下+キーワード",
+    ]
+    df.loc[~df["条件種別"].isin(allowed_kind), "条件種別"] = "キーワード"
+
+    df = df.sort_values("並び順").reset_index(drop=True)
+    return df
+
+
+def load_alert_condition_master():
+    ensure_alert_condition_file()
+    df = load_sqlite_table(SQLITE_TABLE_ALERT_CONDITIONS, ALERT_CONDITION_COLUMNS)
+    if df.empty:
+        df = pd.DataFrame(DEFAULT_ALERT_CONDITIONS, columns=ALERT_CONDITION_COLUMNS)
+    return normalize_alert_condition_master_df(df)
+
+
+
+def save_alert_condition_master(df):
+    """
+    条件マスタをSQLiteへ保存する。
+    商品版ではExcelファイルを正データとして書き出しません。
+    """
+    ensure_dirs()
+    df = normalize_alert_condition_master_df(df)
+
+    existing_ids = set()
+    for i, row in df.iterrows():
+        cid = clean_text(row.get("条件ID"))
+        if not cid:
+            cid = f"C{(i + 1):03d}"
+            while cid in existing_ids:
+                cid = f"C{random.randint(100, 999)}"
+            df.at[i, "条件ID"] = cid
+        existing_ids.add(cid)
+
+    save_sqlite_table(df, SQLITE_TABLE_ALERT_CONDITIONS, ALERT_CONDITION_COLUMNS, unique_cols=["条件ID"])
+    return df
+
+def parse_keywords(value):
+    text = clean_text(value)
+    if not text:
+        return []
+    return [x.strip() for x in re.split(r"[,、\n\s]+", text) if x.strip()]
+
+
+def get_health_row_for_day(health_df, target_day, user_name):
+    if health_df.empty:
+        return None
+    h = health_df.copy()
+    h["記録日"] = pd.to_datetime(h["記録日"], errors="coerce")
+    h = h[(h["記録日"].dt.date == target_day) & (h["利用者名"].astype(str) == user_name)]
+    if h.empty:
+        return None
+    return h.iloc[-1]
+
+
+def get_health_days_for_user(health_df, target_day, user_name, days):
+    if health_df.empty:
+        return pd.DataFrame(columns=HEALTH_COLUMNS)
+    start_day = target_day - timedelta(days=max(int(days), 1) - 1)
+    h = health_df.copy()
+    h["記録日"] = pd.to_datetime(h["記録日"], errors="coerce")
+    return h[
+        (h["利用者名"].astype(str) == user_name)
+        & (h["記録日"].dt.date >= start_day)
+        & (h["記録日"].dt.date <= target_day)
+    ].sort_values("記録日")
+
+
+def day_meal_min(row):
+    if row is None:
+        return None
+    vals = []
+    for col in ["朝食摂取率", "昼食摂取率", "夕食摂取率"]:
+        v = safe_float(row.get(col), -1)
+        if v >= 0:
+            vals.append(v)
+    return min(vals) if vals else None
+
+
+def check_no_stool_days(ex_df, target_day, user_name, days):
+    days = max(int(safe_int(days, 3)), 1)
+    check_dates = [target_day - timedelta(days=i) for i in range(days - 1, -1, -1)]
+    stool_counts = []
+    for d in check_dates:
+        ddf = get_day_excretion_data(ex_df, d, user_name)
+        stool_counts.append(summarize_excretion(ddf)["排便回数"])
+    return sum(stool_counts) == 0, f"{check_dates[0].strftime('%m/%d')}〜{check_dates[-1].strftime('%m/%d')}"
+
+
+def check_alert_condition(rule, health_df, ex_df, target_day, user_name):
+    """条件マスタ1行を判定し、該当すれば辞書を返す。診断ではなく申し送り候補。"""
+    kind = clean_text(rule.get("条件種別"))
+    name = clean_text(rule.get("条件名"), kind)
+    severity = clean_text(rule.get("重要度"), "観察")
+    category = clean_text(rule.get("分類"), "その他")
+    threshold1 = safe_float(rule.get("閾値1"), 0)
+    threshold2 = safe_float(rule.get("閾値2"), 0)
+    days = max(safe_int(rule.get("日数"), 1), 1)
+    message = clean_text(rule.get("表示メッセージ"), name)
+    hrow = get_health_row_for_day(health_df, target_day, user_name)
+    ex_day = get_day_excretion_data(ex_df, target_day, user_name)
+    detail = ""
+    hit = False
+    matched_text = ""
+
+    if kind == "未排便":
+        hit, period = check_no_stool_days(ex_df, target_day, user_name, days)
+        detail = f"対象期間：{period}"
+
+    elif kind == "便性状":
+        keywords = parse_keywords(rule.get("キーワード")) or ["下痢便", "水様便"]
+        if not ex_day.empty:
+            warn = ex_day[ex_day["便性状"].fillna("").astype(str).isin(keywords)]
+            hit = not warn.empty
+            if hit:
+                detail = "、".join([f"{clean_text(r.get('時間帯'))}:{clean_text(r.get('便性状'))}" for _, r in warn.iterrows()])
+
+    elif kind == "尿性状":
+        keywords = parse_keywords(rule.get("キーワード")) or ["濃縮尿"]
+        if not ex_day.empty:
+            warn = ex_day[ex_day["尿性状"].fillna("").astype(str).isin(keywords)]
+            hit = not warn.empty
+            if hit:
+                detail = "、".join([f"{clean_text(r.get('時間帯'))}:{clean_text(r.get('尿性状'))}" for _, r in warn.iterrows()])
+
+    elif kind == "食事低下":
+        meal_min = day_meal_min(hrow)
+        hit = meal_min is not None and meal_min <= threshold1
+        if hit:
+            detail = f"最小食事摂取率 {meal_min:.0f}%"
+
+    elif kind == "食事低下連続":
+        hdays = get_health_days_for_user(health_df, target_day, user_name, days)
+        low_days = 0
+        for _, r in hdays.iterrows():
+            meal_min = day_meal_min(r)
+            if meal_min is not None and meal_min <= threshold1:
+                low_days += 1
+        hit = low_days >= days
+        if hit:
+            detail = f"{days}日中{low_days}日が{threshold1:.0f}%以下"
+
+    elif kind == "発熱":
+        temp = safe_float(hrow.get("体温"), 0) if hrow is not None else 0
+        hit = temp >= threshold1 and temp > 0
+        if hit:
+            detail = f"体温 {temp:.1f}℃"
+
+    elif kind == "SpO2低下":
+        spo2 = safe_float(hrow.get("SpO2"), 0) if hrow is not None else 0
+        hit = 0 < spo2 <= threshold1
+        if hit:
+            detail = f"SpO2 {spo2:.0f}%"
+
+    elif kind == "血圧高値":
+        bp_high = safe_float(hrow.get("血圧上"), 0) if hrow is not None else 0
+        hit = bp_high >= threshold1 and bp_high > 0
+        if hit:
+            detail = f"血圧上 {bp_high:.0f}"
+
+    elif kind == "体重減少":
+        hdays = get_health_days_for_user(health_df, target_day, user_name, days + 1)
+        weights = []
+        for _, r in hdays.iterrows():
+            w = safe_float(r.get("体重"), 0)
+            if w > 0:
+                weights.append((pd.to_datetime(r.get("記録日"), errors="coerce"), w))
+        if len(weights) >= 2:
+            before = weights[0][1]
+            now = weights[-1][1]
+            diff = before - now
+            hit = diff >= threshold1
+            if hit:
+                detail = f"{before:.1f}kg → {now:.1f}kg（-{diff:.1f}kg）"
+
+    elif kind == "キーワード":
+        keywords = parse_keywords(rule.get("キーワード"))
+        notes = []
+        if hrow is not None:
+            notes.append(clean_text(hrow.get("気になる変化")))
+            notes.append(clean_text(hrow.get("家族共有メモ")))
+        note_text = " ".join([n for n in notes if n])
+        matched = [kw for kw in keywords if kw and kw in note_text]
+        hit = bool(matched)
+        if hit:
+            matched_text = "、".join(matched)
+            detail = clean_text(note_text[:80])
+
+    elif kind == "複合:発熱+食事低下":
+        temp = safe_float(hrow.get("体温"), 0) if hrow is not None else 0
+        meal_min = day_meal_min(hrow)
+        hit = temp >= threshold1 and meal_min is not None and meal_min <= threshold2
+        if hit:
+            detail = f"体温 {temp:.1f}℃／最小食事摂取率 {meal_min:.0f}%"
+
+    elif kind == "複合:濃縮尿+食事低下":
+        urine_hit = False
+        if not ex_day.empty:
+            urine_hit = (ex_day["尿性状"].fillna("").astype(str) == "濃縮尿").any()
+        meal_min = day_meal_min(hrow)
+        hit = urine_hit and meal_min is not None and meal_min <= threshold1
+        if hit:
+            detail = f"濃縮尿あり／最小食事摂取率 {meal_min:.0f}%"
+
+    elif kind == "複合:SpO2低下+キーワード":
+        spo2 = safe_float(hrow.get("SpO2"), 0) if hrow is not None else 0
+        keywords = parse_keywords(rule.get("キーワード")) or ["傾眠", "息苦しい", "呼吸"]
+        note_text = ""
+        if hrow is not None:
+            note_text = f"{clean_text(hrow.get('気になる変化'))} {clean_text(hrow.get('家族共有メモ'))}"
+        matched = [kw for kw in keywords if kw and kw in note_text]
+        hit = 0 < spo2 <= threshold1 and bool(matched)
+        if hit:
+            matched_text = "、".join(matched)
+            detail = f"SpO2 {spo2:.0f}%／キーワード：{matched_text}"
+
+    if not hit:
+        return None
+
+    try:
+        message = message.format(
+            日数=days,
+            閾値1=int(threshold1) if float(threshold1).is_integer() else threshold1,
+            閾値2=int(threshold2) if float(threshold2).is_integer() else threshold2,
+            該当内容=matched_text or detail,
+        )
+    except Exception:
+        pass
+
+    return {
+        "利用者名": user_name,
+        "重要度": severity,
+        "分類": category,
+        "条件名": name,
+        "詳細": detail,
+        "申し送り文": message,
+    }
+
+
+def build_handover_alerts_by_condition(target_date):
+    """条件マスタに基づき、健康・排泄Excelから申し送り候補を抽出する。"""
+    target = pd.to_datetime(target_date, errors="coerce")
+    if pd.isna(target):
+        return pd.DataFrame(columns=["利用者名", "重要度", "分類", "条件名", "詳細", "申し送り文"])
+    target_day = target.date()
+    try:
+        health_df = load_health_data()
+    except Exception:
+        health_df = pd.DataFrame(columns=HEALTH_COLUMNS)
+    try:
+        ex_df = load_excretion_data()
+    except Exception:
+        ex_df = pd.DataFrame(columns=EXCRETION_COLUMNS)
+    try:
+        rules = load_alert_condition_master()
+    except Exception:
+        rules = pd.DataFrame(DEFAULT_ALERT_CONDITIONS, columns=ALERT_CONDITION_COLUMNS)
+
+    enabled_rules = rules[rules["使用"].astype(bool)].copy()
+    rows = []
+    for user in active_users:
+        for _, rule in enabled_rules.iterrows():
+            hit = check_alert_condition(rule, health_df, ex_df, target_day, user)
+            if hit:
+                rows.append(hit)
+    return pd.DataFrame(rows, columns=["利用者名", "重要度", "分類", "条件名", "詳細", "申し送り文"])
+
+
+def build_business_handover_auto_extract_text(target_date):
+    """条件設定マスタに基づき、健康チェック・排泄チェックExcelから申し送り候補を自動抽出する。"""
+    target = pd.to_datetime(target_date, errors="coerce")
+    if pd.isna(target):
+        return "Excel自動抽出情報：日付を確認できません。"
+    target_day = target.date()
+    lines = [f"【Excel自動抽出情報】対象日：{target_day.strftime('%Y-%m-%d')} ／ 条件設定マスタに基づく抽出"]
+
+    alert_df = build_handover_alerts_by_condition(target_day)
+    if alert_df.empty:
+        lines.append("・条件に該当する申し送り候補はありません。")
+        return "\n".join(lines)
+
+    severity_order = {"至急": 0, "注意": 1, "観察": 2, "通常": 3}
+    alert_df["_order"] = alert_df["重要度"].map(severity_order).fillna(9)
+    alert_df = alert_df.sort_values(["_order", "利用者名", "分類", "条件名"]).drop(columns=["_order"])
+
+    for severity in ["至急", "注意", "観察", "通常"]:
+        part = alert_df[alert_df["重要度"] == severity]
+        if part.empty:
+            continue
+        mark = "🔴" if severity == "至急" else "🟠" if severity == "注意" else "🟡" if severity == "観察" else "⚪"
+        lines.append(f"・{mark}{severity}：")
+        for _, r in part.iterrows():
+            detail = clean_text(r.get("詳細"))
+            detail_text = f"（{detail}）" if detail else ""
+            lines.append(
+                f"  - {clean_text(r.get('利用者名'))}｜{clean_text(r.get('分類'))}｜{clean_text(r.get('条件名'))}{detail_text}\n"
+                f"    → {clean_text(r.get('申し送り文'))}"
+            )
+    return "\n".join(lines)
+
+
+def show_alert_condition_master_menu():
+    """管理者が申し送り自動抽出条件を編集する画面。"""
+    st.subheader("異常検知・申し送り条件設定マスタ")
+    st.caption("健康チェック・排泄チェックのExcelデータから、業務全体申し送りに自動表示する条件を設定します。診断ではなく、申し送り候補を拾うための設定です。")
+
+    if not is_admin_user():
+        st.warning("条件設定は管理者専用です。")
+        return
+
+    c1, c2, c3 = st.columns([1.1, 1.1, 1])
+    with c1:
+        if st.button("初期おすすめ条件に戻す", use_container_width=True):
+            save_alert_condition_master(pd.DataFrame(DEFAULT_ALERT_CONDITIONS, columns=ALERT_CONDITION_COLUMNS))
+            st.success("初期おすすめ条件に戻しました。")
+            st.rerun()
+    with c2:
+        if st.button("全条件を使用ONにする", use_container_width=True):
+            df_on = load_alert_condition_master()
+            df_on["使用"] = True
+            save_alert_condition_master(df_on)
+            st.success("全条件を使用ONにしました。")
+            st.rerun()
+    with c3:
+        preview_date = st.date_input("抽出プレビュー日", value=today_jst(), key="alert_condition_preview_date")
+
+    df = load_alert_condition_master()
+    enabled_count = int(df["使用"].astype(bool).sum()) if "使用" in df.columns else 0
+    st.caption(f"現在、使用ONの条件：{enabled_count}件 / {len(df)}件")
+    if enabled_count == 0:
+        st.warning("使用ONの条件がありません。申し送りには反映されません。左端の『使用』にチェックを入れて保存してください。")
+
+    with st.form("alert_condition_master_form", clear_on_submit=False):
+        edited = st.data_editor(
+            df,
+            use_container_width=True,
+            hide_index=True,
+            num_rows="dynamic",
+            column_config={
+                "条件ID": st.column_config.TextColumn("条件ID", disabled=True),
+                "使用": st.column_config.CheckboxColumn("使用", default=True),
+                "重要度": st.column_config.SelectboxColumn("重要度", options=["至急", "注意", "観察", "通常"]),
+                "分類": st.column_config.SelectboxColumn("分類", options=["排泄", "食事", "バイタル", "体重", "変化", "複合", "その他"]),
+                "条件種別": st.column_config.SelectboxColumn(
+                    "条件種別",
+                    options=[
+                        "未排便", "便性状", "尿性状", "食事低下", "食事低下連続", "発熱", "SpO2低下", "血圧高値", "体重減少", "キーワード",
+                        "複合:発熱+食事低下", "複合:濃縮尿+食事低下", "複合:SpO2低下+キーワード",
+                    ],
+                ),
+                "閾値1": st.column_config.TextColumn("閾値1"),
+                "閾値2": st.column_config.TextColumn("閾値2"),
+                "日数": st.column_config.NumberColumn("日数", min_value=1, max_value=30, step=1),
+                "並び順": st.column_config.NumberColumn("並び順", min_value=1, max_value=999, step=1),
+            },
+            key="alert_condition_master_editor",
+        )
+        submitted = st.form_submit_button("条件マスタを保存して申し送り表示を更新", type="primary", use_container_width=True)
+
+    if submitted:
+        saved_df = save_alert_condition_master(edited)
+        st.session_state["alert_condition_master_saved_at"] = format_now_jst("%Y-%m-%d %H:%M:%S")
+        st.success(f"条件マスタを保存しました。使用ON：{int(saved_df['使用'].astype(bool).sum())}件。業務全体申し送りの自動抽出に反映されます。")
+        st.rerun()
+
+    st.markdown("#### 抽出プレビュー")
+    st.caption("ここに表示される内容が、業務全体申し送りの『Excel自動抽出情報』に反映される内容です。")
+    alert_df = build_handover_alerts_by_condition(preview_date)
+    if alert_df.empty:
+        st.info("この日の条件該当者はありません。使用ONの条件、対象日、健康チェック・排泄チェックの記録を確認してください。")
+    else:
+        st.dataframe(alert_df, use_container_width=True, hide_index=True)
+        st.markdown("#### 業務全体申し送りに表示される文章")
+        st.info(build_business_handover_auto_extract_text(preview_date))
+
+def show_business_handover_auto_extract_box(target_date):
+    """申し送り画面内にExcel自動抽出情報を表示する。"""
+    auto_text = build_business_handover_auto_extract_text(target_date)
+    st.markdown("#### Excel自動抽出情報")
+    st.info(auto_text)
+    return auto_text
+
+
+
+# =========================
+# Ver5予定候補抽出：申し送り → 予定候補 → Excel/CSV出力
+# Googleカレンダー等へ直接API連携せず、管理者確認後に取込用データを出力する安全設計。
+# =========================
+SCHEDULE_KEYWORD_RULES = [
+    {"keyword": "受診", "title": "受診", "category": "医療"},
+    {"keyword": "病院", "title": "受診・病院", "category": "医療"},
+    {"keyword": "通院", "title": "通院", "category": "医療"},
+    {"keyword": "往診", "title": "往診", "category": "医療"},
+    {"keyword": "訪問診療", "title": "訪問診療", "category": "医療"},
+    {"keyword": "訪問看護", "title": "訪問看護", "category": "医療・介護"},
+    {"keyword": "訪問", "title": "訪問", "category": "予定"},
+    {"keyword": "面談", "title": "面談", "category": "家族・相談"},
+    {"keyword": "家族来訪", "title": "家族来訪", "category": "家族"},
+    {"keyword": "家族面談", "title": "家族面談", "category": "家族"},
+    {"keyword": "来訪", "title": "来訪", "category": "予定"},
+    {"keyword": "外出", "title": "外出", "category": "外出"},
+    {"keyword": "外泊", "title": "外泊", "category": "外出"},
+    {"keyword": "送迎", "title": "送迎", "category": "外出"},
+    {"keyword": "美容", "title": "美容", "category": "生活"},
+    {"keyword": "理美容", "title": "理美容", "category": "生活"},
+    {"keyword": "買い物", "title": "買い物", "category": "生活"},
+
+]
+
+DEFAULT_HANDOVER_KEYWORDS = [
+    {"keyword": "受診", "title": "受診", "category": "医療", "is_active": 1, "sort_order": 10},
+    {"keyword": "病院", "title": "受診・病院", "category": "医療", "is_active": 1, "sort_order": 20},
+    {"keyword": "通院", "title": "通院", "category": "医療", "is_active": 1, "sort_order": 30},
+    {"keyword": "往診", "title": "往診", "category": "医療", "is_active": 1, "sort_order": 40},
+    {"keyword": "訪問診療", "title": "訪問診療", "category": "医療", "is_active": 1, "sort_order": 50},
+    {"keyword": "訪問看護", "title": "訪問看護", "category": "医療・介護", "is_active": 1, "sort_order": 60},
+    {"keyword": "訪問", "title": "訪問", "category": "予定", "is_active": 1, "sort_order": 70},
+    {"keyword": "家族来訪", "title": "家族来訪", "category": "家族", "is_active": 1, "sort_order": 80},
+    {"keyword": "面談", "title": "面談", "category": "家族・相談", "is_active": 1, "sort_order": 90},
+    {"keyword": "家族面談", "title": "家族面談", "category": "家族", "is_active": 1, "sort_order": 100},
+    {"keyword": "外出", "title": "外出", "category": "外出", "is_active": 1, "sort_order": 110},
+    {"keyword": "送迎", "title": "送迎", "category": "外出", "is_active": 1, "sort_order": 120},
+]
+
+
+def normalize_handover_keyword_df(df: pd.DataFrame) -> pd.DataFrame:
+    """予定抽出キーワード設定を標準列にそろえる。"""
+    if df is None:
+        df = pd.DataFrame(columns=HANDOVER_KEYWORD_COLUMNS)
+    work = df.copy()
+    for col in HANDOVER_KEYWORD_COLUMNS:
+        if col not in work.columns:
+            work[col] = ""
+    work = work[HANDOVER_KEYWORD_COLUMNS].copy()
+    work["keyword"] = work["keyword"].map(lambda x: clean_text(x))
+    work["title"] = work["title"].map(lambda x: clean_text(x))
+    work["category"] = work["category"].map(lambda x: clean_text(x, "予定"))
+    work["is_active"] = work["is_active"].map(lambda x: 1 if str(x).lower() in ["1", "true", "yes", "on", "使用", "有効", "対象"] else 0)
+    work["sort_order"] = work["sort_order"].map(lambda x: safe_int(x, 100))
+    work["created_at"] = work["created_at"].map(lambda x: clean_text(x))
+    work["updated_at"] = work["updated_at"].map(lambda x: clean_text(x))
+    work = work[work["keyword"] != ""].copy()
+    now_value = format_now_jst("%Y-%m-%d %H:%M:%S")
+    for idx, row in work.iterrows():
+        if not clean_text(row.get("id")):
+            work.at[idx, "id"] = "kw_" + hashlib.sha1(clean_text(row.get("keyword")).encode("utf-8")).hexdigest()[:12]
+        if not clean_text(row.get("title")):
+            work.at[idx, "title"] = clean_text(row.get("keyword"), "予定")
+        if not clean_text(row.get("created_at")):
+            work.at[idx, "created_at"] = now_value
+        work.at[idx, "updated_at"] = clean_text(row.get("updated_at"), now_value)
+    work = work.drop_duplicates(subset=["keyword"], keep="last")
+    return work.reset_index(drop=True)
+
+
+def ensure_handover_keyword_table():
+    """申し送り予定抽出キーワードのDBテーブルを用意し、初期値を投入する。"""
+    try:
+        if not sqlite_table_exists(SQLITE_TABLE_HANDOVER_KEYWORDS):
+            now_value = format_now_jst("%Y-%m-%d %H:%M:%S")
+            rows = []
+            for item in DEFAULT_HANDOVER_KEYWORDS:
+                rows.append({
+                    "id": "kw_" + hashlib.sha1(item["keyword"].encode("utf-8")).hexdigest()[:12],
+                    "keyword": item["keyword"],
+                    "title": item.get("title", item["keyword"]),
+                    "category": item.get("category", "予定"),
+                    "is_active": int(item.get("is_active", 1)),
+                    "sort_order": int(item.get("sort_order", 100)),
+                    "created_at": now_value,
+                    "updated_at": now_value,
+                })
+            save_sqlite_table(
+                pd.DataFrame(rows, columns=HANDOVER_KEYWORD_COLUMNS),
+                SQLITE_TABLE_HANDOVER_KEYWORDS,
+                HANDOVER_KEYWORD_COLUMNS,
+                unique_cols=["id"],
+                sort_cols=["sort_order", "keyword"],
+            )
+    except Exception:
+        pass
+
+
+def load_handover_keywords(active_only=False) -> pd.DataFrame:
+    ensure_handover_keyword_table()
+    try:
+        df = load_sqlite_table(SQLITE_TABLE_HANDOVER_KEYWORDS, HANDOVER_KEYWORD_COLUMNS)
+        df = normalize_handover_keyword_df(df)
+        if active_only:
+            df = df[df["is_active"].astype(int) == 1].copy()
+        return df.sort_values(["sort_order", "keyword"]).reset_index(drop=True)
+    except Exception:
+        fallback = pd.DataFrame(DEFAULT_HANDOVER_KEYWORDS)
+        fallback["id"] = fallback["keyword"].map(lambda x: "kw_" + hashlib.sha1(str(x).encode("utf-8")).hexdigest()[:12])
+        fallback["created_at"] = format_now_jst("%Y-%m-%d %H:%M:%S")
+        fallback["updated_at"] = fallback["created_at"]
+        fallback = fallback[HANDOVER_KEYWORD_COLUMNS]
+        return fallback[fallback["is_active"].astype(int) == 1].copy() if active_only else fallback
+
+
+def save_handover_keywords(df: pd.DataFrame) -> pd.DataFrame:
+    ensure_handover_keyword_table()
+    work = normalize_handover_keyword_df(df)
+    now_value = format_now_jst("%Y-%m-%d %H:%M:%S")
+    work["updated_at"] = now_value
+    save_sqlite_table(
+        work,
+        SQLITE_TABLE_HANDOVER_KEYWORDS,
+        HANDOVER_KEYWORD_COLUMNS,
+        unique_cols=["id"],
+        sort_cols=["sort_order", "keyword"],
+    )
+    try:
+        add_audit_log("予定抽出キーワード設定更新", SQLITE_TABLE_HANDOVER_KEYWORDS, "", f"予定抽出キーワードを{len(work)}件保存")
+    except Exception:
+        pass
+    return work
+
+
+def load_schedule_keyword_rules() -> list:
+    """予定候補抽出に使うキーワードルールをDBから取得する。"""
+    df = load_handover_keywords(active_only=True)
+    if df.empty:
+        return SCHEDULE_KEYWORD_RULES
+    rules = []
+    for _, row in df.iterrows():
+        kw = clean_text(row.get("keyword"))
+        if not kw:
+            continue
+        rules.append({
+            "keyword": kw,
+            "title": clean_text(row.get("title"), kw),
+            "category": clean_text(row.get("category"), "予定"),
+        })
+    return rules or SCHEDULE_KEYWORD_RULES
+
+
+SCHEDULE_EXPORT_COLUMNS = [
+    "登録する",
+    "取込対象",
+    "予定ID",
+    "元記録ID",
+    "元日付",
+    "勤務帯",
+    "利用者",
+    "利用者名",
+    "user_id",
+    "キーワード",
+    "分類",
+    "タイトル",
+    "件名",
+    "日時",
+    "開始日",
+    "開始時刻",
+    "終了日",
+    "終了時刻",
+    "終日",
+    "場所",
+    "詳細",
+    "内容",
+    "元文章",
+]
+
+GOOGLE_CALENDAR_CSV_COLUMNS = [
+    "Subject",
+    "Start Date",
+    "Start Time",
+    "End Date",
+    "End Time",
+    "All Day Event",
+    "Description",
+    "Location",
+    "Private",
+]
+
+# ひだまり帳内部カレンダー用テーブル
+SQLITE_TABLE_HIDAMARI_SCHEDULES = "hidamari_schedules"
+
+HIDAMARI_SCHEDULE_COLUMNS = [
+    "予定ID",
+    "予定日",
+    "開始時刻",
+    "終了時刻",
+    "終日",
+    "user_id",
+    "利用者名",
+    "分類",
+    "タイトル",
+    "詳細",
+    "場所",
+    "元記録ID",
+    "元日付",
+    "勤務帯",
+    "キーワード",
+    "元文章",
+    "登録日時",
+    "登録者",
+    "更新日時",
+    "更新者",
+]
+
+
+def ensure_hidamari_schedule_table():
+    """ひだまり帳内部予定テーブルを作成する。"""
+    try:
+        if not sqlite_table_exists(SQLITE_TABLE_HIDAMARI_SCHEDULES):
+            save_sqlite_table(
+                pd.DataFrame(columns=HIDAMARI_SCHEDULE_COLUMNS),
+                SQLITE_TABLE_HIDAMARI_SCHEDULES,
+                HIDAMARI_SCHEDULE_COLUMNS,
+                unique_cols=["予定ID"],
+            )
+    except Exception:
+        pass
+
+
+def load_hidamari_schedules() -> pd.DataFrame:
+    ensure_hidamari_schedule_table()
+    return load_sqlite_table(SQLITE_TABLE_HIDAMARI_SCHEDULES, HIDAMARI_SCHEDULE_COLUMNS, date_cols=["予定日", "元日付"])
+
+
+def save_hidamari_schedules(df: pd.DataFrame):
+    ensure_hidamari_schedule_table()
+    save_sqlite_table(
+        df,
+        SQLITE_TABLE_HIDAMARI_SCHEDULES,
+        HIDAMARI_SCHEDULE_COLUMNS,
+        date_cols=["予定日", "元日付"],
+        unique_cols=["予定ID"],
+        sort_cols=["予定日", "開始時刻"],
+    )
+
+
+def make_datetime_display(date_text, time_text="") -> str:
+    d = clean_text(date_text)
+    t = clean_text(time_text)
+    return f"{d} {t}".strip() if t else d
+
+
+def apply_datetime_display_to_schedule_row(row: pd.Series) -> dict:
+    """編集された日時欄を開始日・開始時刻へ反映する。"""
+    data = dict(row)
+    dt_text = clean_text(data.get("日時"))
+    if dt_text:
+        m = re.search(r"(20\d{2})[-/\.](\d{1,2})[-/\.](\d{1,2})(?:\s+(\d{1,2})[:：](\d{2}))?", dt_text)
+        if m:
+            try:
+                d = date(int(m.group(1)), int(m.group(2)), int(m.group(3)))
+                data["開始日"] = d.strftime("%Y-%m-%d")
+                data["終了日"] = d.strftime("%Y-%m-%d")
+                if m.group(4) is not None:
+                    h = safe_int(m.group(4), 0)
+                    mi = safe_int(m.group(5), 0)
+                    data["開始時刻"] = f"{h:02d}:{mi:02d}"
+                    if not clean_text(data.get("終了時刻")):
+                        data["終了時刻"] = calc_schedule_end_time(data["開始時刻"], 60)
+                    data["終日"] = "FALSE"
+                else:
+                    data["開始時刻"] = clean_text(data.get("開始時刻"))
+                    data["終日"] = "FALSE" if clean_text(data.get("開始時刻")) else "TRUE"
+            except Exception:
+                pass
+    # 表示用の編集列を正式列へ同期
+    data["取込対象"] = bool(data.get("登録する", data.get("取込対象", True)))
+    data["利用者名"] = clean_text(data.get("利用者"), clean_text(data.get("利用者名")))
+    if data["利用者名"] == "業務全般":
+        data["user_id"] = ""
+    elif not clean_text(data.get("user_id")) and data["利用者名"]:
+        data["user_id"] = get_user_id_by_name(data["利用者名"])
+    data["件名"] = clean_text(data.get("タイトル"), clean_text(data.get("件名"), "予定"))
+    data["内容"] = clean_text(data.get("詳細"), clean_text(data.get("内容")))
+    return data
+
+
+def normalize_schedule_editor_df(edited_df: pd.DataFrame) -> pd.DataFrame:
+    if edited_df is None or edited_df.empty:
+        return pd.DataFrame(columns=SCHEDULE_EXPORT_COLUMNS)
+    rows = [apply_datetime_display_to_schedule_row(row) for _, row in edited_df.iterrows()]
+    work = pd.DataFrame(rows)
+    for col in SCHEDULE_EXPORT_COLUMNS:
+        if col not in work.columns:
+            work[col] = ""
+    # 日時欄も再整形しておく
+    work["日時"] = work.apply(lambda r: make_datetime_display(r.get("開始日"), r.get("開始時刻")), axis=1)
+    work["登録する"] = work["取込対象"].astype(str).str.lower().isin(["true", "1", "yes", "対象", "取込", "取込対象"])
+    return work[SCHEDULE_EXPORT_COLUMNS].copy()
+
+
+def filter_selected_schedule_rows(df: pd.DataFrame) -> pd.DataFrame:
+    if df is None or df.empty:
+        return pd.DataFrame(columns=SCHEDULE_EXPORT_COLUMNS)
+    work = normalize_schedule_editor_df(df)
+    return work[work["登録する"].astype(str).str.lower().isin(["true", "1", "yes", "対象", "取込", "取込対象"])].copy()
+
+
+def register_schedules_to_hidamari(candidate_df: pd.DataFrame) -> tuple[int, int]:
+    """選択された予定候補を、ひだまり帳内部予定DBへ登録・更新する。戻り値は（登録更新件数, 対象件数）。"""
+    selected = filter_selected_schedule_rows(candidate_df)
+    if selected.empty:
+        return 0, 0
+
+    existing = load_hidamari_schedules()
+    if existing is None or existing.empty:
+        existing = pd.DataFrame(columns=HIDAMARI_SCHEDULE_COLUMNS)
+    else:
+        existing = existing.copy()
+
+    # 同じ予定IDは更新扱いにする
+    ids = set(selected["予定ID"].map(clean_text).tolist())
+    existing = existing[~existing["予定ID"].astype(str).isin(ids)].copy() if "予定ID" in existing.columns else existing
+
+    now_text = format_now_jst("%Y-%m-%d %H:%M:%S")
+    user_text = current_login_user()
+    rows = []
+    for _, row in selected.iterrows():
+        schedule_id = clean_text(row.get("予定ID")) or str(uuid.uuid4())
+        rows.append({
+            "予定ID": schedule_id,
+            "予定日": clean_text(row.get("開始日")),
+            "開始時刻": clean_text(row.get("開始時刻")),
+            "終了時刻": clean_text(row.get("終了時刻")),
+            "終日": clean_text(row.get("終日"), "TRUE"),
+            "user_id": clean_text(row.get("user_id")),
+            "利用者名": clean_text(row.get("利用者名")),
+            "分類": clean_text(row.get("分類"), "予定"),
+            "タイトル": clean_text(row.get("件名"), "予定"),
+            "詳細": clean_text(row.get("内容")),
+            "場所": clean_text(row.get("場所")),
+            "元記録ID": clean_text(row.get("元記録ID")),
+            "元日付": clean_text(row.get("元日付")),
+            "勤務帯": clean_text(row.get("勤務帯")),
+            "キーワード": clean_text(row.get("キーワード")),
+            "元文章": clean_text(row.get("元文章")),
+            "登録日時": now_text,
+            "登録者": user_text,
+            "更新日時": now_text,
+            "更新者": user_text,
+        })
+    add_df = pd.DataFrame(rows, columns=HIDAMARI_SCHEDULE_COLUMNS)
+    out = pd.concat([existing, add_df], ignore_index=True)
+    save_hidamari_schedules(out)
+    try:
+        add_audit_log("ひだまり帳予定登録", SQLITE_TABLE_HIDAMARI_SCHEDULES, "", f"申し送り予定候補から{len(add_df)}件を登録・更新")
+    except Exception:
+        pass
+    return len(add_df), len(selected)
+
+
+def split_handover_lines(text_value: str) -> list:
+    """申し送り本文を、予定候補抽出しやすい単位へ分割する。"""
+    text_value = clean_text(text_value)
+    if not text_value:
+        return []
+    # 構造化メモの見出しや箇条書きを考慮して分割
+    normalized = text_value.replace("。", "。\n").replace("、", "、")
+    parts = []
+    for line in normalized.splitlines():
+        line = clean_text(line)
+        if not line:
+            continue
+        # 長すぎる行は句点で分割した結果を優先
+        for part in re.split(r"[。\n\r]+", line):
+            part = clean_text(part)
+            if part:
+                parts.append(part)
+    return parts
+
+
+def get_schedule_keyword_hits(line: str) -> list:
+    """1行に含まれる予定化キーワードを返す。長い語を優先して重複を抑える。"""
+    line = clean_text(line)
+    hits = []
+    used = set()
+    rules = load_schedule_keyword_rules()
+    for rule in sorted(rules, key=lambda x: len(x["keyword"]), reverse=True):
+        kw = rule["keyword"]
+        if kw in line and kw not in used:
+            hits.append(rule)
+            used.add(kw)
+    return hits
+
+
+def parse_schedule_date_from_text(line: str, base_date) -> date:
+    """申し送り文から日付を推定。見つからなければ元記録日を使う。"""
+    if isinstance(base_date, datetime):
+        base = base_date.date()
+    else:
+        try:
+            base = pd.to_datetime(base_date, errors="coerce").date()
+        except Exception:
+            base = today_jst()
+    if not base:
+        base = today_jst()
+
+    line = clean_text(line)
+    if "明後日" in line or "あさって" in line:
+        return base + timedelta(days=2)
+    if "明日" in line or "翌日" in line:
+        return base + timedelta(days=1)
+    if "本日" in line or "今日" in line:
+        return base
+
+    # 2026/5/20, 2026-05-20, 2026年5月20日
+    m = re.search(r"(20\d{2})[年/\-\.](\d{1,2})[月/\-\.](\d{1,2})日?", line)
+    if m:
+        try:
+            return date(int(m.group(1)), int(m.group(2)), int(m.group(3)))
+        except Exception:
+            pass
+
+    # 5/20, 5月20日
+    m = re.search(r"(?<!\d)(\d{1,2})[月/\.](\d{1,2})日?", line)
+    if m:
+        try:
+            return date(base.year, int(m.group(1)), int(m.group(2)))
+        except Exception:
+            pass
+
+    return base
+
+
+def parse_schedule_time_from_text(line: str):
+    """申し送り文から開始時刻を推定。見つからなければ空欄＝終日予定扱い。"""
+    line = clean_text(line)
+    # 14:30 / 14：30
+    m = re.search(r"(\d{1,2})[:：](\d{2})", line)
+    if m:
+        h = safe_int(m.group(1), 0)
+        minute = safe_int(m.group(2), 0)
+        if 0 <= h <= 23 and 0 <= minute <= 59:
+            return f"{h:02d}:{minute:02d}"
+
+    # 午前10時 / 午後2時30分 / 10時
+    m = re.search(r"(午前|午後)?\s*(\d{1,2})時\s*(\d{1,2})?分?", line)
+    if m:
+        ampm = clean_text(m.group(1))
+        h = safe_int(m.group(2), 0)
+        minute = safe_int(m.group(3), 0)
+        if ampm == "午後" and 1 <= h <= 11:
+            h += 12
+        if ampm == "午前" and h == 12:
+            h = 0
+        if 0 <= h <= 23 and 0 <= minute <= 59:
+            return f"{h:02d}:{minute:02d}"
+
+    return ""
+
+
+def calc_schedule_end_time(start_time: str, minutes: int = 60) -> str:
+    start_time = clean_text(start_time)
+    if not start_time:
+        return ""
+    try:
+        dt = datetime.strptime(start_time, "%H:%M") + timedelta(minutes=minutes)
+        return dt.strftime("%H:%M")
+    except Exception:
+        return ""
+
+
+def detect_user_name_in_text(line: str) -> str:
+    """申し送り文中に利用者名が含まれる場合は拾う。見つからない場合は空欄。"""
+    try:
+        users = get_active_user_names()
+    except Exception:
+        users = []
+    line = clean_text(line)
+    for name in users:
+        name_text = clean_text(name)
+        if name_text and name_text in line:
+            return name_text
+        # 「様」抜き表記にも軽く対応
+        short_name = name_text.replace("様", "")
+        if short_name and short_name in line:
+            return name_text
+    return ""
+
+
+def make_schedule_candidate_id(record_id: str, line: str, keyword: str, idx: int) -> str:
+    source = f"{clean_text(record_id)}__{clean_text(line)}__{clean_text(keyword)}__{idx}"
+    return "sch_" + hashlib.sha1(source.encode("utf-8")).hexdigest()[:12]
+
+
+def build_schedule_candidate_subject(rule: dict, user_name: str) -> str:
+    base = clean_text(rule.get("title"), clean_text(rule.get("keyword"), "予定"))
+    user_name = clean_text(user_name)
+    return f"{user_name}：{base}" if user_name else base
+
+
+def extract_schedule_candidates_from_handover_df(df: pd.DataFrame, start_date=None, end_date=None, keyword_filter="") -> pd.DataFrame:
+    """業務全体申し送りから、カレンダー取込前の予定候補を抽出する。"""
+    if df is None or df.empty:
+        return pd.DataFrame(columns=SCHEDULE_EXPORT_COLUMNS)
+
+    work = df.copy()
+    if "日付" not in work.columns:
+        return pd.DataFrame(columns=SCHEDULE_EXPORT_COLUMNS)
+    work["日付_dt"] = pd.to_datetime(work["日付"], errors="coerce")
+
+    if start_date:
+        work = work[work["日付_dt"].dt.date >= start_date]
+    if end_date:
+        work = work[work["日付_dt"].dt.date <= end_date]
+
+    keyword_filter = clean_text(keyword_filter)
+    rows = []
+    for _, row in work.iterrows():
+        record_id = clean_text(row.get("記録ID"))
+        record_date = row.get("日付")
+        shift = clean_text(row.get("勤務帯"))
+        row_target_type = clean_text(row.get("対象区分"))
+        row_user_id = clean_text(row.get("user_id"))
+        row_user_name = clean_text(row.get("利用者名"))
+        if row_user_name == "業務全般":
+            row_user_name = ""
+            row_user_id = ""
+        combined_text = "\n".join([
+            clean_text(row.get("全体申し送り")),
+            clean_text(row.get("要確認事項")),
+        ])
+        if keyword_filter and keyword_filter not in combined_text:
+            continue
+
+        lines = split_handover_lines(combined_text)
+        candidate_idx = 0
+        for line in lines:
+            hits = get_schedule_keyword_hits(line)
+            if not hits:
+                continue
+            for rule in hits:
+                candidate_idx += 1
+                schedule_date = parse_schedule_date_from_text(line, record_date)
+                start_time = parse_schedule_time_from_text(line)
+                end_time = calc_schedule_end_time(start_time, 60)
+                detected_user_name = detect_user_name_in_text(line)
+                user_name = row_user_name or detected_user_name
+                user_id = row_user_id or get_user_id_by_name(user_name)
+                subject = build_schedule_candidate_subject(rule, user_name)
+                all_day = "TRUE" if not start_time else "FALSE"
+                rows.append({
+                    "登録する": True,
+                    "取込対象": True,
+                    "予定ID": make_schedule_candidate_id(record_id, line, rule["keyword"], candidate_idx),
+                    "元記録ID": record_id,
+                    "元日付": pd.to_datetime(record_date, errors="coerce").strftime("%Y-%m-%d") if not pd.isna(pd.to_datetime(record_date, errors="coerce")) else "",
+                    "勤務帯": shift,
+                    "利用者": user_name,
+                    "利用者名": user_name,
+                    "user_id": user_id,
+                    "キーワード": rule["keyword"],
+                    "分類": rule.get("category", "予定"),
+                    "タイトル": subject,
+                    "件名": subject,
+                    "日時": make_datetime_display(schedule_date.strftime("%Y-%m-%d"), start_time),
+                    "開始日": schedule_date.strftime("%Y-%m-%d"),
+                    "開始時刻": start_time,
+                    "終了日": schedule_date.strftime("%Y-%m-%d"),
+                    "終了時刻": end_time,
+                    "終日": all_day,
+                    "場所": "",
+                    "詳細": f"申し送りから抽出：{line}",
+                    "内容": f"申し送りから抽出：{line}",
+                    "元文章": line,
+                })
+    if not rows:
+        return pd.DataFrame(columns=SCHEDULE_EXPORT_COLUMNS)
+    result = pd.DataFrame(rows, columns=SCHEDULE_EXPORT_COLUMNS)
+    return result.drop_duplicates(subset=["予定ID"]).reset_index(drop=True)
+
+
+def convert_to_google_calendar_csv_df(candidate_df: pd.DataFrame) -> pd.DataFrame:
+    """GoogleカレンダーCSV取込形式へ変換する。"""
+    if candidate_df is None or candidate_df.empty:
+        return pd.DataFrame(columns=GOOGLE_CALENDAR_CSV_COLUMNS)
+
+    work = filter_selected_schedule_rows(candidate_df)
+    if "取込対象" in work.columns:
+        work = work[work["取込対象"].astype(str).str.lower().isin(["true", "1", "yes", "対象", "取込", "取込対象"])]
+    if work.empty:
+        return pd.DataFrame(columns=GOOGLE_CALENDAR_CSV_COLUMNS)
+
+    out = pd.DataFrame(columns=GOOGLE_CALENDAR_CSV_COLUMNS)
+    out["Subject"] = work["件名"].map(lambda x: clean_text(x, "予定"))
+    # Google Calendar CSVは環境によって yyyy/mm/dd が安定しやすい
+    out["Start Date"] = pd.to_datetime(work["開始日"], errors="coerce").dt.strftime("%Y/%m/%d")
+    out["Start Time"] = work["開始時刻"].map(lambda x: clean_text(x))
+    out["End Date"] = pd.to_datetime(work["終了日"], errors="coerce").dt.strftime("%Y/%m/%d")
+    out["End Time"] = work["終了時刻"].map(lambda x: clean_text(x))
+    out["All Day Event"] = work["終日"].map(lambda x: "TRUE" if clean_text(x).upper() in ["TRUE", "1", "YES", "終日"] else "FALSE")
+    out["Description"] = work["内容"].map(lambda x: clean_text(x))
+    out["Location"] = work["場所"].map(lambda x: clean_text(x))
+    out["Private"] = "FALSE"
+    return out[GOOGLE_CALENDAR_CSV_COLUMNS]
+
+
+def dataframe_to_csv_bytes(df: pd.DataFrame) -> bytes:
+    """Excelで文字化けしにくいUTF-8 BOM付きCSVを返す。"""
+    if df is None:
+        df = pd.DataFrame()
+    return df.to_csv(index=False, encoding="utf-8-sig").encode("utf-8-sig")
+
+
+
+def show_handover_keyword_master_menu():
+    """申し送りから予定候補を抽出するためのキーワード設定。"""
+    if not is_admin_user():
+        st.warning("このメニューは管理者専用です。")
+        return
+
+    st.subheader("予定抽出キーワード設定")
+    st.caption("ここで使用ONにしたキーワードが、『予定候補抽出・出力』画面で自動使用されます。")
+
+    ensure_handover_keyword_table()
+    df = load_handover_keywords(active_only=False)
+
+    if df.empty:
+        df = pd.DataFrame(columns=HANDOVER_KEYWORD_COLUMNS)
+
+    view = df.copy()
+    view["使用"] = view["is_active"].astype(int).map(lambda x: True if x == 1 else False)
+    view = view.rename(columns={
+        "keyword": "キーワード",
+        "title": "予定タイトル",
+        "category": "分類",
+        "sort_order": "並び順",
+    })
+    for col in ["使用", "キーワード", "予定タイトル", "分類", "並び順"]:
+        if col not in view.columns:
+            view[col] = ""
+    editor_cols = ["使用", "キーワード", "予定タイトル", "分類", "並び順"]
+
+    edited = st.data_editor(
+        view[editor_cols],
+        use_container_width=True,
+        hide_index=True,
+        num_rows="dynamic",
+        column_config={
+            "使用": st.column_config.CheckboxColumn("使用"),
+            "キーワード": st.column_config.TextColumn("キーワード", help="申し送り本文に含まれていたら予定候補にします。例：受診、訪問、外出"),
+            "予定タイトル": st.column_config.TextColumn("予定タイトル", help="予定候補のタイトルに使います。空欄ならキーワードを使います。"),
+            "分類": st.column_config.SelectboxColumn("分類", options=["医療", "医療・介護", "家族", "家族・相談", "外出", "生活", "予定", "その他"]),
+            "並び順": st.column_config.NumberColumn("並び順", min_value=1, max_value=999, step=10),
+        },
+        key="handover_keyword_master_editor",
+    )
+
+    c1, c2 = st.columns(2)
+    with c1:
+        save_btn = st.button("予定抽出キーワード設定を保存", type="primary", use_container_width=True)
+    with c2:
+        reset_btn = st.button("初期キーワードを追加", use_container_width=True)
+
+    if reset_btn:
+        current = load_handover_keywords(active_only=False)
+        current_keywords = set(current["keyword"].map(clean_text).tolist()) if not current.empty else set()
+        now_value = format_now_jst("%Y-%m-%d %H:%M:%S")
+        rows = current.to_dict("records") if not current.empty else []
+        for item in DEFAULT_HANDOVER_KEYWORDS:
+            if item["keyword"] in current_keywords:
+                continue
+            rows.append({
+                "id": "kw_" + hashlib.sha1(item["keyword"].encode("utf-8")).hexdigest()[:12],
+                "keyword": item["keyword"],
+                "title": item.get("title", item["keyword"]),
+                "category": item.get("category", "予定"),
+                "is_active": int(item.get("is_active", 1)),
+                "sort_order": int(item.get("sort_order", 100)),
+                "created_at": now_value,
+                "updated_at": now_value,
+            })
+        save_handover_keywords(pd.DataFrame(rows, columns=HANDOVER_KEYWORD_COLUMNS))
+        st.success("初期キーワードを追加しました。")
+        st.rerun()
+
+    if save_btn:
+        rows = []
+        now_value = format_now_jst("%Y-%m-%d %H:%M:%S")
+        old_df = load_handover_keywords(active_only=False)
+        old_map = {clean_text(r.get("keyword")): r for _, r in old_df.iterrows()} if not old_df.empty else {}
+        for _, row in edited.iterrows():
+            keyword = clean_text(row.get("キーワード"))
+            if not keyword:
+                continue
+            old = old_map.get(keyword, {})
+            rows.append({
+                "id": clean_text(old.get("id")) or "kw_" + hashlib.sha1(keyword.encode("utf-8")).hexdigest()[:12],
+                "keyword": keyword,
+                "title": clean_text(row.get("予定タイトル"), keyword),
+                "category": clean_text(row.get("分類"), "予定"),
+                "is_active": 1 if bool(row.get("使用")) else 0,
+                "sort_order": safe_int(row.get("並び順"), 100),
+                "created_at": clean_text(old.get("created_at"), now_value),
+                "updated_at": now_value,
+            })
+        saved = save_handover_keywords(pd.DataFrame(rows, columns=HANDOVER_KEYWORD_COLUMNS))
+        st.success(f"予定抽出キーワード設定を保存しました。有効：{int(saved['is_active'].astype(int).sum())}件。予定候補抽出に反映されます。")
+        st.rerun()
+
+    st.markdown("#### 使用中キーワード")
+    active = load_handover_keywords(active_only=True)
+    if active.empty:
+        st.info("使用ONのキーワードはありません。")
+    else:
+        st.dataframe(active[["keyword", "title", "category", "sort_order"]].rename(columns={"keyword":"キーワード", "title":"予定タイトル", "category":"分類", "sort_order":"並び順"}), use_container_width=True, hide_index=True)
+
+
+def show_handover_schedule_export_menu():
+    """申し送りから予定候補を抽出し、管理者確認後にExcel/CSVで出力する画面。"""
+    if not is_admin_user():
+        st.warning("このメニューは管理者専用です。")
+        return
+
+    st.subheader("申し送り予定候補の自動抽出・出力")
+    st.caption("「予定抽出キーワード設定」に登録されたキーワードを使って、申し送り本文から予定候補を自動抽出します。管理者が確認・修正してから、ひだまり帳登録やカレンダー取込用データを出力します。")
+
+    df = load_business_handover_data()
+    if df.empty:
+        st.info("業務全体申し送りがまだ登録されていません。")
+        return
+
+    work = df.copy()
+    work["日付_dt"] = pd.to_datetime(work["日付"], errors="coerce")
+    valid_dates = work["日付_dt"].dropna()
+    if valid_dates.empty:
+        default_start = today_jst() - timedelta(days=7)
+        default_end = today_jst()
+    else:
+        default_start = max(valid_dates.min().date(), today_jst() - timedelta(days=30))
+        default_end = valid_dates.max().date()
+
+    active_keywords_df = load_handover_keywords(active_only=True)
+    active_keywords = active_keywords_df["keyword"].tolist() if not active_keywords_df.empty else []
+    if active_keywords:
+        st.caption("現在の抽出キーワード：" + "、".join(active_keywords))
+    else:
+        st.warning("有効な予定抽出キーワードがありません。『予定抽出キーワード設定』で使用ONにしてください。")
+
+    c1, c2, c3 = st.columns(3)
+    with c1:
+        start_date = st.date_input("抽出開始日", value=default_start, key="schedule_extract_start")
+    with c2:
+        end_date = st.date_input("抽出終了日", value=default_end, key="schedule_extract_end")
+    with c3:
+        keyword_filter = st.text_input("追加の本文絞り込み（任意）", placeholder="例：谷様、家族、午前", key="schedule_extract_keyword")
+
+    candidates = extract_schedule_candidates_from_handover_df(df, start_date=start_date, end_date=end_date, keyword_filter=keyword_filter)
+
+    if candidates.empty:
+        st.info("この期間の申し送りから予定候補は見つかりませんでした。キーワードや期間を変えて確認してください。")
+        return
+
+    st.success(f"予定候補を {len(candidates)} 件抽出しました。必要に応じて修正してから出力してください。")
+    st.caption("時刻が読み取れない予定は『終日予定』として出力されます。時刻が分かる場合は開始時刻・終了時刻を手入力してください。")
+
+    editor_source = candidates.copy()
+    editor_source["登録する"] = True
+    editor_source["日時"] = editor_source.apply(lambda r: make_datetime_display(r.get("開始日"), r.get("開始時刻")), axis=1)
+    editor_source["利用者"] = editor_source["利用者名"]
+    editor_source["タイトル"] = editor_source["件名"]
+    editor_source["詳細"] = editor_source["内容"]
+
+    edited = st.data_editor(
+        editor_source,
+        use_container_width=True,
+        hide_index=True,
+        num_rows="dynamic",
+        column_order=["登録する", "日時", "利用者", "user_id", "分類", "タイトル", "詳細", "場所", "予定ID", "元日付", "勤務帯", "キーワード", "元文章"],
+        column_config={
+            "登録する": st.column_config.CheckboxColumn("登録する"),
+            "日時": st.column_config.TextColumn("日時（例：2026-05-27 14:00）"),
+            "利用者": st.column_config.TextColumn("利用者"),
+            "user_id": st.column_config.TextColumn("利用者ID"),
+            "分類": st.column_config.SelectboxColumn("分類", options=["医療", "医療・介護", "家族", "家族・相談", "外出", "生活", "予定", "その他"]),
+            "タイトル": st.column_config.TextColumn("タイトル"),
+            "詳細": st.column_config.TextColumn("詳細"),
+            "場所": st.column_config.TextColumn("場所"),
+        },
+        disabled=["予定ID", "元日付", "勤務帯", "キーワード", "元文章"],
+        key="schedule_candidate_editor",
+    )
+
+    normalized_edited = normalize_schedule_editor_df(edited)
+    target_df = filter_selected_schedule_rows(normalized_edited)
+    google_df = convert_to_google_calendar_csv_df(target_df)
+
+    st.markdown("#### 登録・出力")
+    st.caption("まず候補一覧を確認し、必要なら日時・利用者・分類・タイトル・詳細を修正してください。チェックが入った行だけ登録・出力されます。")
+    d0, d1, d2, d3 = st.columns(4)
+    with d0:
+        if st.button("ひだまり帳へ登録", type="primary", use_container_width=True):
+            count, total = register_schedules_to_hidamari(normalized_edited)
+            if count > 0:
+                st.success(f"ひだまり帳の内部予定に {count} 件登録・更新しました。")
+            else:
+                st.warning("登録対象の予定がありません。『登録する』にチェックを入れてください。")
+    with d1:
+        st.download_button(
+            "予定候補一覧をExcelでダウンロード",
+            data=to_excel_download(normalized_edited),
+            file_name=f"handover_schedule_candidates_{today_jst().strftime('%Y%m%d')}.xlsx",
+            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            use_container_width=True,
+        )
+    with d2:
+        st.download_button(
+            "CSV出力",
+            data=dataframe_to_csv_bytes(google_df),
+            file_name=f"google_calendar_import_{today_jst().strftime('%Y%m%d')}.csv",
+            mime="text/csv",
+            use_container_width=True,
+        )
+    with d3:
+        st.download_button(
+            "Excel出力",
+            data=to_excel_download(google_df),
+            file_name=f"google_calendar_import_{today_jst().strftime('%Y%m%d')}.xlsx",
+            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            use_container_width=True,
+        )
+
+    st.markdown("#### ひだまり帳 内部予定一覧")
+    schedules = load_hidamari_schedules()
+    if schedules.empty:
+        st.info("内部予定はまだ登録されていません。")
+    else:
+        view = schedules.copy()
+        view["予定日_dt"] = pd.to_datetime(view["予定日"], errors="coerce")
+        view = view.sort_values(["予定日_dt", "開始時刻"], ascending=[False, True]).drop(columns=["予定日_dt"], errors="ignore")
+        st.dataframe(view.head(100), use_container_width=True, hide_index=True)
+
+    with st.expander("Googleカレンダー等へ読み込む際の注意", expanded=False):
+        st.markdown(
+            """
+            - まず「予定候補一覧」で内容を確認してください。
+            - 時刻が空欄の予定は終日予定として扱います。
+            - Googleカレンダーへ取り込む場合は、CSVファイルを使用してください。
+            - 施設運用では、いきなり自動登録せず、管理者確認後に取り込む方式が安全です。
+            """
+        )
+
+
+def render_business_handover_card(row):
+    priority = clean_text(row.get("優先度", "通常"), "通常")
+    icon = "【至急】" if priority == "至急" else "【注意】" if priority == "注意" else "【通常】"
+
+    record_date = row.get("日付", "")
+    if not isinstance(record_date, str):
+        try:
+            record_date = pd.to_datetime(record_date).strftime("%Y-%m-%d")
+        except Exception:
+            record_date = ""
+
+    auto_text = clean_text(row.get("Excel自動抽出情報"), "記載なし").replace(chr(10), "<br>")
+
+    st.markdown(
+        f"""
+        <div style="
+            border:1px solid #e0d6c8;
+            border-radius:14px;
+            padding:14px 16px;
+            margin-bottom:12px;
+            background-color:#fffdf7;
+        ">
+        <b>{icon} {record_date}｜{clean_text(row.get('勤務帯'))}｜{clean_text(row.get('記入者'))}｜対象：{make_handover_target_label(row.get('user_id'), row.get('利用者名'), row.get('対象区分'))}｜{priority}｜{clean_text(row.get('対応状況'))}</b><br><br>
+        <b>全体申し送り</b><br>
+        {clean_text(row.get('全体申し送り'), '記載なし').replace(chr(10), '<br>')}<br><br>
+        <b>要確認事項</b><br>
+        {clean_text(row.get('要確認事項'), '記載なし').replace(chr(10), '<br>')}<br><br>
+        <b>Excel自動抽出情報</b><br>
+        <div style="background-color:#eef7ff;border-left:4px solid #5ca8d8;padding:10px;margin-top:6px;">
+        {auto_text}
+        </div><br>
+        <span style="font-size:12px;color:#666;">記録日時：{clean_text(row.get('記録日時'))}</span>
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
+
+    input_excel_path = clean_text(row.get("入力Excelファイル"))
+    input_excel_text = clean_text(row.get("入力Excel表示情報"))
+    if input_excel_path or input_excel_text:
+        with st.expander("入力Excelデータを表示", expanded=True):
+            show_business_handover_excel_preview(input_excel_path, input_excel_text)
+
+    photo1 = clean_text(row.get("写真1"))
+    photo2 = clean_text(row.get("写真2"))
+    if photo1 or photo2:
+        p1, p2 = st.columns(2)
+        with p1:
+            show_business_handover_photo(photo1, "写真1")
+        with p2:
+            show_business_handover_photo(photo2, "写真2")
+
+
+
+def show_business_handover_menu():
+    st.header("業務全体申し送り")
+    show_observation_perspective("handover")
+    st.caption("施設全体の出来事・注意点・次の勤務者に共有したい内容を記録します。")
+
+    # Ver5.0.1 修正：st.tabs だと環境やCSSの影響で「選択しても画面が動かない」ことがあるため、
+    # 確実に再描画される radio 方式に変更。
+    handover_mode = st.radio(
+        "表示する機能",
+        ["新規登録", "検索・更新・削除", "予定候補抽出・出力", "予定抽出キーワード設定"],
+        horizontal=True,
+        key="business_handover_mode_radio",
+    )
+
+    if handover_mode == "新規登録":
+        df = load_business_handover_data()
+
+        # 先に本日の申し送りを表示し、その下に対応中案件、その下に入力欄を置く
+        st.subheader("本日の業務全体申し送り")
+        today_df = get_business_handover_by_date(df, today_jst())
+        if today_df.empty:
+            st.info("本日の業務全体申し送りはまだありません。")
+        else:
+            for _, row in today_df.iterrows():
+                render_business_handover_card(row)
+
+        st.divider()
+        show_business_handover_in_progress_section(df)
+
+        st.divider()
+        st.subheader("業務全体申し送りに入力")
+
+        with st.form("business_handover_form", clear_on_submit=False):
+            c1, c2, c3, c4 = st.columns(4)
+            with c1:
+                record_date = st.date_input("日付", value=today_jst(), key="business_handover_date")
+            with c2:
+                shift_type = st.selectbox("勤務帯", ["日勤", "夜勤"], index=0, key="business_handover_shift")
+            with c3:
+                staff_name = st.text_input("記入者", placeholder="例：藤野", key="business_handover_staff")
+            with c4:
+                target_options = build_handover_target_options()
+                target_selection = st.selectbox("対象", target_options, index=0, key="business_handover_target")
+
+            st.markdown("#### 事実／気づき／次に見ること")
+            st.caption("責めるためではなく、次の勤務者が動きやすくなる形で分けて残します。")
+            fact_note = st.text_area(
+                "事実（見たこと・起きたこと）",
+                height=100,
+                placeholder="例：共有スペースの床が濡れていた。15時頃に来客あり。物品残数が少ない。",
+                key="business_handover_fact_note",
+            )
+            insight_note = st.text_area(
+                "気づき（普段との違い・気になったこと）",
+                height=90,
+                placeholder="例：いつもより表情が硬い、動線が混みやすい、確認が必要そう。",
+                key="business_handover_insight_note",
+            )
+            next_note = st.text_area(
+                "次に見ること（次勤務者への確認ポイント）",
+                height=90,
+                placeholder="例：床の状態を再確認、物品補充、家族連絡の有無を確認。",
+                key="business_handover_next_note",
+            )
+            overall_note = format_handover_structured_note(fact_note, insight_note, next_note)
+
+            check_note = st.text_area(
+                "要確認事項（未対応・確認中のこと）",
+                height=100,
+                placeholder="例：明日の往診時間確認、家族連絡の確認、物品残数確認など",
+                key="business_handover_check_note",
+            )
+
+            c4, c5 = st.columns(2)
+            with c4:
+                priority = st.selectbox("優先度", ["通常", "注意", "至急"], index=0, key="business_handover_priority")
+            with c5:
+                status = st.selectbox("対応状況", ["未対応", "対応中", "対応済"], index=0, key="business_handover_status")
+
+            st.markdown("#### 写真添付")
+            p1, p2 = st.columns(2)
+            with p1:
+                photo1_file = st.file_uploader("写真1", type=["jpg", "jpeg", "png", "webp"], key="business_handover_photo1")
+            with p2:
+                photo2_file = st.file_uploader("写真2", type=["jpg", "jpeg", "png", "webp"], key="business_handover_photo2")
+
+            st.markdown("#### 入力Excelデータ添付")
+            input_excel_file = st.file_uploader(
+                "入力済みのExcel・CSVを添付して申し送り内に表示",
+                type=["xlsx", "xls", "csv"],
+                key="business_handover_input_excel",
+            )
+            if input_excel_file is not None:
+                input_excel_display_text = build_uploaded_excel_display_text(input_excel_file)
+                st.info(input_excel_display_text)
+                _, input_excel_preview_df = read_uploaded_excel_preview(input_excel_file, max_rows=10)
+                if not input_excel_preview_df.empty:
+                    st.dataframe(input_excel_preview_df, use_container_width=True, hide_index=True)
+            else:
+                input_excel_display_text = ""
+
+            auto_extract_text = build_business_handover_auto_extract_text(record_date)
+            st.markdown("#### Excel自動抽出情報")
+            st.info(auto_extract_text)
+
+            submitted = st.form_submit_button("業務全体申し送りを保存", use_container_width=True)
+
+        if submitted:
+            if not clean_text(staff_name):
+                st.warning("記入者を入力してください。")
+                st.stop()
+
+            if not clean_text(overall_note) and not clean_text(check_note):
+                st.warning("全体申し送り、または要確認事項を入力してください。")
+                st.stop()
+
+            target_type, target_user_id, target_user_name = resolve_handover_target(target_selection)
+
+            record_id = make_business_handover_id(record_date, shift_type, staff_name)
+            photo1_path = save_business_handover_photo(photo1_file, record_id, 1)
+            photo2_path = save_business_handover_photo(photo2_file, record_id, 2)
+            input_excel_path = save_business_handover_excel(input_excel_file, record_id)
+            input_excel_display_text = build_uploaded_excel_display_text(input_excel_file) if input_excel_file is not None else ""
+            auto_extract_text = build_business_handover_auto_extract_text(record_date)
+
+            new_record = {
+                "記録ID": record_id,
+                "日付": record_date,
+                "勤務帯": shift_type,
+                "記入者": clean_text(staff_name),
+                "対象区分": target_type,
+                "user_id": target_user_id,
+                "利用者名": target_user_name,
+                "全体申し送り": clean_text(overall_note),
+                "要確認事項": clean_text(check_note),
+                "優先度": priority,
+                "対応状況": status,
+                "写真1": photo1_path,
+                "写真2": photo2_path,
+                "Excel自動抽出情報": auto_extract_text,
+                "入力Excelファイル": input_excel_path,
+                "入力Excel表示情報": input_excel_display_text,
+                "記録日時": format_now_jst("%Y-%m-%d %H:%M:%S"),
+            }
+
+            df = pd.concat([df, pd.DataFrame([new_record], columns=BUSINESS_HANDOVER_COLUMNS)], ignore_index=True)
+            save_business_handover_data(df)
+            st.success("業務全体申し送りを保存しました。")
+            st.rerun()
+
+    if handover_mode == "検索・更新・削除":
+        st.subheader("業務全体申し送りの検索")
+        df = load_business_handover_data()
+
+        if df.empty:
+            st.info("まだ業務全体申し送りは登録されていません。")
+            return
+
+        work = df.copy()
+        work["日付"] = pd.to_datetime(work["日付"], errors="coerce")
+
+        valid_dates = work["日付"].dropna()
+        if valid_dates.empty:
+            default_start = today_jst() - timedelta(days=7)
+            default_end = today_jst()
+        else:
+            default_start = valid_dates.min().date()
+            default_end = valid_dates.max().date()
+
+        c1, c2, c3 = st.columns(3)
+        with c1:
+            start_date = st.date_input("開始日", value=default_start, key="bh_search_start_date")
+        with c2:
+            end_date = st.date_input("終了日", value=default_end, key="bh_search_end_date")
+        with c3:
+            keyword = st.text_input("キーワード検索", placeholder="記入者・本文・要確認事項", key="bh_search_keyword")
+
+        c4, c5, c6 = st.columns(3)
+        with c4:
+            shift_filter = st.selectbox("勤務帯", ["すべて", "日勤", "夜勤"], key="bh_search_shift")
+        with c5:
+            status_filter = st.selectbox("対応状況", ["すべて", "未対応", "対応中", "対応済"], key="bh_search_status")
+        with c6:
+            priority_filter = st.selectbox("優先度", ["すべて", "通常", "注意", "至急"], key="bh_search_priority")
+
+        filtered = work[
+            (work["日付"].dt.date >= start_date)
+            & (work["日付"].dt.date <= end_date)
+        ].copy()
+
+        if shift_filter != "すべて":
+            filtered = filtered[filtered["勤務帯"] == shift_filter]
+        if status_filter != "すべて":
+            filtered = filtered[filtered["対応状況"] == status_filter]
+        if priority_filter != "すべて":
+            filtered = filtered[filtered["優先度"] == priority_filter]
+
+        keyword = clean_text(keyword)
+        if keyword:
+            search_text = (
+                filtered["記入者"].fillna("").astype(str)
+                + " " + filtered.get("対象区分", "").fillna("").astype(str)
+                + " " + filtered.get("user_id", "").fillna("").astype(str)
+                + " " + filtered.get("利用者名", "").fillna("").astype(str)
+                + " " + filtered["全体申し送り"].fillna("").astype(str)
+                + " " + filtered["要確認事項"].fillna("").astype(str)
+            )
+            filtered = filtered[search_text.str.contains(keyword, case=False, na=False)]
+
+        if not filtered.empty:
+            filtered["_sort_dt"] = pd.to_datetime(filtered["記録日時"], errors="coerce")
+            filtered = filtered.sort_values(["日付", "_sort_dt"], ascending=[False, False]).drop(columns=["_sort_dt"])
+
+        st.caption(f"検索結果：{len(filtered)}件")
+
+        if filtered.empty:
+            st.info("条件に合う申し送りはありません。")
+            return
+
+        display_df = filtered.copy()
+        display_df["日付"] = pd.to_datetime(display_df["日付"], errors="coerce").dt.strftime("%Y-%m-%d")
+        display_cols = ["日付", "勤務帯", "記入者", "対象区分", "user_id", "利用者名", "優先度", "対応状況", "全体申し送り", "要確認事項", "Excel自動抽出情報", "入力Excel表示情報", "記録日時"]
+        st.dataframe(
+            display_df[[c for c in display_cols if c in display_df.columns]],
+            use_container_width=True,
+            hide_index=True,
+        )
+
+        st.divider()
+        st.subheader("選択した申し送りの更新・削除")
+
+        def make_select_label(row):
+            d = pd.to_datetime(row.get("日付"), errors="coerce")
+            d_text = d.strftime("%Y-%m-%d") if not pd.isna(d) else "日付不明"
+            note = clean_text(row.get("全体申し送り", "")) or clean_text(row.get("要確認事項", ""))
+            if len(note) > 24:
+                note = note[:24] + "..."
+            return f"{d_text}｜{clean_text(row.get('勤務帯'))}｜{clean_text(row.get('記入者'))}｜{clean_text(row.get('優先度'))}｜{clean_text(row.get('対応状況'))}｜{note}"
+
+        select_options = []
+        label_to_id = {}
+        for _, row in filtered.iterrows():
+            label = make_select_label(row)
+            rid = clean_text(row.get("記録ID"))
+            if not rid:
+                continue
+            # 同じラベルがあっても選べるように末尾へIDの一部を付ける
+            unique_label = f"{label}｜ID:{rid[-6:]}"
+            select_options.append(unique_label)
+            label_to_id[unique_label] = rid
+
+        selected_label = st.selectbox("編集・削除する申し送りを選択", select_options, key="bh_selected_record")
+        selected_id = label_to_id.get(selected_label)
+
+        selected_rows = df[df["記録ID"].astype(str) == str(selected_id)]
+        if selected_rows.empty:
+            st.warning("選択した記録が見つかりません。")
+            return
+
+        selected_row = selected_rows.iloc[0]
+        render_business_handover_card(selected_row)
+
+        selected_date = pd.to_datetime(selected_row.get("日付"), errors="coerce")
+        if pd.isna(selected_date):
+            selected_date_value = today_jst()
+        else:
+            selected_date_value = selected_date.date()
+
+        shift_options = ["日勤", "夜勤"]
+        priority_options = ["通常", "注意", "至急"]
+        status_options = ["未対応", "対応中", "対応済"]
+
+        with st.form("business_handover_update_form", clear_on_submit=False):
+            u1, u2, u3 = st.columns(3)
+            with u1:
+                update_date = st.date_input("日付", value=selected_date_value, key="bh_update_date")
+            with u2:
+                update_shift = st.selectbox(
+                    "勤務帯",
+                    shift_options,
+                    index=shift_options.index(clean_text(selected_row.get("勤務帯"), "日勤")) if clean_text(selected_row.get("勤務帯"), "日勤") in shift_options else 0,
+                    key="bh_update_shift",
+                )
+            with u3:
+                update_staff = st.text_input("記入者", value=clean_text(selected_row.get("記入者")), key="bh_update_staff")
+
+            update_target_options = build_handover_target_options()
+            current_target_label = make_handover_target_label(selected_row.get("user_id"), selected_row.get("利用者名"), selected_row.get("対象区分"))
+            if current_target_label not in update_target_options:
+                update_target_options = [current_target_label] + update_target_options
+            update_target_selection = st.selectbox(
+                "対象",
+                update_target_options,
+                index=update_target_options.index(current_target_label) if current_target_label in update_target_options else 0,
+                key="bh_update_target",
+            )
+
+            update_overall = st.text_area(
+                "全体申し送り",
+                value=clean_text(selected_row.get("全体申し送り")),
+                height=150,
+                key="bh_update_overall",
+            )
+            update_check = st.text_area(
+                "要確認事項",
+                value=clean_text(selected_row.get("要確認事項")),
+                height=120,
+                key="bh_update_check",
+            )
+
+            u4, u5 = st.columns(2)
+            with u4:
+                update_priority = st.selectbox(
+                    "優先度",
+                    priority_options,
+                    index=priority_options.index(clean_text(selected_row.get("優先度"), "通常")) if clean_text(selected_row.get("優先度"), "通常") in priority_options else 0,
+                    key="bh_update_priority",
+                )
+            with u5:
+                update_status = st.selectbox(
+                    "対応状況",
+                    status_options,
+                    index=status_options.index(clean_text(selected_row.get("対応状況"), "未対応")) if clean_text(selected_row.get("対応状況"), "未対応") in status_options else 0,
+                    key="bh_update_status",
+                )
+
+            st.markdown("#### 写真添付の更新")
+            up1, up2 = st.columns(2)
+            with up1:
+                update_photo1_file = st.file_uploader("写真1を差し替える", type=["jpg", "jpeg", "png", "webp"], key="bh_update_photo1")
+                remove_photo1 = st.checkbox("写真1を削除", key="bh_remove_photo1")
+            with up2:
+                update_photo2_file = st.file_uploader("写真2を差し替える", type=["jpg", "jpeg", "png", "webp"], key="bh_update_photo2")
+                remove_photo2 = st.checkbox("写真2を削除", key="bh_remove_photo2")
+
+            st.markdown("#### 入力Excelデータの更新")
+            current_excel_path = clean_text(selected_row.get("入力Excelファイル"))
+            current_excel_text = clean_text(selected_row.get("入力Excel表示情報"))
+            if current_excel_path or current_excel_text:
+                show_business_handover_excel_preview(current_excel_path, current_excel_text)
+            update_input_excel_file = st.file_uploader(
+                "入力Excelを差し替える",
+                type=["xlsx", "xls", "csv"],
+                key="bh_update_input_excel",
+            )
+            remove_input_excel = st.checkbox("入力Excelを削除", key="bh_remove_input_excel")
+            if update_input_excel_file is not None:
+                update_input_excel_display_text = build_uploaded_excel_display_text(update_input_excel_file)
+                st.info(update_input_excel_display_text)
+                _, update_input_excel_preview_df = read_uploaded_excel_preview(update_input_excel_file, max_rows=10)
+                if not update_input_excel_preview_df.empty:
+                    st.dataframe(update_input_excel_preview_df, use_container_width=True, hide_index=True)
+            else:
+                update_input_excel_display_text = current_excel_text
+
+            update_auto_extract_text = build_business_handover_auto_extract_text(update_date)
+            st.markdown("#### Excel自動抽出情報（更新時に再作成）")
+            st.info(update_auto_extract_text)
+
+            update_submitted = st.form_submit_button("この申し送りを更新する", use_container_width=True)
+
+        if update_submitted:
+            if not clean_text(update_staff):
+                st.warning("記入者を入力してください。")
+                st.stop()
+            if not clean_text(update_overall) and not clean_text(update_check):
+                st.warning("全体申し送り、または要確認事項を入力してください。")
+                st.stop()
+
+            df_update = load_business_handover_data()
+            mask = df_update["記録ID"].astype(str) == str(selected_id)
+            if not mask.any():
+                st.error("更新対象の記録が見つかりません。")
+                st.stop()
+
+            update_target_type, update_user_id, update_user_name = resolve_handover_target(update_target_selection)
+
+            df_update.loc[mask, "日付"] = pd.to_datetime(update_date)
+            df_update.loc[mask, "勤務帯"] = update_shift
+            df_update.loc[mask, "記入者"] = clean_text(update_staff)
+            df_update.loc[mask, "対象区分"] = update_target_type
+            df_update.loc[mask, "user_id"] = update_user_id
+            df_update.loc[mask, "利用者名"] = update_user_name
+            df_update.loc[mask, "全体申し送り"] = clean_text(update_overall)
+            df_update.loc[mask, "要確認事項"] = clean_text(update_check)
+            df_update.loc[mask, "優先度"] = update_priority
+            df_update.loc[mask, "対応状況"] = update_status
+
+            current_photo1 = clean_text(selected_row.get("写真1"))
+            current_photo2 = clean_text(selected_row.get("写真2"))
+            if remove_photo1:
+                current_photo1 = ""
+            elif update_photo1_file is not None:
+                current_photo1 = save_business_handover_photo(update_photo1_file, selected_id, 1)
+            if remove_photo2:
+                current_photo2 = ""
+            elif update_photo2_file is not None:
+                current_photo2 = save_business_handover_photo(update_photo2_file, selected_id, 2)
+
+            current_input_excel = clean_text(selected_row.get("入力Excelファイル"))
+            current_input_excel_text = clean_text(selected_row.get("入力Excel表示情報"))
+            if remove_input_excel:
+                current_input_excel = ""
+                current_input_excel_text = ""
+            elif update_input_excel_file is not None:
+                current_input_excel = save_business_handover_excel(update_input_excel_file, selected_id)
+                current_input_excel_text = build_uploaded_excel_display_text(update_input_excel_file)
+
+            df_update.loc[mask, "写真1"] = current_photo1
+            df_update.loc[mask, "写真2"] = current_photo2
+            df_update.loc[mask, "Excel自動抽出情報"] = update_auto_extract_text
+            df_update.loc[mask, "入力Excelファイル"] = current_input_excel
+            df_update.loc[mask, "入力Excel表示情報"] = current_input_excel_text
+            df_update.loc[mask, "記録日時"] = format_now_jst("%Y-%m-%d %H:%M:%S")
+
+            save_business_handover_data(df_update)
+            st.success("業務全体申し送りを更新しました。")
+            st.rerun()
+
+        st.divider()
+        st.subheader("削除")
+        st.warning("削除すると、この申し送り記録は一覧と管理者ダッシュボードから消えます。")
+        confirm_delete = st.checkbox("この申し送りを削除することを確認しました", key="bh_confirm_delete")
+        if st.button("この申し送りを削除する", type="primary", disabled=not confirm_delete, use_container_width=True, key="bh_delete_button"):
+            df_delete = load_business_handover_data()
+            before_count = len(df_delete)
+            df_delete = df_delete[df_delete["記録ID"].astype(str) != str(selected_id)].copy()
+            after_count = len(df_delete)
+
+            if before_count == after_count:
+                st.error("削除対象の記録が見つかりません。")
+            else:
+                save_business_handover_data(df_delete)
+                st.success("業務全体申し送りを削除しました。")
+                st.rerun()
+
+    if handover_mode == "予定候補抽出・出力":
+        show_handover_schedule_export_menu()
+
+    if handover_mode == "予定抽出キーワード設定":
+        show_handover_keyword_master_menu()
+
+def show_admin_business_handover_summary(target_date):
+    st.subheader("業務全体申し送り")
+    st.caption("出勤時に最初に確認する項目です。確認日の申し送りと、未対応・至急の申し送りを表示します。")
+
+    df = load_business_handover_data()
+
+    if df.empty:
+        st.info("業務全体申し送りはまだ登録されていません。")
+        return
+
+    target_df = get_business_handover_by_date(df, target_date)
+    alert_df = get_business_handover_alerts(df)
+
+    tab1, tab2 = st.tabs(["確認日の申し送り", "未対応・至急"])
+
+    with tab1:
+        if target_df.empty:
+            st.info("確認日の業務全体申し送りはありません。")
+        else:
+            for _, row in target_df.iterrows():
+                render_business_handover_card(row)
+
+    with tab2:
+        if alert_df.empty:
+            st.success("未対応・至急の業務全体申し送りはありません。")
+        else:
+            for _, row in alert_df.iterrows():
+                render_business_handover_card(row)
+
+
+
+
+# =========================
+# 短期目標・モニタリング機能
+# =========================
+def ensure_short_goal_files():
+    """互換用。実データはSQLiteへ保存します。既存Excelは初回のみ移行します。"""
+    migrate_excel_to_sqlite_if_needed(
+        SQLITE_TABLE_SHORT_GOAL_MASTER,
+        SHORT_GOAL_MASTER_FILE,
+        "短期目標マスタ",
+        SHORT_GOAL_MASTER_COLUMNS,
+        date_cols=["開始日", "終了予定日"],
+        unique_cols=["目標ID"],
+    )
+    migrate_excel_to_sqlite_if_needed(
+        SQLITE_TABLE_SHORT_GOAL_CHECKS,
+        SHORT_GOAL_CHECK_FILE,
+        "実施チェック",
+        SHORT_GOAL_CHECK_COLUMNS,
+        date_cols=["日付"],
+        unique_cols=["記録ID"],
+    )
+    migrate_excel_to_sqlite_if_needed(
+        SQLITE_TABLE_MONITORING_DRAFTS,
+        MONITORING_DRAFT_FILE,
+        "モニタリング下書き",
+        MONITORING_DRAFT_COLUMNS,
+        date_cols=["作成日"],
+        unique_cols=["下書きID"],
+    )
+
+
+def read_excel_safe(path: Path, columns: list, sheet_name: str | None = None) -> pd.DataFrame:
+    """互換用：既存の呼び出しが残っていても安全にExcelを読めるよう残す。"""
+    ensure_dirs()
+    if not path.exists():
+        return pd.DataFrame(columns=columns)
+    try:
+        if sheet_name:
+            df = pd.read_excel(path, sheet_name=sheet_name)
+        else:
+            df = pd.read_excel(path)
+    except Exception:
+        return pd.DataFrame(columns=columns)
+    for col in columns:
+        if col not in df.columns:
+            df[col] = ""
+    return df[columns].astype("object")
+
+
+
+def save_excel_safe(df: pd.DataFrame, path: Path, columns: list, sheet_name: str):
+    """
+    互換用。
+    商品版ではExcelファイルを正データとして保存しません。
+    永続保存が必要なデータは各save_*関数でSQLiteへ保存してください。
+    """
+    return normalize_df_columns(df, columns)
+
+def load_short_goal_master():
+    ensure_short_goal_files()
+    df = load_sqlite_table(
+        SQLITE_TABLE_SHORT_GOAL_MASTER,
+        SHORT_GOAL_MASTER_COLUMNS,
+        date_cols=["開始日", "終了予定日"],
+    )
+    return attach_user_ids(df)
+
+
+def save_short_goal_master(df):
+    df = normalize_df_columns(df, SHORT_GOAL_MASTER_COLUMNS)
+    df = attach_user_ids(df)
+    save_sqlite_table(
+        df,
+        SQLITE_TABLE_SHORT_GOAL_MASTER,
+        SHORT_GOAL_MASTER_COLUMNS,
+        date_cols=["開始日", "終了予定日"],
+        unique_cols=["目標ID"],
+    )
+    add_audit_log("保存", SQLITE_TABLE_SHORT_GOAL_MASTER, "", "短期目標マスタを保存しました")
+
+
+def load_short_goal_checks():
+    ensure_short_goal_files()
+    df = load_sqlite_table(
+        SQLITE_TABLE_SHORT_GOAL_CHECKS,
+        SHORT_GOAL_CHECK_COLUMNS,
+        date_cols=["日付"],
+    )
+    return attach_user_ids(df)
+
+
+def save_short_goal_checks(df):
+    df = normalize_df_columns(df, SHORT_GOAL_CHECK_COLUMNS)
+    df = attach_user_ids(df)
+    save_sqlite_table(
+        df,
+        SQLITE_TABLE_SHORT_GOAL_CHECKS,
+        SHORT_GOAL_CHECK_COLUMNS,
+        date_cols=["日付"],
+        unique_cols=["記録ID"],
+    )
+    add_audit_log("保存", SQLITE_TABLE_SHORT_GOAL_CHECKS, "", "短期目標実施記録を保存しました")
+
+
+def load_monitoring_drafts():
+    ensure_short_goal_files()
+    df = load_sqlite_table(
+        SQLITE_TABLE_MONITORING_DRAFTS,
+        MONITORING_DRAFT_COLUMNS,
+        date_cols=["作成日"],
+    )
+    return attach_user_ids(df)
+
+
+def save_monitoring_drafts(df):
+    df = normalize_df_columns(df, MONITORING_DRAFT_COLUMNS)
+    df = attach_user_ids(df)
+    save_sqlite_table(
+        df,
+        SQLITE_TABLE_MONITORING_DRAFTS,
+        MONITORING_DRAFT_COLUMNS,
+        date_cols=["作成日"],
+        unique_cols=["下書きID"],
+    )
+
+
+def to_excel_download(df: pd.DataFrame) -> bytes:
+    output = BytesIO()
+    with pd.ExcelWriter(output, engine="openpyxl") as writer:
+        df.to_excel(writer, index=False, sheet_name="出力データ")
+    return output.getvalue()
+
+
+def ym_str(d: date):
+    return d.strftime("%Y-%m")
+
+
+def get_active_user_names():
+    users = load_users(include_hidden=False)["利用者名"].tolist()
+    return users if users else DEFAULT_USERS
+
+
+def show_short_goal_top():
+    if not is_admin_user():
+        st.warning("このメニューは管理者専用です。")
+        return
+    st.header("短期目標・モニタリング")
+    st.caption("利用者ごとの短期目標を登録し、日々の実施状況から介護計画モニタリング表の下書きを作成します。")
+    goals = load_short_goal_master()
+    checks = load_short_goal_checks()
+    drafts = load_monitoring_drafts()
+    c1, c2, c3 = st.columns(3)
+    c1.metric("有効な短期目標", len(goals[goals["状態"].astype(str) == "有効"]) if not goals.empty else 0)
+    c2.metric("実施チェック記録", len(checks))
+    c3.metric("モニタリング下書き", len(drafts))
+    st.markdown(
+        """
+        <div class="info-box">
+        ① 短期目標を登録<br>
+        ② 職員が日々「実施／一部実施／未実施」を入力<br>
+        ③ 利用者別・月別に履歴を確認<br>
+        ④ 月末や会議前にモニタリング下書きを作成
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
+
+
+def show_short_goal_master():
+    st.header("短期目標マスタ")
+    st.caption("利用者ごとの短期目標を登録します。日々の実施チェックでは、ここで登録した有効な目標を選択します。")
+    users = get_active_user_names()
+    df = load_short_goal_master()
+
+    with st.form("goal_master_form", clear_on_submit=True):
+        col1, col2, col3 = st.columns(3)
+        with col1:
+            user_name = st.selectbox("利用者名", users, key="goal_user")
+        with col2:
+            start_date = st.date_input("開始日", value=today_jst(), key="goal_start")
+        with col3:
+            end_date = st.date_input("終了予定日", value=today_jst(), key="goal_end")
+        short_goal = st.text_area("短期目標", placeholder="例：午前中に居室からリビングへ移動し、他利用者と過ごす時間を持つ")
+        support = st.text_area("支援内容", placeholder="例：声かけ、歩行時の見守り、必要時は手を添える")
+        col4, col5 = st.columns(2)
+        with col4:
+            status = st.selectbox("状態", ["有効", "終了", "一時停止"], index=0)
+        with col5:
+            memo = st.text_input("備考")
+        submitted = st.form_submit_button("短期目標を登録", use_container_width=True)
+
+    if submitted:
+        if not clean_text(short_goal):
+            st.error("短期目標を入力してください。")
+        else:
+            new_row = {
+                "目標ID": str(uuid.uuid4()),
+                "利用者名": user_name,
+                "短期目標": clean_text(short_goal),
+                "支援内容": clean_text(support),
+                "開始日": start_date.strftime("%Y-%m-%d"),
+                "終了予定日": end_date.strftime("%Y-%m-%d"),
+                "状態": status,
+                "備考": clean_text(memo),
+                "登録日時": format_now_jst("%Y-%m-%d %H:%M:%S"),
+            }
+            df = pd.concat([df, pd.DataFrame([new_row], columns=SHORT_GOAL_MASTER_COLUMNS)], ignore_index=True)
+            save_short_goal_master(df)
+            st.success("短期目標を登録しました。")
+            st.rerun()
+
+    st.subheader("登録済み短期目標")
+    if df.empty:
+        st.info("まだ短期目標が登録されていません。")
+    else:
+        st.dataframe(df.drop(columns=["目標ID"], errors="ignore"), use_container_width=True, hide_index=True)
+
+
+def show_daily_goal_check():
+    st.header("日々の短期目標 実施チェック")
+    users = get_active_user_names()
+    goal_df = load_short_goal_master()
+    check_df = load_short_goal_checks()
+
+    col1, col2 = st.columns(2)
+    with col1:
+        check_date = st.date_input("日付", value=today_jst(), key="daily_goal_date")
+    with col2:
+        user_name = st.selectbox("利用者名", users, key="daily_goal_user")
+
+    user_goals = goal_df[(goal_df["利用者名"].astype(str) == str(user_name)) & (goal_df["状態"].astype(str) == "有効")]
+    if user_goals.empty:
+        st.warning("この利用者の有効な短期目標が登録されていません。先に『短期目標マスタ』で登録してください。")
+        return
+
+    goal_label_map = {}
+    for _, row in user_goals.iterrows():
+        label = clean_text(row.get("短期目標"))
+        if label:
+            goal_label_map[label] = row
+
+    selected_goal_label = st.selectbox("短期目標", list(goal_label_map.keys()), key="daily_goal_select")
+    selected_goal = goal_label_map[selected_goal_label]
+
+    st.markdown("#### 支援内容")
+    st.info(clean_text(selected_goal.get("支援内容"), "支援内容の記載はありません。"))
+
+    with st.form("check_form", clear_on_submit=True):
+        col1, col2, col3 = st.columns(3)
+        with col1:
+            result = st.selectbox("実施状況", ["実施", "一部実施", "未実施"])
+        with col2:
+            mood = st.selectbox("本人の様子", ["穏やか", "普段通り", "不安あり", "拒否あり", "疲労あり", "痛み訴えあり", "その他"])
+        with col3:
+            reflect = st.selectbox("モニタリング反映", ["反映する", "反映しない"])
+        reason = st.text_input("未実施理由・一部実施の理由", placeholder="例：眠気が強く、声かけのみ実施")
+        staff_memo = st.text_area("職員メモ", placeholder="例：リビングへの移動はできたが、10分ほどで居室へ戻られた")
+        staff_name = st.text_input("入力職員", placeholder="例：藤野")
+        submitted = st.form_submit_button("実施チェックを保存", use_container_width=True)
+
+    if submitted:
+        new_row = {
+            "記録ID": str(uuid.uuid4()),
+            "日付": check_date.strftime("%Y-%m-%d"),
+            "利用者名": user_name,
+            "目標ID": selected_goal["目標ID"],
+            "短期目標": selected_goal["短期目標"],
+            "実施状況": result,
+            "本人の様子": mood,
+            "未実施理由": clean_text(reason),
+            "職員メモ": clean_text(staff_memo),
+            "入力職員": clean_text(staff_name),
+            "モニタリング反映": reflect,
+            "登録日時": format_now_jst("%Y-%m-%d %H:%M:%S"),
+        }
+        check_df = pd.concat([check_df, pd.DataFrame([new_row], columns=SHORT_GOAL_CHECK_COLUMNS)], ignore_index=True)
+        save_short_goal_checks(check_df)
+        st.success("実施チェックを保存しました。")
+        st.rerun()
+
+
+def show_goal_history():
+    st.header("実施履歴一覧")
+    users = get_active_user_names()
+    df = load_short_goal_checks()
+    if df.empty:
+        st.info("まだ実施チェック記録がありません。")
+        return
+
+    col1, col2, col3 = st.columns(3)
+    with col1:
+        user_name = st.selectbox("利用者名", ["全員"] + users, key="goal_history_user")
+    with col2:
+        start_date = st.date_input("開始日", value=date(today_jst().year, today_jst().month, 1), key="goal_history_start")
+    with col3:
+        end_date = st.date_input("終了日", value=today_jst(), key="goal_history_end")
+
+    filtered = df.copy()
+    filtered["日付_dt"] = pd.to_datetime(filtered["日付"], errors="coerce")
+    filtered = filtered[(filtered["日付_dt"] >= pd.to_datetime(start_date)) & (filtered["日付_dt"] <= pd.to_datetime(end_date))]
+    if user_name != "全員":
+        filtered = filtered[filtered["利用者名"].astype(str) == str(user_name)]
+
+    if filtered.empty:
+        st.info("条件に該当する実施チェック記録はありません。")
+        return
+
+    show_df = filtered.drop(columns=["記録ID", "目標ID", "日付_dt"], errors="ignore")
+    st.dataframe(show_df, use_container_width=True, hide_index=True)
+
+    st.download_button(
+        "表示中データをExcelでダウンロード",
+        data=to_excel_download(show_df),
+        file_name=f"短期目標実施履歴_{today_jst().strftime('%Y-%m-%d')}.xlsx",
+        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        use_container_width=True,
+    )
+
+    # 管理者のみ、表示中の履歴から選択して削除できる
+    if is_admin_user():
+        st.divider()
+        st.subheader("実施履歴の削除")
+        st.caption("誤入力などを、表示中の履歴から選択して削除できます。削除後は実施チェックExcelに保存し直されます。")
+
+        delete_target_df = filtered.copy()
+        delete_target_df["記録ID"] = delete_target_df["記録ID"].fillna("").astype(str)
+        delete_target_df = delete_target_df[delete_target_df["記録ID"] != ""].copy()
+
+        if delete_target_df.empty:
+            st.info("削除できる履歴がありません。")
+        else:
+            label_to_id = {}
+            for _, row in delete_target_df.sort_values("日付_dt", ascending=False).iterrows():
+                record_id = clean_text(row.get("記録ID"))
+                day_text = ""
+                d = pd.to_datetime(row.get("日付"), errors="coerce")
+                if pd.notna(d):
+                    day_text = d.strftime("%Y-%m-%d")
+                goal_text = clean_text(row.get("短期目標"))
+                if len(goal_text) > 35:
+                    goal_text = goal_text[:35] + "…"
+                label = (
+                    f"{day_text}｜{clean_text(row.get('利用者名'))}｜"
+                    f"{clean_text(row.get('実施状況'))}｜{goal_text}｜"
+                    f"入力:{clean_text(row.get('入力職員'))}｜ID:{record_id[:8]}"
+                )
+                label_to_id[label] = record_id
+
+            selected_labels = st.multiselect(
+                "削除する履歴を選択",
+                options=list(label_to_id.keys()),
+                key="goal_history_delete_select",
+            )
+
+            if selected_labels:
+                preview_ids = [label_to_id[label] for label in selected_labels]
+                preview = delete_target_df[delete_target_df["記録ID"].isin(preview_ids)].drop(columns=["目標ID", "日付_dt"], errors="ignore")
+                st.warning(f"{len(preview_ids)}件を削除対象として選択しています。")
+                st.dataframe(preview, use_container_width=True, hide_index=True)
+
+                confirm_delete = st.checkbox(
+                    "確認しました。この実施履歴を削除します。",
+                    key="goal_history_delete_confirm",
+                )
+                if st.button("選択した実施履歴を削除", type="secondary", use_container_width=True):
+                    if not confirm_delete:
+                        st.error("削除する場合は、確認チェックを入れてください。")
+                    else:
+                        before_count = len(df)
+                        new_df = df[~df["記録ID"].fillna("").astype(str).isin(preview_ids)].copy()
+                        deleted_count = before_count - len(new_df)
+                        save_short_goal_checks(new_df)
+                        st.success(f"実施履歴を{deleted_count}件削除しました。")
+                        st.rerun()
+    else:
+        st.info("実施履歴の削除は管理者のみ可能です。")
+
+
+def show_monitoring_draft():
+    if not is_admin_user():
+        st.warning("このメニューは管理者専用です。")
+        return
+    st.header("介護計画モニタリング下書き作成")
+    users = get_active_user_names()
+    check_df = load_short_goal_checks()
+    draft_df = load_monitoring_drafts()
+    if check_df.empty:
+        st.info("実施チェック記録がまだありません。")
+        return
+
+    col1, col2 = st.columns(2)
+    with col1:
+        user_name = st.selectbox("利用者名", users, key="monitoring_user")
+    with col2:
+        target_month_date = st.date_input("対象月", value=today_jst(), key="monitoring_month")
+
+    target_month = ym_str(target_month_date)
+    tmp = check_df.copy()
+    tmp["日付_dt"] = pd.to_datetime(tmp["日付"], errors="coerce")
+    tmp["対象月"] = tmp["日付_dt"].dt.strftime("%Y-%m")
+    tmp = tmp[(tmp["利用者名"].astype(str) == str(user_name)) & (tmp["対象月"] == target_month) & (tmp["モニタリング反映"].astype(str) == "反映する")]
+
+    if tmp.empty:
+        st.warning("この条件に該当する実施チェック記録がありません。")
+        return
+
+    goal_list = tmp["短期目標"].dropna().astype(str).unique().tolist()
+    selected_goal = st.selectbox("短期目標", goal_list, key="monitoring_goal")
+    gdf = tmp[tmp["短期目標"].astype(str) == str(selected_goal)]
+
+    total = len(gdf)
+    done = int((gdf["実施状況"] == "実施").sum())
+    partial = int((gdf["実施状況"] == "一部実施").sum())
+    not_done = int((gdf["実施状況"] == "未実施").sum())
+    rate = round(((done + partial * 0.5) / total) * 100, 1) if total else 0
+    mood_summary = "／".join(gdf["本人の様子"].dropna().astype(str).value_counts().head(5).index.tolist())
+    reasons = "／".join([x for x in gdf["未実施理由"].dropna().astype(str).tolist() if x.strip()][:5])
+    memos = [x for x in gdf["職員メモ"].dropna().astype(str).tolist() if x.strip()]
+    memo_text = "。".join(memos[:6])
+
+    draft_text = f"{target_month}の記録では、短期目標『{selected_goal}』について、実施{done}回、一部実施{partial}回、未実施{not_done}回でした。実施率の目安は{rate}%です。本人の様子としては『{mood_summary}』が記録されています。"
+    if reasons:
+        draft_text += f" 未実施・一部実施の理由として『{reasons}』が記録されています。"
+    if memo_text:
+        draft_text += f" 職員メモでは『{memo_text}』などの記録があります。"
+    draft_text += " 今後も本人の様子を確認しながら、無理のない範囲で支援を継続します。"
+
+    c1, c2, c3, c4 = st.columns(4)
+    c1.metric("実施率目安", f"{rate}%")
+    c2.metric("実施", done)
+    c3.metric("一部実施", partial)
+    c4.metric("未実施", not_done)
+
+    edited_draft = st.text_area("下書き文", value=draft_text, height=240)
+    direction = st.selectbox("今後の方向性", ["継続", "一部見直し", "目標見直し", "終了", "経過観察"])
+
+    col_save, col_download = st.columns(2)
+    with col_save:
+        if st.button("この下書きを保存", use_container_width=True):
+            new_row = {
+                "下書きID": str(uuid.uuid4()),
+                "作成日": today_jst().strftime("%Y-%m-%d"),
+                "対象月": target_month,
+                "利用者名": user_name,
+                "短期目標": selected_goal,
+                "実施率": rate,
+                "実施回数": done,
+                "一部実施回数": partial,
+                "未実施回数": not_done,
+                "本人の様子まとめ": mood_summary,
+                "未実施理由まとめ": reasons,
+                "モニタリング下書き": edited_draft,
+                "今後の方向性": direction,
+                "作成日時": format_now_jst("%Y-%m-%d %H:%M:%S"),
+            }
+            draft_df = pd.concat([draft_df, pd.DataFrame([new_row], columns=MONITORING_DRAFT_COLUMNS)], ignore_index=True)
+            save_monitoring_drafts(draft_df)
+            st.success("モニタリング下書きを保存しました。")
+            st.rerun()
+    with col_download:
+        st.download_button(
+            "下書き文をテキストでダウンロード",
+            data=edited_draft.encode("utf-8"),
+            file_name=f"モニタリング下書き_{user_name}_{target_month}.txt",
+            mime="text/plain",
+            use_container_width=True,
+        )
+
+
+
+def _first_non_empty_text(values, default=""):
+    for value in values:
+        text = clean_text(value)
+        if text:
+            return text
+    return default
+
+
+def infer_monitoring_item(short_goal, support_text=""):
+    """短期目標文からモニタリング表の項目名を推定する。"""
+    text = f"{clean_text(short_goal)} {clean_text(support_text)}"
+    rules = [
+        ("移動", ["移動", "歩行", "車椅子", "車いす", "立位", "移乗", "転倒", "居室", "リビング"]),
+        ("排泄", ["排泄", "トイレ", "便", "尿", "誘導", "失禁", "排便", "排尿"]),
+        ("食事", ["食事", "摂取", "水分", "嚥下", "むせ", "口腔", "栄養"]),
+        ("入浴", ["入浴", "清潔", "更衣", "整容"]),
+        ("服薬", ["服薬", "薬", "内服"]),
+        ("活動", ["活動", "レク", "交流", "会話", "他利用者", "参加"]),
+        ("睡眠", ["睡眠", "夜間", "不眠", "覚醒"]),
+    ]
+    for label, words in rules:
+        if any(word in text for word in words):
+            return label
+    return "その他"
+
+
+def build_monthly_health_context(user_name, target_month):
+    """健康・排泄データからモニタリング表に添える状況文を作成する。
+
+    注意：ここで作るバイタル等の数値は「ニーズや生活の現状」へは直接入れない。
+    バイタル値は、具体的理由・備考やモニタリングまとめの補足として使う。
+    """
+    try:
+        year, month = [int(x) for x in str(target_month).split("-")[:2]]
+    except Exception:
+        return {"health_text": "", "excretion_text": "", "change_text": ""}
+
+    health_df = get_month_health_data(load_health_data(), user_name, year, month)
+    ex_df = get_month_excretion_data(load_excretion_data(), user_name, year, month)
+
+    health_parts = []
+    change_parts = []
+    if not health_df.empty:
+        for col, label, unit in [("体温", "平均体温", "℃"), ("SpO2", "平均SpO2", "%"), ("体重", "平均体重", "kg")]:
+            if col in health_df.columns:
+                vals = to_number(health_df[col])
+                vals = vals[vals > 0]
+                if not vals.empty:
+                    # 読みやすさのため、項目名と数値の間に半角スペースを入れる
+                    health_parts.append(f"{label} {round(float(vals.mean()), 1)}{unit}")
+        meal_cols = ["朝食摂取率", "昼食摂取率", "夕食摂取率"]
+        meal_vals = []
+        for col in meal_cols:
+            if col in health_df.columns:
+                meal_vals.extend(to_number(health_df[col]).dropna().tolist())
+        if meal_vals:
+            health_parts.append(f"平均食事摂取率 {round(float(pd.Series(meal_vals).mean()), 1)}%")
+        if "気になる変化" in health_df.columns:
+            changes = [clean_text(x) for x in health_df["気になる変化"].tolist() if clean_text(x)]
+            change_parts.extend(changes[:5])
+        if "家族共有メモ" in health_df.columns:
+            family_memos = [clean_text(x) for x in health_df["家族共有メモ"].tolist() if clean_text(x)]
+            change_parts.extend(family_memos[:3])
+
+    ex_text = ""
+    if not ex_df.empty:
+        ex_sum = summarize_excretion(ex_df)
+        ex_text = f"排尿 {ex_sum.get('排尿回数', 0)}回、排便 {ex_sum.get('排便回数', 0)}回"
+        if ex_sum.get("下痢便", 0) or ex_sum.get("水様便", 0):
+            ex_text += f"、下痢便・水様便 {ex_sum.get('下痢便', 0) + ex_sum.get('水様便', 0)}回"
+        if ex_sum.get("濃縮尿", 0):
+            ex_text += f"、濃縮尿 {ex_sum.get('濃縮尿', 0)}回"
+
+    return {
+        "health_text": "、".join(health_parts),
+        "excretion_text": ex_text,
+        "change_text": "。".join(change_parts),
+    }
+
+
+def build_needs_current_status(user_name, item, short_goal, support_text, context):
+    """モニタリング表の「ニーズや生活の現状」を作る。
+
+    ここにはバイタル平均・食事摂取率などの数値を直接入れず、
+    本人の生活上の困りごと・希望・支援が必要な背景を短く入れる。
+    """
+    assessment = get_user_assessment(user_name)
+    candidates = []
+    # 利用者マスタに情報があれば、生活状況・課題・主訴を優先する
+    for key in ["主訴", "生活状況", "ADL", "課題"]:
+        value = clean_text(assessment.get(key, ""))
+        if value:
+            candidates.append(value)
+
+    change_text = clean_text(context.get("change_text", ""))
+    if change_text:
+        candidates.append(change_text[:90])
+
+    if candidates:
+        return "。".join(candidates[:2])
+
+    goal_text = f"{clean_text(short_goal)} {clean_text(support_text)}"
+    if item == "移動":
+        return "移動時のふらつきや転倒リスクに配慮し、安全に移動できるよう見守りや声かけが必要です。"
+    if item == "排泄":
+        return "排泄リズムやトイレ動作の状態を確認し、必要に応じて声かけや見守りが必要です。"
+    if item == "食事":
+        return "食事量や水分摂取の様子を確認し、無理なく摂取できるよう支援が必要です。"
+    if item == "入浴":
+        return "清潔保持や更衣動作の負担に配慮し、安心して生活できるよう支援が必要です。"
+    if item == "服薬":
+        return "服薬状況を確認し、飲み忘れや不安が出ないよう声かけが必要です。"
+    if item == "活動":
+        return "生活の中で無理なく参加できる活動や交流の機会を保つことが必要です。"
+    if item == "睡眠":
+        return "夜間の睡眠状況や日中の様子を確認し、生活リズムを整える支援が必要です。"
+    if clean_text(goal_text):
+        return "本人の生活状況を確認しながら、設定した短期目標に沿って支援を継続しています。"
+    return "日々の生活状況を確認しながら、本人に合った支援を継続しています。"
+
+
+def build_rule_based_monitoring_rows(user_name, target_month):
+    """過去入力データから、介護計画モニタリング表の下書き行を作る。"""
+    goals = load_short_goal_master()
+    checks = load_short_goal_checks()
+    context = build_monthly_health_context(user_name, target_month)
+
+    if goals.empty:
+        return pd.DataFrame(columns=["項目", "ニーズや生活の現状", "短期目標", "実施状況", "本人の様子・満足度", "具体的所見", "今後の方向性", "具体的理由・今後の備考"]), "", ""
+
+    active_goals = goals[(goals["利用者名"].astype(str) == str(user_name)) & (goals["状態"].astype(str).isin(["有効", "終了", "一時停止"]))].copy()
+    if active_goals.empty:
+        return pd.DataFrame(columns=["項目", "ニーズや生活の現状", "短期目標", "実施状況", "本人の様子・満足度", "具体的所見", "今後の方向性", "具体的理由・今後の備考"]), "", ""
+
+    work = checks.copy()
+    if not work.empty:
+        work["日付_dt"] = pd.to_datetime(work["日付"], errors="coerce")
+        work["対象月"] = work["日付_dt"].dt.strftime("%Y-%m")
+        work = work[(work["利用者名"].astype(str) == str(user_name)) & (work["対象月"] == str(target_month))]
+    else:
+        work = pd.DataFrame(columns=SHORT_GOAL_CHECK_COLUMNS + ["日付_dt", "対象月"])
+
+    rows = []
+    summary_sentences = []
+    issue_sentences = []
+
+    for _, goal in active_goals.iterrows():
+        goal_id = clean_text(goal.get("目標ID"))
+        short_goal = clean_text(goal.get("短期目標"))
+        support = clean_text(goal.get("支援内容"))
+        item = infer_monitoring_item(short_goal, support)
+        gdf = work[work["目標ID"].astype(str) == goal_id].copy() if goal_id else pd.DataFrame()
+        if gdf.empty:
+            gdf = work[work["短期目標"].astype(str) == short_goal].copy()
+
+        total = len(gdf)
+        done = int((gdf["実施状況"].astype(str) == "実施").sum()) if total else 0
+        partial = int((gdf["実施状況"].astype(str) == "一部実施").sum()) if total else 0
+        not_done = int((gdf["実施状況"].astype(str) == "未実施").sum()) if total else 0
+        rate = round(((done + partial * 0.5) / total) * 100, 1) if total else 0
+
+        mood = ""
+        findings = ""
+        reasons = ""
+        memos = []
+        if total:
+            mood_values = [clean_text(x) for x in gdf["本人の様子"].tolist() if clean_text(x)]
+            mood = _first_non_empty_text(pd.Series(mood_values).value_counts().index.tolist(), "記録上、大きな拒否や不穏は目立ちません。")
+            reasons_list = [clean_text(x) for x in gdf["未実施理由"].tolist() if clean_text(x)]
+            memo_list = [clean_text(x) for x in gdf["職員メモ"].tolist() if clean_text(x)]
+            memos = memo_list[:4]
+            reasons = "。".join(reasons_list[:3])
+            findings = "。".join(memos) if memos else f"実施{done}回、一部実施{partial}回、未実施{not_done}回。実施率の目安は{rate}%です。"
+        else:
+            mood = "記録が少ないため、本人の様子は十分に確認できていません。"
+            findings = "対象月の実施チェック記録がありません。記録方法または実施状況の確認が必要です。"
+            issue_sentences.append(f"{item}について、実施記録が不足しています。")
+
+        if total == 0:
+            status_text = "記録未入力"
+            direction = "記録を確認して継続する"
+        elif rate >= 80:
+            status_text = "計画通り実施できた"
+            direction = "サービス内容を継続する"
+        elif rate >= 50:
+            status_text = "一部実施できた"
+            direction = "支援方法を一部見直して継続する"
+            issue_sentences.append(f"{item}について、一部実施・未実施の理由確認が必要です。")
+        else:
+            status_text = "実施が少ない"
+            direction = "目標または支援方法を見直す"
+            issue_sentences.append(f"{item}について、実施率が低めです。")
+
+        # ニーズ欄には支援内容やバイタル平均を混ぜず、生活上の現状・困りごとを出す
+        current_status = build_needs_current_status(user_name, item, short_goal, support, context)
+
+        note_parts = []
+        if reasons:
+            note_parts.append(reasons)
+        else:
+            note_parts.append("現在の記録上、急な変更を要する内容は目立ちません。本人の様子を見ながら継続して確認します。")
+        if support:
+            note_parts.append(f"支援内容：{support}")
+        if context.get("health_text"):
+            note_parts.append(f"健康記録：{context['health_text']}")
+        if context.get("excretion_text") and item in ["排泄", "その他"]:
+            note_parts.append(f"排泄記録：{context['excretion_text']}")
+        note = " ".join(note_parts)
+        if item == "移動" and "転倒" in context.get("change_text", ""):
+            note += " 転倒リスクに配慮し、移動時の見守りを継続します。"
+        if item == "排泄" and context.get("excretion_text"):
+            note += f" 排泄状況は、{context['excretion_text']}として記録されています。"
+
+        rows.append({
+            "項目": item,
+            "ニーズや生活の現状": current_status,
+            "短期目標": short_goal,
+            "実施状況": status_text,
+            "本人の様子・満足度": mood,
+            "具体的所見": findings,
+            "今後の方向性": direction,
+            "具体的理由・今後の備考": note,
+        })
+        summary_sentences.append(f"{item}の目標は{status_text}（実施率目安{rate}%）でした。")
+
+    summary_text = " ".join(summary_sentences)
+    if context.get("health_text"):
+        summary_text += f" 健康記録では、{context['health_text']}が確認されています。"
+    if context.get("excretion_text"):
+        summary_text += f" 排泄記録では、{context['excretion_text']}が確認されています。"
+    if context.get("change_text"):
+        summary_text += f" 気になる変化として、{context['change_text'][:120]}が記録されています。"
+    summary_text += " 今後も本人の様子を確認しながら、無理のない範囲で支援を継続します。"
+
+    if not issue_sentences:
+        issue_sentences.append("現在の記録上、新たな生活課題は大きく目立っていません。引き続き、本人の様子と生活リズムを確認します。")
+    issue_text = " ".join(dict.fromkeys(issue_sentences))
+
+    return pd.DataFrame(rows), summary_text, issue_text
+
+
+def generate_ai_monitoring_rows(user_name, target_month, base_rows, summary_text, issue_text):
+    """OpenAI APIが設定されている場合のみ、モニタリング文を整える。失敗時は空文字を返す。"""
+    api_key = get_openai_api_key("")
+    if not api_key:
+        return None, "OpenAI APIキーが未設定です。通常下書きを使用してください。"
+    try:
+        from openai import OpenAI
+    except Exception:
+        return None, "openaiライブラリが未インストールです。requirements.txtに openai を追加してください。"
+
+    prompt = f"""
+あなたは介護施設の介護計画モニタリング表の文章整理係です。
+医療判断・診断・治療効果の断定は禁止です。
+記録に基づき、以下の表を自然な介護記録文に整えてください。
+出力は必ずJSONのみ。推測で事実を追加しないでください。
+
+【対象】
+利用者：{user_name}
+対象月：{target_month}
+
+【下書き表】
+{base_rows.to_dict(orient='records')}
+
+【モニタリングまとめ】
+{summary_text}
+
+【新たな生活課題】
+{issue_text}
+
+JSON形式：
+{{
+  "rows": [
+    {{"項目":"", "ニーズや生活の現状":"", "短期目標":"", "実施状況":"", "本人の様子・満足度":"", "具体的所見":"", "今後の方向性":"", "具体的理由・今後の備考":""}}
+  ],
+  "モニタリングまとめ":"",
+  "新たな生活課題":""
+}}
+"""
+    try:
+        client = OpenAI(api_key=api_key)
+        res = client.chat.completions.create(
+            model="gpt-4o-mini",
+            messages=[
+                {"role": "system", "content": "介護計画モニタリング表の文章を整理します。断定せず、記録に基づく表現にします。"},
+                {"role": "user", "content": prompt},
+            ],
+            temperature=0.2,
+            response_format={"type": "json_object"},
+        )
+        data = json.loads(res.choices[0].message.content or "{}")
+        rows = pd.DataFrame(data.get("rows", []))
+        for col in ["項目", "ニーズや生活の現状", "短期目標", "実施状況", "本人の様子・満足度", "具体的所見", "今後の方向性", "具体的理由・今後の備考"]:
+            if col not in rows.columns:
+                rows[col] = ""
+        return (rows[["項目", "ニーズや生活の現状", "短期目標", "実施状況", "本人の様子・満足度", "具体的所見", "今後の方向性", "具体的理由・今後の備考"]], clean_text(data.get("モニタリングまとめ"), summary_text), clean_text(data.get("新たな生活課題"), issue_text)), ""
+    except Exception as e:
+        return None, f"AI生成中にエラーが出ました：{e}"
+
+
+def monitoring_table_to_excel(user_name, target_month, rows_df, summary_text, issue_text):
+    """画像の様式に近い介護計画モニタリング表をExcelで作成する。"""
+    output = BytesIO()
+    try:
+        from openpyxl import Workbook
+        from openpyxl.styles import Font, PatternFill, Border, Side, Alignment
+        from openpyxl.utils import get_column_letter
+    except Exception:
+        rows_df.to_excel(output, index=False)
+        return output.getvalue()
+
+    wb = Workbook()
+    ws = wb.active
+    ws.title = "介護計画モニタリング表"
+
+    thin = Side(style="thin", color="555555")
+    border = Border(left=thin, right=thin, top=thin, bottom=thin)
+    header_fill = PatternFill("solid", fgColor="EDE7D6")
+    title_fill = PatternFill("solid", fgColor="F7F1E3")
+    accent_fill = PatternFill("solid", fgColor="F4A261")
+
+    ws.merge_cells("A1:H1")
+    ws["A1"] = "介護計画モニタリング表"
+    ws["A1"].font = Font(size=16, bold=True)
+    ws["A1"].alignment = Alignment(horizontal="center", vertical="center")
+    ws.row_dimensions[1].height = 28
+
+    info = [
+        ("A3", "入居者名", "B3", user_name),
+        ("D3", "記入日", "E3", today_jst().strftime("%Y/%m/%d")),
+        ("G3", "対象月", "H3", target_month),
+        ("A4", "当今確認職員", "B4", current_login_user()),
+        ("D4", "総合判定", "E4", ""),
+        ("G4", "次回確認予定日", "H4", ""),
+    ]
+    for label_cell, label, value_cell, value in info:
+        ws[label_cell] = label
+        ws[label_cell].fill = title_fill
+        ws[label_cell].font = Font(bold=True)
+        ws[value_cell] = value
+        for c in [label_cell, value_cell]:
+            ws[c].border = border
+            ws[c].alignment = Alignment(vertical="center", wrap_text=True)
+
+    headers = ["項目", "ニーズや生活の現状", "短期目標", "実施状況", "本人の様子・満足度", "具体的所見", "今後の方向性", "具体的理由・今後の備考"]
+    start_row = 6
+    for col_idx, header in enumerate(headers, 1):
+        cell = ws.cell(row=start_row, column=col_idx, value=header)
+        cell.fill = header_fill
+        cell.font = Font(bold=True)
+        cell.border = border
+        cell.alignment = Alignment(horizontal="center", vertical="center", wrap_text=True)
+
+    for r_idx, (_, row) in enumerate(rows_df.iterrows(), start_row + 1):
+        for c_idx, header in enumerate(headers, 1):
+            cell = ws.cell(row=r_idx, column=c_idx, value=clean_text(row.get(header)))
+            cell.border = border
+            cell.alignment = Alignment(vertical="top", wrap_text=True)
+        ws.row_dimensions[r_idx].height = 80
+
+    summary_row = start_row + len(rows_df) + 2
+    ws.merge_cells(start_row=summary_row, start_column=1, end_row=summary_row, end_column=8)
+    ws.cell(summary_row, 1).value = "モニタリングまとめ"
+    ws.cell(summary_row, 1).fill = header_fill
+    ws.cell(summary_row, 1).font = Font(bold=True)
+    ws.cell(summary_row, 1).alignment = Alignment(horizontal="center")
+    ws.cell(summary_row, 1).border = border
+
+    ws.merge_cells(start_row=summary_row + 1, start_column=1, end_row=summary_row + 1, end_column=8)
+    ws.cell(summary_row + 1, 1).value = summary_text
+    ws.cell(summary_row + 1, 1).alignment = Alignment(vertical="top", wrap_text=True)
+    ws.cell(summary_row + 1, 1).border = border
+    ws.row_dimensions[summary_row + 1].height = 70
+
+    issue_row = summary_row + 3
+    ws.merge_cells(start_row=issue_row, start_column=1, end_row=issue_row, end_column=8)
+    ws.cell(issue_row, 1).value = "新たな生活課題"
+    ws.cell(issue_row, 1).fill = header_fill
+    ws.cell(issue_row, 1).font = Font(bold=True)
+    ws.cell(issue_row, 1).alignment = Alignment(horizontal="center")
+    ws.cell(issue_row, 1).border = border
+
+    ws.merge_cells(start_row=issue_row + 1, start_column=1, end_row=issue_row + 1, end_column=8)
+    ws.cell(issue_row + 1, 1).value = issue_text
+    ws.cell(issue_row + 1, 1).alignment = Alignment(vertical="top", wrap_text=True)
+    ws.cell(issue_row + 1, 1).border = border
+    ws.row_dimensions[issue_row + 1].height = 70
+
+    widths = [12, 26, 24, 18, 20, 26, 22, 42]
+    for i, width in enumerate(widths, 1):
+        ws.column_dimensions[get_column_letter(i)].width = width
+
+    ws.page_setup.orientation = "landscape"
+    ws.page_setup.paperSize = ws.PAPERSIZE_A4
+    ws.page_margins.left = 0.3
+    ws.page_margins.right = 0.3
+    ws.page_margins.top = 0.4
+    ws.page_margins.bottom = 0.4
+    ws.freeze_panes = "A7"
+
+    wb.save(output)
+    return output.getvalue()
+
+
+def show_ai_monitoring_table_builder():
+    st.subheader("AI介護計画モニタリング表 作成")
+    st.caption("短期目標・日々の実施チェック・健康記録・排泄記録から、画像のようなモニタリング表の下書きを作成します。")
+
+    users = get_active_user_names()
+    if not users:
+        st.warning("利用者マスタに表示中の利用者がいません。")
+        return
+
+    c1, c2, c3 = st.columns(3)
+    with c1:
+        user_name = st.selectbox("利用者名", users, key="ai_monitoring_user")
+    with c2:
+        target_month_date = st.date_input("対象月", value=today_jst(), key="ai_monitoring_month")
+    with c3:
+        use_ai = st.checkbox("AIで文章を整える", value=False, help="OpenAI APIキー設定時のみ使用できます。未設定でも通常下書きは作成できます。")
+
+    target_month = ym_str(target_month_date)
+    if st.button("モニタリング表の下書きを作成", type="primary", use_container_width=True):
+        rows_df, summary_text, issue_text = build_rule_based_monitoring_rows(user_name, target_month)
+        if rows_df.empty:
+            st.warning("対象利用者の短期目標または実施記録が不足しています。先に短期目標マスタ・日々の実施チェックを確認してください。")
+        else:
+            if use_ai:
+                ai_result, ai_error = generate_ai_monitoring_rows(user_name, target_month, rows_df, summary_text, issue_text)
+                if ai_error:
+                    st.warning(ai_error)
+                if ai_result:
+                    rows_df, summary_text, issue_text = ai_result
+            st.session_state["monitoring_table_rows"] = rows_df
+            st.session_state["monitoring_table_summary"] = summary_text
+            st.session_state["monitoring_table_issue"] = issue_text
+            st.session_state["monitoring_table_user"] = user_name
+            st.session_state["monitoring_table_month"] = target_month
+            st.success("モニタリング表の下書きを作成しました。内容を確認・修正してからExcel出力してください。")
+
+    rows_df = st.session_state.get("monitoring_table_rows")
+    if rows_df is None or len(rows_df) == 0:
+        st.info("まだ下書きは作成されていません。")
+        return
+
+    st.markdown("#### 表の内容確認・修正")
+    edited_rows = st.data_editor(rows_df, use_container_width=True, hide_index=True, num_rows="dynamic", key="monitoring_table_editor")
+    summary_text = st.text_area("モニタリングまとめ", value=st.session_state.get("monitoring_table_summary", ""), height=120)
+    issue_text = st.text_area("新たな生活課題", value=st.session_state.get("monitoring_table_issue", ""), height=120)
+
+    output_user = st.session_state.get("monitoring_table_user", user_name)
+    output_month = st.session_state.get("monitoring_table_month", target_month)
+    excel_bytes = monitoring_table_to_excel(output_user, output_month, edited_rows, summary_text, issue_text)
+    st.download_button(
+        "介護計画モニタリング表をExcelでダウンロード",
+        data=excel_bytes,
+        file_name=f"介護計画モニタリング表_{output_user}_{output_month}.xlsx",
+        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        use_container_width=True,
+    )
+
+def show_short_goal_data_management():
+    st.header("短期目標データ管理")
+    tab_ai, tab_data = st.tabs(["AIモニタリング表作成", "登録データ確認"])
+
+    with tab_ai:
+        show_ai_monitoring_table_builder()
+
+    with tab_data:
+        data_map = {
+            "短期目標マスタ": (load_short_goal_master(), SHORT_GOAL_MASTER_FILE),
+            "日々の実施チェック": (load_short_goal_checks(), SHORT_GOAL_CHECK_FILE),
+            "モニタリング下書き": (load_monitoring_drafts(), MONITORING_DRAFT_FILE),
+        }
+        for label, (df, path) in data_map.items():
+            st.subheader(label)
+            st.dataframe(df, use_container_width=True, hide_index=True)
+            if not df.empty:
+                st.download_button(
+                    f"{label}をExcelでダウンロード",
+                    data=to_excel_download(df),
+                    file_name=f"{label}_{today_jst().strftime('%Y-%m-%d')}.xlsx",
+                    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                    key=f"download_short_goal_{label}",
+                    use_container_width=True,
+                )
+            else:
+                st.info("データはまだありません。")
+
+def show_admin_short_goal_summary(target_date):
+    st.subheader("短期目標 実施状況")
+    checks = load_short_goal_checks()
+    if checks.empty:
+        st.info("短期目標の実施チェック記録はまだありません。")
+        return
+    work = checks.copy()
+    work["日付_dt"] = pd.to_datetime(work["日付"], errors="coerce")
+    target = pd.to_datetime(target_date, errors="coerce")
+    if pd.isna(target):
+        st.info("確認日を取得できません。")
+        return
+    day_df = work[work["日付_dt"].dt.date == target.date()].copy()
+    if day_df.empty:
+        st.info("確認日の短期目標チェック記録はありません。")
+        return
+    summary = day_df.groupby("実施状況").size().to_dict()
+    c1, c2, c3 = st.columns(3)
+    c1.metric("実施", int(summary.get("実施", 0)))
+    c2.metric("一部実施", int(summary.get("一部実施", 0)))
+    c3.metric("未実施", int(summary.get("未実施", 0)))
+    st.dataframe(day_df[["日付", "利用者名", "短期目標", "実施状況", "本人の様子", "未実施理由", "職員メモ", "入力職員"]], use_container_width=True, hide_index=True)
+
+# =========================
+# バックアップ
+# =========================
+# =========================
+# Excel出力ユーティリティ
+# =========================
+
+def dataframe_to_excel_bytes(sheets: dict):
+    """複数のDataFrameを1つのExcelブックにして返す。"""
+    buffer = BytesIO()
+    with pd.ExcelWriter(buffer, engine="openpyxl") as writer:
+        written = False
+        for sheet_name, df in sheets.items():
+            safe_sheet = str(sheet_name)[:31] if sheet_name else "data"
+            work = df.copy() if isinstance(df, pd.DataFrame) else pd.DataFrame()
+            # Excelで扱いやすいように日付・日時は文字列化する
+            for col in work.columns:
+                if pd.api.types.is_datetime64_any_dtype(work[col]):
+                    work[col] = work[col].dt.strftime("%Y-%m-%d")
+            work.to_excel(writer, index=False, sheet_name=safe_sheet)
+            written = True
+        if not written:
+            pd.DataFrame({"メッセージ": ["出力対象データがありません"]}).to_excel(writer, index=False, sheet_name="データなし")
+    buffer.seek(0)
+    return buffer.getvalue()
+
+
+
+def load_selected_export_data(key):
+    """管理者ダウンロード用に、SQLite正データから選択データを読み込む。"""
+    if key == "健康チェック":
+        return load_health_data()
+    if key == "排泄チェック":
+        return load_excretion_data()
+    if key == "利用者マスタ":
+        return load_users(include_hidden=True)
+    if key == "業務全体申し送り":
+        return load_business_handover_data()
+    if key == "短期目標マスタ":
+        return load_short_goal_master()
+    if key == "短期目標実施チェック":
+        return load_short_goal_checks()
+    if key == "モニタリング下書き":
+        return load_monitoring_drafts()
+    if key == "LIFE ADL評価":
+        return load_life_adl_data()
+    if key == "ログイン履歴":
+        return load_login_history()
+    if key == "AI分析ログ":
+        return load_ai_insight_logs()
+    return pd.DataFrame()
+
+def filter_export_dataframe(df, start_date=None, end_date=None, user_name="全員"):
+    """記録日・日付・評価日・作成日などの日付列と利用者名で絞り込む。"""
+    if df is None or df.empty:
+        return pd.DataFrame() if df is None else df
+    work = df.copy()
+
+    date_col = None
+    for candidate in ["記録日", "日付", "評価日", "作成日", "日時", "登録日時"]:
+        if candidate in work.columns:
+            date_col = candidate
+            break
+
+    if date_col and start_date and end_date:
+        work[date_col] = pd.to_datetime(work[date_col], errors="coerce")
+        start_dt = pd.to_datetime(start_date)
+        end_dt = pd.to_datetime(end_date)
+        work = work[(work[date_col] >= start_dt) & (work[date_col] <= end_dt)]
+
+    if user_name != "全員" and "利用者名" in work.columns:
+        work = work[work["利用者名"].astype(str) == user_name]
+
+    return work
+
+
+def show_admin_data_download_menu():
+    """管理者が必要なデータを選択してExcelでダウンロードする画面。"""
+    if st.session_state.role != "admin":
+        st.error("この画面は管理者専用です。")
+        st.stop()
+
+    st.header("データダウンロード")
+    st.caption("健康チェック・排泄チェック・短期目標など、必要なデータを選んでExcel形式でダウンロードできます。")
+
+    export_options = [
+        "健康チェック",
+        "排泄チェック",
+        "利用者マスタ",
+        "業務全体申し送り",
+        "短期目標マスタ",
+        "短期目標実施チェック",
+        "モニタリング下書き",
+        "LIFE ADL評価",
+        "ログイン履歴",
+    ]
+
+    selected = st.multiselect(
+        "ダウンロードするデータを選択",
+        export_options,
+        default=["健康チェック", "排泄チェック"],
+        help="複数選ぶと、1つのExcelファイル内にシートを分けて出力します。",
+    )
+
+    c1, c2, c3 = st.columns(3)
+    with c1:
+        start_date = st.date_input("開始日", value=today_jst().replace(day=1), key="export_start_date")
+    with c2:
+        end_date = st.date_input("終了日", value=today_jst(), key="export_end_date")
+    with c3:
+        user_filter = st.selectbox("利用者で絞り込み", ["全員"] + active_users, key="export_user_filter")
+
+    st.caption("日付列があるデータは期間で絞り込みます。利用者名があるデータは利用者でも絞り込めます。")
+
+    if not selected:
+        st.info("ダウンロードするデータを1つ以上選択してください。")
+        return
+
+    sheets = {}
+    preview_rows = []
+    for key in selected:
+        df = load_selected_export_data(key)
+        filtered = filter_export_dataframe(df, start_date, end_date, user_filter)
+        sheets[key] = filtered
+        preview_rows.append({"データ種類": key, "出力件数": len(filtered)})
+
+    st.subheader("出力内容の確認")
+    st.dataframe(pd.DataFrame(preview_rows), use_container_width=True, hide_index=True)
+
+    with st.expander("選択データのプレビュー"):
+        for key, df in sheets.items():
+            st.markdown(f"**{key}**")
+            if df.empty:
+                st.info("該当データはありません。")
+            else:
+                st.dataframe(df.head(50), use_container_width=True, hide_index=True)
+
+    excel_bytes = dataframe_to_excel_bytes(sheets)
+    file_name = f"hidamari_selected_data_{format_now_jst('%Y%m%d_%H%M%S')}.xlsx"
+    st.download_button(
+        "選択したデータをExcelでダウンロード",
+        data=excel_bytes,
+        file_name=file_name,
+        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        type="primary",
+        use_container_width=True,
+    )
+
+def show_admin_backup_download():
+    """管理者向けバックアップダウンロード欄。"""
+    if st.session_state.role != "admin":
+        return
+
+    st.divider()
+    st.subheader("データバックアップ")
+    st.caption("健康チェック・排泄チェック・利用者マスタをまとめて保存できます。定期的にダウンロードしてください。")
+
+    if st.button("バックアップZIPを作成", type="primary", use_container_width=True):
+        zip_path, err = create_backup_zip(kind="手動")
+        if err:
+            st.error(err)
+        elif zip_path and Path(zip_path).exists():
+            st.session_state["admin_backup_zip_bytes"] = Path(zip_path).read_bytes()
+            st.session_state["admin_backup_zip_name"] = Path(zip_path).name
+            st.success(f"バックアップを作成しました：{Path(zip_path).name}")
+
+    if st.session_state.get("admin_backup_zip_bytes"):
+        st.download_button(
+            label="作成済みバックアップZIPをダウンロード",
+            data=st.session_state["admin_backup_zip_bytes"],
+            file_name=st.session_state.get("admin_backup_zip_name", f"hidamari_backup_{format_now_jst('%Y%m%d_%H%M%S')}.zip"),
+            mime="application/zip",
+            use_container_width=True,
+        )
+
+    with st.expander("個別ファイルでダウンロードする"):
+        if HEALTH_FILE.exists():
+            with open(HEALTH_FILE, "rb") as f:
+                st.download_button(
+                    "健康チェックデータをダウンロード",
+                    data=f,
+                    file_name="health_data.xlsx",
+                    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                )
+
+        if EXCRETION_FILE.exists():
+            with open(EXCRETION_FILE, "rb") as f:
+                st.download_button(
+                    "排泄チェックデータをダウンロード",
+                    data=f,
+                    file_name="excretion_data.xlsx",
+                    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                )
+
+        st.download_button(
+            "利用者マスタをダウンロード",
+            data=export_user_master_excel_bytes(),
+            file_name="user_master.xlsx",
+            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        )
+
+        if HANDOVER_FILE.exists():
+            with open(HANDOVER_FILE, "rb") as f:
+                st.download_button(
+                    "業務全体申し送りデータをダウンロード",
+                    data=f,
+                    file_name="business_handover_data.xlsx",
+                    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                )
+
+        short_goal_files = [
+            (SHORT_GOAL_MASTER_FILE, "短期目標マスタをダウンロード", "short_goal_master.xlsx"),
+            (SHORT_GOAL_CHECK_FILE, "短期目標実施チェックをダウンロード", "short_goal_check_data.xlsx"),
+            (MONITORING_DRAFT_FILE, "モニタリング下書きをダウンロード", "monitoring_draft_data.xlsx"),
+        ]
+        for file_path, label, file_name in short_goal_files:
+            if file_path.exists():
+                with open(file_path, "rb") as f:
+                    st.download_button(
+                        label,
+                        data=f,
+                        file_name=file_name,
+                        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                    )
+
+
+# =========================
+# レポート系
+# =========================
+def create_family_summary_text(health_df, excretion_df, user_name, year, month):
+    target = get_month_health_data(health_df, user_name, year, month)
+    ex_target = get_month_excretion_data(excretion_df, user_name, year, month)
+
+    lines = []
+
+    if target.empty:
+        lines.append(f"{user_name}の{year}年{month}月分の健康チェック記録は、現時点では登録されていません。")
+    else:
+        lines.append(
+            f"{user_name}の{year}年{month}月の健康チェック記録は、{len(target)}件確認されています。"
+            "この文章は医療的な判断ではなく、日々の記録をもとにした共有です。"
+        )
+
+        temp_mean = to_number(target["体温"]).mean()
+        spo2_mean = to_number(target["SpO2"]).mean()
+        weight_mean = to_number(target["体重"]).mean()
+
+        health_parts = []
+        if not pd.isna(temp_mean):
+            health_parts.append(f"体温平均{round(float(temp_mean), 1)}℃")
+        if not pd.isna(spo2_mean):
+            health_parts.append(f"SpO2平均{round(float(spo2_mean), 1)}％")
+        if not pd.isna(weight_mean):
+            health_parts.append(f"体重平均{round(float(weight_mean), 1)}kg")
+
+        if health_parts:
+            lines.append("記録上、" + "、".join(health_parts) + "として確認されています。")
+
+        meal_parts = []
+        for label in ["朝食摂取率", "昼食摂取率", "夕食摂取率"]:
+            mean = to_number(target[label]).mean()
+            if not pd.isna(mean):
+                meal_parts.append(f"{label.replace('摂取率', '')}平均{round(float(mean), 1)}％")
+
+        if meal_parts:
+            lines.append("食事摂取率は、" + "、".join(meal_parts) + "でした。")
+
+        memo_rows = target[target["家族共有メモ"].fillna("").astype(str).str.strip() != ""]
+        change_rows = target[target["気になる変化"].fillna("").astype(str).str.strip() != ""]
+
+        if not memo_rows.empty:
+            first = memo_rows.iloc[0]
+            lines.append(
+                f"ご様子として、{first['記録日'].strftime('%m/%d')}の記録に"
+                f"「{str(first['家族共有メモ'])[:80]}」とあります。"
+            )
+
+        if not change_rows.empty:
+            first = change_rows.iloc[0]
+            lines.append(
+                f"また、{first['記録日'].strftime('%m/%d')}に"
+                f"「{str(first['気になる変化'])[:80]}」という記録があります。"
+                "必要に応じて職員間で共有しながら見守っています。"
+            )
+
+    assessment = build_assessment_context_text(user_name)
+    if assessment:
+        lines.append("アセスメント情報もふまえ、生活全体の様子を確認しています。\n" + assessment)
+
+    if ex_target.empty:
+        lines.append("排泄記録は、対象月にはまだ登録されていません。")
+    else:
+        ex_sum = summarize_excretion(ex_target)
+        lines.append(
+            "排泄状況は、"
+            f"排尿記録{ex_sum['排尿回数']}回、排便記録{ex_sum['排便回数']}回、"
+            f"濃縮尿{ex_sum['濃縮尿']}回、下痢便{ex_sum['下痢便']}回、水様便{ex_sum['水様便']}回として記録されています。"
+        )
+
+    lines.append("今後も、数値だけでなく表情や生活の様子も含めて、安心して過ごせるよう見守ってまいります。")
+
+    return "\n\n".join(lines)
+
+
+def create_hidamari_pdf(health_df, excretion_df, user_name, year, month):
+    if colors is None:
+        raise RuntimeError("reportlab が利用できません。requirements.txt に reportlab を追加してください。")
+
+    pdfmetrics.registerFont(UnicodeCIDFont("HeiseiKakuGo-W5"))
+    pdfmetrics.registerFont(UnicodeCIDFont("HeiseiMin-W3"))
+
+    file_path = REPORT_DIR / f"ひだまりレポート_{user_name}_{year}年{month}月.pdf"
+
+    doc = SimpleDocTemplate(
+        str(file_path),
+        pagesize=A4,
+        rightMargin=17 * mm,
+        leftMargin=17 * mm,
+        topMargin=14 * mm,
+        bottomMargin=14 * mm,
+    )
+
+    styles = getSampleStyleSheet()
+    title_style = ParagraphStyle(
+        "jp_title",
+        parent=styles["Title"],
+        fontName="HeiseiKakuGo-W5",
+        fontSize=22,
+        leading=28,
+        alignment=1,
+        textColor=colors.HexColor("#2F3437"),
+    )
+    h2_style = ParagraphStyle(
+        "jp_h2",
+        parent=styles["Heading2"],
+        fontName="HeiseiKakuGo-W5",
+        fontSize=13,
+        leading=18,
+        textColor=colors.HexColor("#2F3437"),
+    )
+    body_style = ParagraphStyle(
+        "jp_body",
+        parent=styles["BodyText"],
+        fontName="HeiseiMin-W3",
+        fontSize=10,
+        leading=16,
+    )
+    small_style = ParagraphStyle(
+        "jp_small",
+        parent=styles["BodyText"],
+        fontName="HeiseiMin-W3",
+        fontSize=8,
+        leading=12,
+        textColor=colors.HexColor("#666666"),
+    )
+
+    story = []
+    story.append(Paragraph("ひだまりレポート", title_style))
+    story.append(Spacer(1, 6))
+    story.append(Paragraph(f"{user_name}　{year}年{month}月", body_style))
+    story.append(Spacer(1, 12))
+
+    summary = create_family_summary_text(health_df, excretion_df, user_name, year, month)
+    story.append(Paragraph("今月のまとめ", h2_style))
+    for para in summary.split("\n\n"):
+        story.append(Paragraph(para.replace("\n", "<br/>"), body_style))
+        story.append(Spacer(1, 5))
+
+    story.append(PageBreak())
+    story.append(Paragraph("排泄記録", h2_style))
+
+    ex_target = get_month_excretion_data(excretion_df, user_name, year, month)
+    if ex_target.empty:
+        story.append(Paragraph("対象月の排泄記録はありません。", body_style))
+    else:
+        table_data = [["日付", "時間帯", "尿", "便", "メモ"]]
+        for _, row in ex_target.iterrows():
+            table_data.append([
+                row["記録日"].strftime("%m/%d") if pd.notna(row["記録日"]) else "",
+                row["時間帯"],
+                f"{row['尿量']}・{row['尿性状']}",
+                f"{row['便量']}・{row['便性状']}",
+                str(row.get("排泄メモ", ""))[:40],
+            ])
+
+        table = Table(table_data, colWidths=[20*mm, 24*mm, 35*mm, 35*mm, 55*mm])
+        table.setStyle(TableStyle([
+            ("FONTNAME", (0, 0), (-1, -1), "HeiseiMin-W3"),
+            ("FONTNAME", (0, 0), (-1, 0), "HeiseiKakuGo-W5"),
+            ("BACKGROUND", (0, 0), (-1, 0), colors.HexColor("#F7F4EE")),
+            ("BOX", (0, 0), (-1, -1), 0.5, colors.HexColor("#D9D9D9")),
+            ("INNERGRID", (0, 0), (-1, -1), 0.25, colors.HexColor("#D9D9D9")),
+            ("FONTSIZE", (0, 0), (-1, -1), 8),
+            ("VALIGN", (0, 0), (-1, -1), "TOP"),
+        ]))
+        story.append(table)
+
+    story.append(Spacer(1, 12))
+    story.append(Paragraph("※このレポートは施設内の記録をもとにした共有資料です。医療的な診断・治療効果の判断を行うものではありません。", small_style))
+
+    doc.build(story)
+    return file_path
+
+
+def create_handover_text(health_df, excretion_df, target_date):
+    lines = [
+        f"{target_date.strftime('%Y/%m/%d')}の申し送りまとめです。",
+        "医療的な判断ではなく、記録内容をもとにした共有用メモです。",
+        "",
+    ]
+
+    h = health_df.copy()
+    if not h.empty:
+        h["記録日"] = pd.to_datetime(h["記録日"], errors="coerce")
+        h = h[h["記録日"].dt.date == target_date]
+
+        for _, row in h.iterrows():
+            notes = []
+            if clean_text(row.get("気になる変化", "")):
+                notes.append(f"気になる変化：{row.get('気になる変化')}")
+            if clean_text(row.get("家族共有メモ", "")):
+                notes.append(f"家族共有メモ：{row.get('家族共有メモ')}")
+
+            vital_alerts = []
+            if safe_float(row.get("体温"), 0) >= 37.5:
+                vital_alerts.append("体温高め")
+            if safe_int(row.get("SpO2"), 100) <= 93:
+                vital_alerts.append("SpO2低め")
+            if safe_int(row.get("血圧上"), 0) >= 160:
+                vital_alerts.append("血圧上高め")
+
+            if vital_alerts:
+                notes.append("確認目安：" + "、".join(vital_alerts))
+
+            if notes:
+                lines.append(f"■ {row.get('利用者名')}")
+                lines.extend([f"・{x}" for x in notes])
+                lines.append("")
+
+    e = get_day_excretion_data(excretion_df, target_date, None)
+    if not e.empty:
+        for user in e["利用者名"].dropna().unique():
+            user_ex = e[e["利用者名"] == user]
+            alerts = []
+
+            for _, row in user_ex.iterrows():
+                if row["尿性状"] == "濃縮尿":
+                    alerts.append(f"{row['時間帯']}に濃縮尿")
+                if row["便性状"] in ["下痢便", "水様便"]:
+                    alerts.append(f"{row['時間帯']}に{row['便性状']}")
+
+            if alerts:
+                lines.append(f"■ {user} 排泄確認")
+                lines.append("・" + "、".join(alerts))
+                lines.append("")
+
+    diff_lines = []
+    for user in active_users:
+        hdiff = build_health_diff_text(health_df, target_date, user)
+        ediff = build_excretion_diff_text(excretion_df, target_date, user)
+
+        if "大きな差分は目立ちません" not in hdiff and "比較できる過去記録はありません" not in hdiff and "本日の健康記録がありません" not in hdiff:
+            diff_lines.append(f"■ {user} {hdiff}")
+
+        if "大きな変化は目立ちません" not in ediff and "比較できる過去排泄記録はありません" not in ediff:
+            diff_lines.append(f"■ {user} {ediff}")
+
+    if diff_lines:
+        lines.append("【前回との差分】")
+        lines.extend(diff_lines)
+        lines.append("")
+
+    if len(lines) <= 3:
+        lines.append("記録上、特に申し送り対象となるメモや注意目安はありません。")
+
+    lines.append("引き続き、普段との違いがないかを確認しながら見守ります。")
+    return "\n".join(lines)
+
+
+
+
+# =========================
+# 今日のひだまりメッセージ（ランダム表示）
+# =========================
+HIDAMARI_MESSAGES = [
+'小さな記録が、誰かの安心につながります。',
+'今日のひと声が、利用者様の一日をやわらかくします。',
+'あわてず、ひとつずつ。記録はチームの安心です。',
+'いつもの中の小さな違いに、そっと気づけますように。',
+'今日も無理なく、やさしいケアでいきましょう。',
+'申し送りは、責任を背負うためではなく、チームで分け合うためにあります。',
+'気になった時点で、もう大事な気づきです。',
+'なんとなく変かも、は立派な観察です。',
+'小さな違和感を残せる職場は、利用者様を守る力があります。',
+'完璧より、安心できる空気を大切に。',
+'急がない声かけが、安心につながる日もあります。',
+'いつも通りを守ることも、立派な支援です。',
+'今日の記録は、明日の誰かを助けます。',
+'一人で抱えず、チームで見守りましょう。',
+'深呼吸する時間も、ケアのうちです。',
+'利用者様だけでなく、自分の体調も大切に。',
+'焦らなくても大丈夫。記録は積み重なります。',
+'やさしさは、入力欄の外にもあります。',
+'声のトーンひとつで、安心は伝わります。',
+'今日の笑顔は、今日の大切なケアです。',
+'見る、聞く、待つ。それだけで支援になる時間があります。',
+'できたことを一つ見つける日でありますように。',
+'記録は評価ではなく、安心をつなぐメモです。',
+'昨日との違いに気づけたら、それは大きな一歩です。',
+'急がず、でも見逃さず。今日も丁寧にいきましょう。',
+'利用者様のペースを尊重できることは、強いケアです。',
+'困った時は、早めに共有。それだけで事故は減らせます。',
+'小さな確認が、大きな安心につながります。',
+'今日も現場を支えるあなたの力があります。',
+'声をかける前に一呼吸。それだけで伝わり方が変わります。',
+'記録を残すことは、利用者様を一人にしないことです。',
+'いつもの表情を知っている職員さんは、現場の宝です。',
+'大きなことをしなくても、そばにいることが支援です。',
+'今日のケアが、明日の落ち着きにつながることがあります。',
+'迷ったら、抱え込まずに共有しましょう。',
+'気づきを言葉にすることが、チームケアの第一歩です。',
+'静かな見守りも、確かなケアです。',
+'今日も、利用者様の生活の一部を支えています。',
+'少しの変化を見つける目が、安心を作ります。',
+'申し送りは、次の職員さんへの思いやりです。',
+'記録は冷たい作業ではなく、あたたかい引き継ぎです。',
+'今日の小さなメモが、ご家族の安心にもつながります。',
+'ケアは、正解よりも関わり続けることが大切な日があります。',
+'利用者様の『その人らしさ』を、今日も少し残していきましょう。',
+'ゆっくり話を聞けた時間は、立派な支援です。',
+'できないことより、できていることにも目を向けて。',
+'焦る日ほど、基本に戻りましょう。',
+'今日も一つずつ、確認していけば大丈夫です。',
+'体調の変化だけでなく、気持ちの変化にもそっと気づけますように。',
+'誰かに相談できることも、専門職の力です。',
+'記録があるから、チームで同じ方向を見られます。',
+'小さな『ありがとう』を受け取れる日でありますように。',
+'いつもの暮らしを守ることは、大きな仕事です。',
+'慌ただしい日ほど、やさしい言葉を一つ。',
+'今日の安全確認が、安心した夜につながります。',
+'気づいたことを残すだけで、次のケアが変わります。',
+'職員さんの気づきは、システムより大切な情報です。',
+'機械は記録を整理します。安心を作るのは人です。',
+'入力は短くても大丈夫。残すことに意味があります。',
+'ひとつの記録が、ひとつの見守りになります。',
+'利用者様の安心は、毎日の小さな積み重ねから生まれます。',
+'声をかける、待つ、見守る。どれも大切なケアです。',
+'今日も、無理をしすぎないケアでいきましょう。',
+'『いつもと違う』を大切にできる現場は強いです。',
+'小さな違いを責めず、そっと共有しましょう。',
+'今日の記録は、未来の安心の材料です。',
+'手を止めて見る時間も、ケアの時間です。',
+'利用者様の表情を思い出しながら記録してみましょう。',
+'チームで見れば、気づきはもっとやさしくなります。',
+'忙しい中の一言が、利用者様の心を軽くすることがあります。',
+'できるだけやさしく、できるだけ正確に。今日もそれで十分です。',
+'安全は、細かな確認から育ちます。',
+'生活を支える仕事は、目立たなくても深い価値があります。',
+'今日の観察が、明日の対応を助けます。',
+'記録を残すことは、ケアを見える形にすることです。',
+'利用者様の一日は、職員さんの気づきで守られています。',
+'『大丈夫かな』と思ったら、残しておきましょう。',
+'確認したことも、立派な申し送りです。',
+'何もなかった日も、見守った日です。',
+'普段通りを確認できることも、安心材料です。',
+'今日も、自分を責めすぎず、丁寧に。',
+'現場のやさしさは、細かい記録にも表れます。',
+'利用者様の安心と、職員さんの安心。どちらも大切です。',
+'よく見ることは、よく支えることにつながります。',
+'一つの気づきが、転倒予防につながることがあります。',
+'一つの声かけが、不安の軽減につながることがあります。',
+'食事、排泄、表情。生活の中に大事な情報があります。',
+'今日のメモは、明日の会話のきっかけになります。',
+'大きな変化でなくても、残してよいのです。',
+'職員さんの『気になる』は、現場のセンサーです。',
+'急がず、でも流さず。今日もやさしく確認を。',
+'穏やかな声は、安心の環境づくりです。',
+'ケアは一人で完成しません。つなぐことで強くなります。',
+'今日も、利用者様の暮らしをそっと支えています。',
+'ボーダーコリーのように、落ち着いて見守る日でありますように。',
+'猫のように、少しゆっくりでも大丈夫です。',
+'ひなたぼっこのような空気を、今日も少しだけ。',
+'尻尾を振るような安心感を、今日の現場にも。',
+'やさしい見守りは、ちゃんと伝わっています。',
+'忙しさの中にも、ひだまりの時間を一つ。',
+]
+
+
+def get_hidamari_message():
+    """ログインごとに1つ選ばれる、介護の心得メッセージ。"""
+    if "hidamari_login_message" not in st.session_state:
+        st.session_state["hidamari_login_message"] = random.choice(HIDAMARI_MESSAGES)
+    return st.session_state["hidamari_login_message"]
+
+
+# =========================
+# あたたかい画面デザイン
+# =========================
+def show_hidamari_hero(mode="login"):
+    """ログイン画面と各ダッシュボード上部の案内表示。"""
+    if mode == "login":
+        title = "ひだまり 健康チェック管理システム"
+        sub = "利用者様に寄り添うために"
+
+        # ログイン画面は、インラインCSSで確実に画面中央へ配置する。
+        st.markdown(
+            f"""
+            <div style="
+                width: 100%;
+                display: flex;
+                justify-content: center;
+                align-items: center;
+                text-align: center;
+                margin: 34px auto 22px auto;
+            ">
+                <div style="
+                    width: min(760px, 92vw);
+                    background: linear-gradient(135deg, #F7F2EA 0%, #EEF5EF 58%, #EAF1F5 100%);
+                    border: 1px solid rgba(88, 112, 96, 0.16);
+                    border-radius: 28px;
+                    padding: 28px 26px;
+                    box-shadow: 0 10px 28px rgba(55, 64, 58, 0.08);
+                ">
+                    <div style="font-size: 2.1rem; line-height: 1.25; font-weight: 800; color: #2F6F5E; letter-spacing: 0.02em;">
+                        {title}
+                    </div>
+                    <div style="font-size: 1.15rem; color: #64706A; margin-top: 10px;">
+                        {sub}
+                    </div>
+                </div>
+            </div>
+            """,
+            unsafe_allow_html=True,
+        )
+        return
+
+    elif mode == "staff":
+        title = "今日のひだまりメッセージ"
+        sub = get_hidamari_message()
+    else:
+        title = "ひだまり 管理者ダッシュボード"
+        sub = get_hidamari_message()
+
+    st.markdown(
+        f"""
+        <div class="hidamari-hero">
+            <div class="hidamari-hero-title">{title}</div>
+            <div class="hidamari-hero-sub">{sub}</div>
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
+
+
+def show_staff_encouragement():
+    # 上部の「今日もお疲れ様です」カードを残すため、
+    # ここでは追加メッセージを表示しない。
+    return
+
+
+
+def show_admin_encouragement():
+    st.markdown(
+        """
+        <div class="admin-welcome">
+            <b> 管理者モードです。</b><br>
+            入力状況、注意記録、申し送りを確認できます。現場の気づきを、管理の力に変えていきましょう。
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
+
+
+
+
+# =========================
+# 現場の気づき構造化・AI管理者支援 Ver1.3追加
+# =========================
+AI_INSIGHT_LOG_FILE = DATA_DIR / "ai_insight_log.xlsx"
+AI_INSIGHT_LOG_COLUMNS = ["作成日時", "分析基準日", "利用者名", "対象期間", "ルール分析", "AI分析結果"]
+
+
+
+def ensure_ai_insight_log_file():
+    """
+    AI分析ログをSQLiteで管理する。
+    旧Excelがある場合のみ初回移行し、以後はSQLiteを正とする。
+    """
+    ensure_dirs()
+    if sqlite_table_row_count(SQLITE_TABLE_AI_INSIGHT_LOGS) > 0:
+        return
+
+    df = pd.DataFrame(columns=AI_INSIGHT_LOG_COLUMNS)
+    if AI_INSIGHT_LOG_FILE.exists():
+        try:
+            df = pd.read_excel(AI_INSIGHT_LOG_FILE, sheet_name="AI分析ログ")
+        except Exception:
+            try:
+                df = pd.read_excel(AI_INSIGHT_LOG_FILE)
+            except Exception:
+                df = pd.DataFrame(columns=AI_INSIGHT_LOG_COLUMNS)
+
+    df = normalize_df_columns(df, AI_INSIGHT_LOG_COLUMNS)
+    save_sqlite_table(df, SQLITE_TABLE_AI_INSIGHT_LOGS, AI_INSIGHT_LOG_COLUMNS, sort_cols=["作成日時"])
+
+
+def load_ai_insight_logs():
+    ensure_ai_insight_log_file()
+    return load_sqlite_table(SQLITE_TABLE_AI_INSIGHT_LOGS, AI_INSIGHT_LOG_COLUMNS).astype("object")
+
+
+def save_ai_insight_logs(df):
+    ensure_dirs()
+    df = normalize_df_columns(df, AI_INSIGHT_LOG_COLUMNS)
+    save_sqlite_table(df, SQLITE_TABLE_AI_INSIGHT_LOGS, AI_INSIGHT_LOG_COLUMNS, sort_cols=["作成日時"])
+
+def filter_records_by_period(df, date_col, start_day, end_day, user_name=None):
+    if df is None or df.empty or date_col not in df.columns:
+        return pd.DataFrame(columns=df.columns if df is not None else [])
+    work = df.copy()
+    work[date_col] = pd.to_datetime(work[date_col], errors="coerce")
+    mask = (work[date_col].dt.date >= start_day) & (work[date_col].dt.date <= end_day)
+    if user_name and user_name != "全員" and "利用者名" in work.columns:
+        mask &= work["利用者名"].astype(str) == str(user_name)
+    return work[mask].copy()
+
+
+def text_contains_any(text, words):
+    text = clean_text(text)
+    return any(w in text for w in words)
+
+
+def analyze_structured_insights(health_df, ex_df, handover_df, goal_df, user_name, end_day):
+    """OpenAIなしでも使える、記録ベースの管理者向け分析。診断はしない。"""
+    start_day = end_day - timedelta(days=6)
+    h = filter_records_by_period(health_df, "記録日", start_day, end_day, user_name)
+    e = filter_records_by_period(ex_df, "記録日", start_day, end_day, user_name)
+    b = filter_records_by_period(handover_df, "日付", start_day, end_day, None)
+    g = filter_records_by_period(goal_df, "日付", start_day, end_day, user_name)
+
+    findings = []
+    checks = []
+    goal_summary = []
+
+    if not h.empty:
+        change_items = []
+        for col in ["気になる変化", "家族共有メモ", "LIFE補助メモ"]:
+            if col in h.columns:
+                change_items += [clean_text(x) for x in h[col].dropna().tolist() if clean_text(x)]
+        if change_items:
+            findings.append(f"直近7日で、気になる変化・共有メモが {len(change_items)} 件記録されています。")
+            checks.append("気になる変化が、どの時間帯・どの場面で出ているかを職員間でそろえて確認すると整理しやすくなります。")
+
+        joined = " ".join(h.fillna("").astype(str).agg(" ".join, axis=1).tolist())
+        keyword_map = {
+            "食事量": ["食欲", "食事少", "摂取少", "食べない", "半量", "残し"],
+            "水分": ["水分", "飲まない", "脱水", "濃縮"],
+            "睡眠・夜間": ["不眠", "眠れ", "夜間", "覚醒", "徘徊"],
+            "痛み": ["痛", "疼痛", "つらい"],
+            "転倒リスク": ["ふらつ", "転倒", "歩行不安定", "立位不安定"],
+            "気分・不安": ["不安", "拒否", "怒", "落ち着か", "涙"],
+        }
+        for label, words in keyword_map.items():
+            if text_contains_any(joined, words):
+                findings.append(f"{label}に関係する記録が見られます。")
+                checks.append(f"{label}について、普段との違い・続いている日数・関わり方の差を確認してもよいかもしれません。")
+
+        for meal_col in ["朝食摂取率", "昼食摂取率", "夕食摂取率"]:
+            if meal_col in h.columns:
+                low_count = int((pd.to_numeric(h[meal_col], errors="coerce") <= 50).sum())
+                if low_count > 0:
+                    findings.append(f"{meal_col}が50％以下の日が {low_count} 件あります。")
+                    checks.append(f"{meal_col}の低下が一時的か、複数日続いているかを確認してください。")
+
+        numeric_checks = [("体温", 37.5, "以上"), ("SpO2", 93, "以下"), ("血圧上", 160, "以上")]
+        for col, threshold, direction in numeric_checks:
+            if col in h.columns:
+                vals = pd.to_numeric(h[col], errors="coerce")
+                if direction == "以上":
+                    cnt = int((vals >= threshold).sum())
+                else:
+                    cnt = int(((vals <= threshold) & (vals > 0)).sum())
+                if cnt > 0:
+                    findings.append(f"{col}が確認目安にかかる記録が {cnt} 件あります。")
+                    checks.append(f"{col}について、入力ミスではないか、普段値との差があるかを確認してください。")
+    else:
+        findings.append("直近7日の健康チェック記録が確認できません。")
+        checks.append("記録漏れか、入力日・利用者名の表記ゆれがないか確認してください。")
+
+    if not e.empty:
+        stool_df = e[e.get("便量", "").astype(str).fillna("なし") != "なし"] if "便量" in e.columns else pd.DataFrame()
+        if stool_df.empty:
+            findings.append("直近7日の排便記録が確認できません。")
+            checks.append("排便記録の入力漏れか、実際に間隔が空いているのかを確認してください。")
+        else:
+            last_day = pd.to_datetime(stool_df["記録日"], errors="coerce").max()
+            if pd.notna(last_day):
+                days = (end_day - last_day.date()).days
+                if days >= 3:
+                    findings.append(f"排便記録の最終確認から {days} 日経過しています。")
+                    checks.append("普段の排便間隔、水分・食事量、腹部症状の記録を確認してください。")
+        if "尿性状" in e.columns and int((e["尿性状"].astype(str) == "濃縮尿").sum()) > 0:
+            findings.append("濃縮尿の記録があります。")
+            checks.append("水分摂取量や食事量の記録と合わせて確認してください。")
+        if "便性状" in e.columns:
+            loose_count = int(e["便性状"].astype(str).isin(["下痢便", "水様便"]).sum())
+            if loose_count > 0:
+                findings.append(f"下痢便・水様便の記録が {loose_count} 件あります。")
+                checks.append("一時的な記録か、複数回続いているかを申し送りで共有してください。")
+
+    if not b.empty:
+        # 業務全体申し送りは利用者名列がないため、全体傾向として扱う
+        urgent = 0
+        if "優先度" in b.columns:
+            urgent += int(b["優先度"].astype(str).isin(["高", "至急", "重要"]).sum())
+        if "対応状況" in b.columns:
+            pending = int(b["対応状況"].astype(str).isin(["未対応", "確認中"]).sum())
+            if pending > 0:
+                findings.append(f"業務全体申し送りに未対応・確認中の記録が {pending} 件あります。")
+                checks.append("利用者個別の変化と、全体申し送りの未対応事項が重なっていないか確認してください。")
+        if urgent > 0:
+            findings.append(f"業務全体申し送りに優先度の高い記録が {urgent} 件あります。")
+
+    if not g.empty:
+        for goal, grp in g.groupby("短期目標"):
+            total = len(grp)
+            done = int(grp["実施状況"].astype(str).isin(["実施", "一部実施", "できた", "○"]).sum()) if "実施状況" in grp.columns else 0
+            partial = int((grp["実施状況"].astype(str) == "一部実施").sum()) if "実施状況" in grp.columns else 0
+            not_done = int((grp["実施状況"].astype(str) == "未実施").sum()) if "実施状況" in grp.columns else 0
+            rate = round(done / total * 100, 1) if total else 0
+            goal_summary.append(f"{goal}：記録{total}回／実施・一部実施{done}回／未実施{not_done}回／実施率{rate}%")
+            if rate < 70:
+                findings.append(f"短期目標『{goal}』の実施率が {rate}% です。")
+                checks.append(f"『{goal}』について、未実施理由・実施しにくい時間帯・職員間の見え方の差を確認してください。")
+            if partial > 0:
+                checks.append(f"『{goal}』は一部実施の記録があります。どこまでできたかを次回記録でそろえると分析しやすくなります。")
+    else:
+        checks.append("短期目標の実施記録がない場合は、ケアプランの短期目標と日々の記録がつながっているか確認してください。")
+
+    if not findings:
+        findings.append("直近7日の記録上、大きな変化は目立っていません。")
+    if not checks:
+        checks.append("現在の記録を継続し、気になる変化が出た場合は早めに共有してください。")
+
+    return {"findings": findings, "checks": checks, "goal_summary": goal_summary, "start_day": start_day, "end_day": end_day}
+
+
+def build_ai_structured_context(health_df, ex_df, handover_df, goal_df, user_name, end_day, rule_result):
+    start_day = end_day - timedelta(days=6)
+    h = filter_records_by_period(health_df, "記録日", start_day, end_day, user_name)
+    e = filter_records_by_period(ex_df, "記録日", start_day, end_day, user_name)
+    b = filter_records_by_period(handover_df, "日付", start_day, end_day, None)
+    g = filter_records_by_period(goal_df, "日付", start_day, end_day, user_name)
+
+    def table_text(df, max_rows=20):
+        if df is None or df.empty:
+            return "記録なし"
+        show = df.tail(max_rows).copy()
+        for col in show.columns:
+            show[col] = show[col].apply(clean_text)
+        return show.to_string(index=False)
+
+    rules = "\n".join(["【記録上の気づき】"] + [f"- {x}" for x in rule_result.get("findings", [])] + ["【管理者確認ポイント】"] + [f"- {x}" for x in rule_result.get("checks", [])])
+    goals = "\n".join(rule_result.get("goal_summary", [])) or "短期目標集計なし"
+
+    return f"""
+あなたは介護施設の管理者支援のための記録整理係です。
+医療判断・診断・治療判断・受診判断の断定は禁止です。
+記録に基づき、現場の気づきを構造化してください。
+
+【分析対象】
+利用者：{user_name}
+対象期間：{start_day}〜{end_day}
+
+【ルールベース分析】
+{rules}
+
+【短期目標集計】
+{goals}
+
+【健康チェック記録】
+{table_text(h)}
+
+【排泄記録】
+{table_text(e)}
+
+【業務全体申し送り】
+{table_text(b)}
+
+【短期目標実施記録】
+{table_text(g)}
+""".strip()
+
+
+def generate_ai_structured_advice(context):
+    api_key = get_openai_api_key("")
+    if not api_key:
+        return ""
+    try:
+        from openai import OpenAI
+    except Exception:
+        return "OpenAIライブラリが未インストールです。requirements.txt に openai を追加してください。"
+
+    system_prompt = """
+あなたは介護施設の管理者支援のための記録整理係です。
+AIは診断しません。医療判断、治療判断、受診判断、改善・悪化の断定は禁止です。
+『危険です』『受診が必要です』『問題ありません』『改善しました』のような断定表現は使わないでください。
+出力は以下の見出しで、丁寧に短く整理してください。
+
+1. 記録上見られる変化
+2. 短期目標の実施状況から見えること
+3. 管理者が確認するとよい点
+4. 職員間で共有するとよい観察ポイント
+5. 家族へ伝える場合のやわらかい表現案
+
+表現は「確認してもよいかもしれません」「共有すると整理しやすくなります」「記録上は〜が見られます」を基本にしてください。
+""".strip()
+    try:
+        client = OpenAI(api_key=api_key)
+        res = client.chat.completions.create(
+            model="gpt-4.1-mini",
+            messages=[
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": context},
+            ],
+            temperature=0.2,
+        )
+        return res.choices[0].message.content or ""
+    except Exception as e:
+        return f"AI分析中にエラーが発生しました：{e}"
+
+
+def show_structured_insight_menu():
+    if not is_admin_user():
+        st.error("この画面は管理者専用です。")
+        st.stop()
+
+    st.header("現場の気づき構造化・AI管理者支援")
+    show_observation_perspective("ai")
+    st.caption("健康チェック・排泄・申し送り・短期目標を合わせて、管理者が確認しやすい形に整理します。AIは診断せず、記録上の気づきと確認ポイントだけを出します。")
+
+    users = get_active_user_names()
+    c1, c2 = st.columns([1, 1])
+    with c1:
+        user_name = st.selectbox("分析する利用者", users, key="structured_insight_user")
+    with c2:
+        end_day = st.date_input("分析基準日", value=today_jst(), key="structured_insight_end_day")
+
+    health_df = load_health_data()
+    ex_df = load_excretion_data()
+    handover_df = load_business_handover_data() if 'load_business_handover_data' in globals() else read_excel_safe(HANDOVER_FILE, BUSINESS_HANDOVER_COLUMNS)
+    goal_df = load_short_goal_checks()
+
+    result = analyze_structured_insights(health_df, ex_df, handover_df, goal_df, user_name, end_day)
+
+    st.markdown("### ルールベース分析（APIなしでも使用可）")
+    left, right = st.columns(2)
+    with left:
+        st.subheader("記録上の気づき")
+        for item in result["findings"]:
+            st.write("・" + item)
+    with right:
+        st.subheader("管理者の確認ポイント")
+        for item in result["checks"]:
+            st.write("・" + item)
+
+    if result["goal_summary"]:
+        st.subheader("短期目標 実施状況")
+        st.dataframe(pd.DataFrame({"短期目標分析": result["goal_summary"]}), use_container_width=True, hide_index=True)
+
+    with st.expander("分析対象データを確認", expanded=False):
+        start_day = end_day - timedelta(days=6)
+        st.write(f"対象期間：{start_day}〜{end_day}")
+        st.markdown("#### 健康チェック")
+        st.dataframe(filter_records_by_period(health_df, "記録日", start_day, end_day, user_name), use_container_width=True, hide_index=True)
+        st.markdown("#### 排泄")
+        st.dataframe(filter_records_by_period(ex_df, "記録日", start_day, end_day, user_name), use_container_width=True, hide_index=True)
+        st.markdown("#### 短期目標")
+        st.dataframe(filter_records_by_period(goal_df, "日付", start_day, end_day, user_name), use_container_width=True, hide_index=True)
+
+    st.markdown("---")
+    st.markdown("### AI管理者アドバイス")
+    if not get_openai_api_key(""):
+        st.warning("OpenAI APIキーが未設定です。Streamlit Cloud の Secrets に OPENAI_API_KEY を設定するとAI分析が使えます。")
+        st.code('OPENAI_API_KEY = "sk-xxxxxxxxxxxxxxxx"', language="toml")
+    else:
+        if st.button("AIで管理者向けアドバイスを生成", use_container_width=True):
+            context = build_ai_structured_context(health_df, ex_df, handover_df, goal_df, user_name, end_day, result)
+            with st.spinner("AIが記録を整理しています..."):
+                ai_text = generate_ai_structured_advice(context)
+            st.subheader("AI分析結果")
+            st.write(ai_text)
+
+            logs = load_ai_insight_logs()
+            rule_text = "\n".join(["【気づき】"] + result["findings"] + ["【確認ポイント】"] + result["checks"] + ["【短期目標】"] + result["goal_summary"])
+            new_row = {
+                "作成日時": format_now_jst("%Y-%m-%d %H:%M:%S"),
+                "分析基準日": end_day,
+                "利用者名": user_name,
+                "対象期間": f"{end_day - timedelta(days=6)}〜{end_day}",
+                "ルール分析": rule_text,
+                "AI分析結果": ai_text,
+            }
+            logs = pd.concat([logs, pd.DataFrame([new_row])], ignore_index=True)
+            save_ai_insight_logs(logs)
+            st.success("AI分析ログに保存しました。")
+
+    st.markdown("### AI分析ログ")
+    logs = load_ai_insight_logs()
+    if logs.empty:
+        st.info("AI分析ログはまだありません。")
+    else:
+        st.dataframe(logs.tail(20), use_container_width=True, hide_index=True)
+
+
+# =========================
+# ログイン・デザイン
+# =========================
+def show_force_password_change_screen():
+    """初回ログイン・仮パスワード利用時に通常画面へ進ませず、パスワード変更を求める。"""
+    show_hidamari_hero("login")
+    login_id = current_login_user()
+    accounts = load_accounts()
+    hit = accounts[accounts["ログインID"] == login_id]
+    if hit.empty:
+        st.error("ログイン情報を確認できません。もう一度ログインしてください。")
+        if st.button("ログイン画面へ戻る", use_container_width=True):
+            st.session_state.logged_in = False
+            st.rerun()
+        return False
+
+    row = hit.iloc[-1]
+    st.warning("安全のため、初回ログイン時はパスワード変更が必要です。")
+    st.caption("仮パスワードのまま通常画面へ進むことはできません。新しいパスワードを設定してください。")
+
+    col1, col2, col3 = st.columns([1, 2, 1])
+    with col2:
+        with st.form("force_password_change_form", clear_on_submit=False):
+            st.markdown("### 初回パスワード変更")
+            st.text_input("ログインID", value=login_id, disabled=True)
+            new_pw = st.text_input("新しいパスワード", type="password", help="8文字以上、英字と数字を両方含めてください。")
+            new_pw2 = st.text_input("新しいパスワード（確認）", type="password")
+            submitted = st.form_submit_button("パスワードを変更して利用開始", type="primary", use_container_width=True)
+
+        if submitted:
+            ok_pw, pw_msg = validate_new_password(login_id, new_pw, new_pw2, clean_text(row.get("パスワードハッシュ")))
+            if not ok_pw:
+                st.error(pw_msg)
+            else:
+                ok, msg = update_account_password(login_id, new_pw, force_change="いいえ")
+                if ok:
+                    add_login_history(login_id, st.session_state.get("user_label", ""), st.session_state.get("role", ""), "成功", "初回パスワード変更完了")
+                    st.session_state.force_password_change = False
+                    st.session_state["hidamari_login_message"] = "安全設定が完了しました。今日の記録をはじめられます。"
+                    st.success("パスワードを変更しました。通常画面へ進みます。")
+                    st.rerun()
+                else:
+                    st.error(msg)
+
+        if st.button("ログアウト", use_container_width=True):
+            st.session_state.logged_in = False
+            st.session_state.role = None
+            st.session_state.user_label = ""
+            st.session_state.username = ""
+            st.session_state.user_id = ""
+            st.session_state.login_user = ""
+            st.session_state.login_user_info = {}
+            st.session_state.force_password_change = False
+            st.rerun()
+    return False
+
+
+def login_check():
+    if "logged_in" not in st.session_state:
+        st.session_state.logged_in = False
+    if "role" not in st.session_state:
+        st.session_state.role = None
+    if "user_label" not in st.session_state:
+        st.session_state.user_label = ""
+    if "force_password_change" not in st.session_state:
+        st.session_state.force_password_change = False
+
+    if st.session_state.logged_in:
+        if st.session_state.force_password_change:
+            return show_force_password_change_screen()
+        return True
+
+    show_hidamari_hero("login")
+
+    col1, col2, col3 = st.columns([1, 2, 1])
+
+    with col2:
+        st.markdown('<h3 style="text-align:center;">ログイン</h3>', unsafe_allow_html=True)
+        input_id = st.text_input("ID")
+        input_password = st.text_input("パスワード", type="password")
+
+        if st.button("ログイン", use_container_width=True):
+            login_id = clean_text(input_id).lower()
+            login_password = clean_text(input_password)
+            user, err = authenticate_user(login_id, login_password)
+
+            if user:
+                st.session_state.logged_in = True
+                st.session_state.role = clean_text(user.get("権限", "staff"), "staff")
+                st.session_state.user_label = clean_text(user.get("表示名", login_id), login_id)
+                st.session_state.username = login_id
+                st.session_state.user_id = login_id
+                st.session_state.login_user = login_id
+                st.session_state.login_user_info = {
+                    "id": login_id,
+                    "username": login_id,
+                    "role": st.session_state.role,
+                    "label": st.session_state.user_label,
+                }
+                st.session_state.force_password_change = account_requires_password_change(user)
+                st.session_state["hidamari_login_message"] = random.choice(HIDAMARI_MESSAGES)
+                st.rerun()
+            else:
+                st.error(err or "IDまたはパスワードが違います。")
+
+    return False
+
+
+def logout_button():
+    with st.sidebar:
+        st.caption(f"ログイン中：{st.session_state.user_label}")
+        if st.button("ログアウト"):
+            st.session_state.logged_in = False
+            st.session_state.role = None
+            st.session_state.user_label = ""
+            st.session_state.username = ""
+            st.session_state.user_id = ""
+            st.session_state.login_user = ""
+            st.session_state.login_user_info = {}
+            st.session_state.force_password_change = False
+            st.session_state.pop("hidamari_login_message", None)
+            st.rerun()
+
+
+# =========================
+# Ver3.0 UI共通設定・共通部品
+# =========================
+APP_VERSION = "Ver4.1 利用者名ゆれ紐づけマスタ版"
+APP_COPY = "押し間違えず、迷わず、観察して次につなぐ 現場OS"
+
+UI_COLORS = {
+    "staff": {"bg": "#FFFDF7", "surface": "#FFFFFF", "surface_soft": "#FFF7EC", "accent": "#C9705C", "accent_dark": "#8F4C3E", "sub": "#6A5B52", "border": "#E8D7C5"},
+    "admin": {"bg": "#F6F8F7", "surface": "#FFFFFF", "surface_soft": "#EEF4F1", "accent": "#2F6F5E", "accent_dark": "#244D43", "sub": "#52605B", "border": "#C9DAD2"},
+}
+
+MENU_GROUPS_ADMIN = {
+    "朝の確認": ["自分専用ダッシュボード", "管理者ダッシュボード", "業務全体申し送り", "管理者支援"],
+    "日々の入力": ["健康チェック入力", "写真から半自動入力", "排泄チェック入力", "日々の実施チェック"],
+    "記録確認": ["過去データ管理", "排泄詳細管理", "実施履歴一覧", "短期目標データ管理"],
+    "短期目標・LIFE": ["短期目標・モニタリング", "短期目標マスタ", "モニタリング下書き作成", "LIFE入力標準化", "管理者LIFE入力", "LIFE不足チェック", "LIFE CSV出力", "LIFE登録一覧", "加算シミュレーション"],
+    "帳票・共有": ["家族向けレポート作成", "ひだまりレポートPDF", "データダウンロード"],
+    "設定・保守": ["利用者マスタ管理", "ログイン・職員ID管理", "セキュリティ・保守管理", "利用者ID移行チェック", "利用者名ゆれ紐づけマスタ", "自分専用ダッシュボード設定", "メニューカテゴリ設定", "システム設定", "現場の気づき構造化・AI管理者支援"],
+}
+
+MENU_GROUPS_STAFF = {"今日の入力": ["業務全体申し送り", "健康チェック入力", "排泄チェック入力", "日々の実施チェック"]}
+
+
+def get_standard_menu_groups(role="admin"):
+    """標準メニューカテゴリ。自己設定の初期値として使う。"""
+    return MENU_GROUPS_ADMIN if role == "admin" else MENU_GROUPS_STAFF
+
+
+def make_menu_category_rows_from_groups(groups, role="admin"):
+    """カテゴリ辞書を編集用DataFrame行へ変換する。"""
+    rows = []
+    sort_no = 10
+    for category, menus in groups.items():
+        menu_no = 10
+        for menu_name in menus:
+            rows.append({
+                "表示": True,
+                "カテゴリ": clean_text(category, "その他"),
+                "メニュー": clean_text(menu_name),
+                "並び順": sort_no + menu_no / 100,
+                "備考": "標準" if role == "admin" else "職員",
+            })
+            menu_no += 10
+        sort_no += 100
+    return rows
+
+
+def get_standard_menu_category_df(role="admin"):
+    groups = get_standard_menu_groups(role)
+    return normalize_menu_category_df(pd.DataFrame(make_menu_category_rows_from_groups(groups, role=role)))
+
+
+def normalize_menu_category_df(df):
+    """メニューカテゴリ自己設定の列・型・並びを整える。"""
+    columns = ["表示", "カテゴリ", "メニュー", "並び順", "備考"]
+    if df is None or df.empty:
+        df = pd.DataFrame(columns=columns)
+    work = df.copy()
+    for col in columns:
+        if col not in work.columns:
+            work[col] = ""
+    work = work[columns].copy()
+    work["表示"] = work["表示"].map(lambda x: str(x).lower() in ["true", "1", "yes", "有", "表示", "on"] if not isinstance(x, bool) else x)
+    work["カテゴリ"] = work["カテゴリ"].map(lambda x: clean_text(x, "その他"))
+    work["メニュー"] = work["メニュー"].map(lambda x: clean_text(x))
+    work["並び順"] = pd.to_numeric(work["並び順"], errors="coerce").fillna(9999)
+    work["備考"] = work["備考"].map(lambda x: clean_text(x))
+    work = work[work["メニュー"] != ""].drop_duplicates(subset=["メニュー"], keep="last")
+    return work.sort_values(["カテゴリ", "並び順", "メニュー"]).reset_index(drop=True)
+
+
+def load_menu_category_settings(role="admin"):
+    """管理者が編集したメニューカテゴリ設定をSQLiteから読み込む。なければ標準設定を使う。"""
+    ensure_dirs()
+    role = "admin" if role == "admin" else "staff"
+    standard_df = get_standard_menu_category_df(role)
+
+    settings_all = get_app_setting("menu_category_settings_all", None)
+    if settings_all is None:
+        settings_all = migrate_json_file_setting_to_db(
+            "menu_category_settings_all",
+            MENU_CATEGORY_SETTINGS_FILE,
+            category="メニュー設定",
+            default={},
+        )
+    if not isinstance(settings_all, dict):
+        settings_all = {}
+
+    rows = settings_all.get(role, [])
+    if rows:
+        df = normalize_menu_category_df(pd.DataFrame(rows))
+    else:
+        df = standard_df.copy()
+
+    # 新機能追加時に自己設定へ自動追記する。既存のカテゴリ変更は維持する。
+    existing_menus = set(df["メニュー"].astype(str).tolist())
+    missing = standard_df[~standard_df["メニュー"].astype(str).isin(existing_menus)]
+    if not missing.empty:
+        df = pd.concat([df, missing], ignore_index=True)
+
+    # 管理者が設定画面を非表示にしても復帰できるよう、必ず表示する。
+    required_admin_menus = ["メニューカテゴリ設定", "システム設定"]
+    if role == "admin":
+        for required_menu in required_admin_menus:
+            if required_menu in standard_df["メニュー"].tolist():
+                if required_menu not in df["メニュー"].tolist():
+                    add = standard_df[standard_df["メニュー"] == required_menu]
+                    df = pd.concat([df, add], ignore_index=True)
+                df.loc[df["メニュー"] == required_menu, "表示"] = True
+
+    return normalize_menu_category_df(df)
+
+
+def save_menu_category_settings(df, role="admin"):
+    """メニューカテゴリ自己設定をSQLiteへ保存する。"""
+    ensure_dirs()
+    role = "admin" if role == "admin" else "staff"
+    clean_df = normalize_menu_category_df(df)
+    if role == "admin":
+        for required_menu in ["メニューカテゴリ設定", "システム設定"]:
+            if required_menu in clean_df["メニュー"].tolist():
+                clean_df.loc[clean_df["メニュー"] == required_menu, "表示"] = True
+
+    settings_all = get_app_setting("menu_category_settings_all", {})
+    if not isinstance(settings_all, dict):
+        settings_all = {}
+    settings_all[role] = clean_df.to_dict(orient="records")
+    set_app_setting(
+        "menu_category_settings_all",
+        settings_all,
+        category="メニュー設定",
+        description="管理者・職員のメニューカテゴリ自己設定",
+    )
+    try:
+        add_audit_log("メニューカテゴリ設定更新", "app_settings", role, "メニューカテゴリ自己設定をSQLiteへ保存")
+    except Exception:
+        pass
+
+
+def reset_menu_category_settings(role="admin"):
+    """自己設定を標準設定に戻す。"""
+    df = get_standard_menu_category_df(role)
+    save_menu_category_settings(df, role=role)
+
+
+def build_menu_groups_from_settings(role="admin"):
+    """自己設定からサイドバー用カテゴリ辞書を作る。"""
+    df = load_menu_category_settings(role)
+    df = df[df["表示"] == True].copy()
+    if df.empty:
+        return get_standard_menu_groups(role)
+    df = df.sort_values(["並び順", "カテゴリ", "メニュー"])
+    groups = {}
+    for _, row in df.iterrows():
+        category = clean_text(row.get("カテゴリ"), "その他")
+        menu_name = clean_text(row.get("メニュー"))
+        if not menu_name:
+            continue
+        groups.setdefault(category, [])
+        if menu_name not in groups[category]:
+            groups[category].append(menu_name)
+    return groups
+
+
+def show_menu_category_settings_menu():
+    """管理者がサイドバーのカテゴリ・表示順・表示有無を自己設定する画面。"""
+    if not is_admin_user():
+        st.warning("このメニューは管理者専用です。")
+        return
+
+    ui_section("メニューカテゴリ設定", "標準設定をもとに、管理者自身でサイドバーのカテゴリ名・並び順・表示有無を調整できます。", "🧭")
+    ui_card("使い方", "カテゴリ名を書き換えると、左メニューのカテゴリ分けが変わります。表示チェックを外すとメニューを一時的に隠せます。『メニューカテゴリ設定』は復帰用として常に表示されます。", "", soft=True)
+
+    role_target = st.radio("設定対象", ["管理者メニュー", "職員メニュー"], horizontal=True, key="menu_category_role_target")
+    role_key = "admin" if role_target == "管理者メニュー" else "staff"
+
+    df = load_menu_category_settings(role_key)
+    edited = st.data_editor(
+        df,
+        use_container_width=True,
+        hide_index=True,
+        num_rows="fixed",
+        column_config={
+            "表示": st.column_config.CheckboxColumn("表示"),
+            "カテゴリ": st.column_config.TextColumn("カテゴリ", help="例：朝の確認、日々の入力、設定・保守"),
+            "メニュー": st.column_config.TextColumn("メニュー", disabled=True, help="機能名は固定です。カテゴリと並び順を変更してください。"),
+            "並び順": st.column_config.NumberColumn("並び順", step=1, help="小さい数字ほど上に表示されます。"),
+            "備考": st.column_config.TextColumn("備考"),
+        },
+        key=f"menu_category_editor_{role_key}",
+    )
+
+    col1, col2 = st.columns(2)
+    with col1:
+        if st.button("自分設定を保存", type="primary", use_container_width=True):
+            save_menu_category_settings(edited, role=role_key)
+            st.success("メニューカテゴリ設定を保存しました。左メニューに反映します。")
+            st.rerun()
+    with col2:
+        if st.button("標準設定に戻す", use_container_width=True):
+            reset_menu_category_settings(role=role_key)
+            st.success("標準設定に戻しました。")
+            st.rerun()
+
+    st.divider()
+    st.subheader("現在の表示プレビュー")
+    preview_groups = build_menu_groups_from_settings(role_key)
+    for cat, menus in preview_groups.items():
+        st.markdown(f"**{cat}**")
+        st.write(" / ".join(menus))
+
+
+
+
+def get_color_settings():
+    """色設定をSQLiteから取得し、UI_COLORSへ反映するための値を返す。"""
+    default = {
+        "staff_bg": UI_COLORS["staff"]["bg"],
+        "staff_accent": UI_COLORS["staff"]["accent"],
+        "admin_bg": UI_COLORS["admin"]["bg"],
+        "admin_accent": UI_COLORS["admin"]["accent"],
+        "alert": "#C9705C",
+        "success": "#2F6F5E",
+    }
+    saved = get_app_setting("color_settings", default)
+    if not isinstance(saved, dict):
+        saved = default
+    merged = {**default, **saved}
+    return merged
+
+
+def get_ui_theme():
+    role_now = st.session_state.get("role", "staff")
+    base = dict(UI_COLORS["admin"] if role_now == "admin" else UI_COLORS["staff"])
+    colors = get_color_settings()
+    if role_now == "admin":
+        base["bg"] = clean_text(colors.get("admin_bg"), base["bg"])
+        base["accent"] = clean_text(colors.get("admin_accent"), base["accent"])
+        base["accent_dark"] = clean_text(colors.get("admin_accent"), base["accent_dark"])
+    else:
+        base["bg"] = clean_text(colors.get("staff_bg"), base["bg"])
+        base["accent"] = clean_text(colors.get("staff_accent"), base["accent"])
+        base["accent_dark"] = clean_text(colors.get("staff_accent"), base["accent_dark"])
+    return base
+
+
+def apply_design():
+    """Ver3.0共通デザイン。色・余白・ボタン・iPad表示をここで一元管理する。"""
+    theme = get_ui_theme()
+    st.markdown(
+        f"""
+        <style>
+        :root {{
+            --hidamari-bg: {theme['bg']};
+            --hidamari-surface: {theme['surface']};
+            --hidamari-soft: {theme['surface_soft']};
+            --hidamari-accent: {theme['accent']};
+            --hidamari-accent-dark: {theme['accent_dark']};
+            --hidamari-sub: {theme['sub']};
+            --hidamari-border: {theme['border']};
+        }}
+        .stApp {{ background: var(--hidamari-bg); }}
+        h1, h2, h3 {{ color: var(--hidamari-accent-dark); letter-spacing: .01em; }}
+        h1 {{ font-size: 2rem; }} h2 {{ font-size: 1.55rem; }} h3 {{ font-size: 1.22rem; }}
+        [data-testid="stSidebar"] {{
+            background: linear-gradient(180deg, var(--hidamari-soft) 0%, #FFFFFF 100%);
+            border-right: 1px solid var(--hidamari-border);
+        }}
+        [data-testid="stSidebar"] * {{ font-size: 0.98rem; }}
+        .block-container {{ padding-top: 1.2rem; padding-bottom: 3rem; max-width: 1280px; }}
+        div[data-testid="stButton"] button,
+        div[data-testid="stDownloadButton"] button,
+        button[kind="primary"], button[kind="secondary"] {{
+            min-height: 48px; border-radius: 14px !important; font-weight: 700 !important;
+            border: 1px solid var(--hidamari-border) !important;
+        }}
+        div[data-testid="stButton"] button:hover,
+        div[data-testid="stDownloadButton"] button:hover {{
+            border-color: var(--hidamari-accent) !important; color: var(--hidamari-accent-dark) !important;
+        }}
+        div[data-baseweb="select"] > div, input, textarea {{ min-height: 46px; border-radius: 12px !important; }}
+        .stTabs [data-baseweb="tab-list"] {{ gap: 8px; flex-wrap: wrap; }}
+        .stTabs [data-baseweb="tab"] {{
+            background: #ffffff; border: 1px solid var(--hidamari-border); border-radius: 999px; padding: 8px 14px;
+        }}
+        .stTabs [aria-selected="true"] {{ background: var(--hidamari-soft) !important; color: var(--hidamari-accent-dark) !important; font-weight: 800; }}
+        .info-box, .ui-card {{
+            background: var(--hidamari-surface); padding: 16px 18px; border-radius: 18px;
+            border: 1px solid var(--hidamari-border); margin: 10px 0 14px 0;
+            box-shadow: 0 6px 18px rgba(45, 64, 55, 0.05);
+        }}
+        .ui-card-soft {{ background: var(--hidamari-soft); padding: 14px 16px; border-radius: 16px; border: 1px solid var(--hidamari-border); margin: 8px 0 12px 0; }}
+        .ui-section-title {{ display:flex; align-items:center; gap:10px; margin:14px 0 8px 0; color:var(--hidamari-accent-dark); font-size:1.25rem; font-weight:850; }}
+        .ui-section-caption {{ color: var(--hidamari-sub); margin-bottom: 12px; line-height: 1.65; }}
+        .ui-badge {{ display:inline-block; background:#ffffffcc; border:1px solid var(--hidamari-border); color:var(--hidamari-accent-dark); border-radius:999px; padding:5px 11px; margin:3px 5px 3px 0; font-size:.86rem; font-weight:700; }}
+        .sidebar-title {{ font-weight:900; color:var(--hidamari-accent-dark); font-size:1.08rem; margin-bottom:2px; }}
+        .sidebar-sub {{ color:var(--hidamari-sub); font-size:.82rem; line-height:1.45; margin-bottom:8px; }}
+        .hidamari-hero {{
+            background: linear-gradient(135deg, #F7F2EA 0%, #EEF5EF 58%, #EAF1F5 100%);
+            border: 1px solid rgba(88, 112, 96, 0.16); border-radius: 28px; padding: 28px 26px;
+            margin: 8px auto 22px auto; max-width: 880px; text-align: center; box-shadow: 0 10px 28px rgba(55, 64, 58, 0.08); position: relative; overflow: hidden;
+        }}
+        .hidamari-hero-title {{ font-size: 2.25rem; line-height: 1.25; font-weight: 800; color: #2F6F5E; margin-bottom: 8px; letter-spacing: 0.02em; }}
+        .hidamari-hero-sub {{ color: #64706A; font-size: 1.05rem; margin-bottom: 14px; }}
+        .hidamari-illust-row {{ display: flex; gap: 14px; flex-wrap: wrap; margin-top: 12px; }}
+        .hidamari-illust-card {{ flex: 1 1 210px; background: rgba(255,255,255,0.78); border: 1px solid rgba(0,0,0,0.06); border-radius: 22px; padding: 14px 16px; display: flex; align-items: center; gap: 12px; min-height: 92px; }}
+        .hidamari-emoji {{ width:58px; height:58px; border-radius:50%; background:#fff3d6; display:flex; align-items:center; justify-content:center; font-size:34px; flex:0 0 auto; }}
+        .hidamari-card-title {{ font-weight:800; color:#3d463d; margin-bottom:4px; }}
+        .hidamari-card-text {{ color:#666; font-size:.9rem; line-height:1.45; }}
+        .staff-welcome {{ background:linear-gradient(135deg, #F7EFE8 0%, #FAF7F1 100%); border:1px solid #E6C9B7; border-radius:18px; padding:14px 16px; margin:10px 0 16px 0; color:#6A5142; }}
+        .admin-welcome {{ background:linear-gradient(135deg, #EAF1F5 0%, #F7FAFA 100%); border:1px solid #BFD0D8; border-radius:18px; padding:14px 16px; margin:10px 0 16px 0; color:#405766; }}
+        .mini-badge {{ display:inline-block; background:#ffffffcc; border:1px solid rgba(0,0,0,.08); border-radius:999px; padding:5px 10px; margin:3px 4px 3px 0; font-size:.86rem; }}
+
+        .mindset-box {{ background:#FFFDF7; border:1px solid var(--hidamari-border); border-left:6px solid var(--hidamari-accent); border-radius:16px; padding:13px 15px; margin:10px 0 14px 0; color:var(--hidamari-sub); line-height:1.65; }}
+        .mindset-title {{ color:var(--hidamari-accent-dark); font-weight:850; margin-bottom:4px; }}
+        .check-card {{ background:#FFFFFF; border:1px solid var(--hidamari-border); border-radius:14px; padding:12px 14px; margin:7px 0; }}
+        .stop-card {{ background:#FFF7EC; border:1px solid #E6C9B7; border-radius:14px; padding:12px 14px; margin:7px 0; }}
+        @media (max-width: 900px) {{
+            .block-container {{ padding-left:.8rem; padding-right:.8rem; }}
+            h1 {{ font-size:1.55rem; }} h2 {{ font-size:1.35rem; }} h3 {{ font-size:1.12rem; }}
+            div[data-testid="stButton"] button, div[data-testid="stDownloadButton"] button {{ min-height:52px; font-size:1rem; }}
+            .hidamari-hero {{ padding:20px 16px; border-radius:20px; }}
+            .hidamari-hero-title {{ font-size:1.55rem; }}
+            .hidamari-illust-card {{ flex:1 1 100%; }}
+            .hidamari-emoji {{ width:48px; height:48px; font-size:28px; }}
+        }}
+        </style>
+        """,
+        unsafe_allow_html=True,
+    )
+
+
+def ui_section(title, caption="", icon="☀️"):
+    """画面見出しの共通部品。今後のUI改修はここを使う。"""
+    caption_html = f'<div class="ui-section-caption">{caption}</div>' if caption else ''
+    st.markdown(f'<div class="ui-section-title"><span>{icon}</span><span>{title}</span></div>{caption_html}', unsafe_allow_html=True)
+
+
+def ui_card(title, body="", icon="", soft=False):
+    """カード表示の共通部品。"""
+    cls = "ui-card-soft" if soft else "ui-card"
+    title_html = f"<strong>{icon + ' ' if icon else ''}{title}</strong>" if title else ""
+    st.markdown(f'<div class="{cls}">{title_html}<div style="margin-top:4px; line-height:1.65; color:var(--hidamari-sub);">{body}</div></div>', unsafe_allow_html=True)
+
+
+def ui_badges(items):
+    """小さな状態表示バッジ。"""
+    html = "".join([f'<span class="ui-badge">{clean_text(x)}</span>' for x in items if clean_text(x)])
+    if html:
+        st.markdown(html, unsafe_allow_html=True)
+
+
+def apply_product_ui_ux():
+    """
+    Ver4.4 余白を守るOS UI。
+    目的：情報密度を下げ、白背景・行間・カード余白・ボタン間隔を広げ、現場が焦らず操作できる画面にする。
+    画像・イラスト風の装飾は表示せず、記録と確認に集中できる余白を優先する。
+    """
+    theme = get_ui_theme()
+    color_setting = get_color_settings()
+    bg = clean_text(theme.get("bg"), "#FFFFFF")
+    surface = clean_text(theme.get("surface"), "#FFFFFF")
+    soft = clean_text(theme.get("surface_soft"), bg)
+    accent = clean_text(theme.get("accent"), "#C9705C")
+    accent_dark = clean_text(theme.get("accent_dark"), accent)
+    sub = clean_text(theme.get("sub"), "#666666")
+    border = clean_text(theme.get("border"), "#E7E1D8")
+    alert = clean_text(color_setting.get("alert"), accent)
+    success = clean_text(color_setting.get("success"), accent_dark)
+
+    st.markdown(
+        f"""
+        <style>
+        /* ===== 余白を守るOS：全体 ===== */
+        html, body, [class*="css"] {{
+            -webkit-text-size-adjust: 100%;
+            line-height: 1.78 !important;
+        }}
+
+        .stApp {{
+            background: {bg} !important;
+        }}
+
+        .block-container {{
+            max-width: 1180px !important;
+            padding-top: 1.8rem !important;
+            padding-left: 2.1rem !important;
+            padding-right: 2.1rem !important;
+            padding-bottom: 4.5rem !important;
+        }}
+
+        /* ===== 余白を守るOS：見出し ===== */
+        h1, h2, h3 {{
+            letter-spacing: .02em !important;
+            line-height: 1.45 !important;
+            margin-top: 1.3rem !important;
+            margin-bottom: .9rem !important;
+        }}
+        h1 {{ font-size: 1.95rem !important; }}
+        h2 {{ font-size: 1.48rem !important; }}
+        h3 {{ font-size: 1.2rem !important; }}
+
+        p, li, div, span {{
+            line-height: 1.78;
+        }}
+
+        /* ===== 余白を守るOS：サイドバーも白基調 ===== */
+        [data-testid="stSidebar"] {{
+            background: {surface} !important;
+            border-right: 1px solid {border} !important;
+            min-width: 300px;
+        }}
+        [data-testid="stSidebar"] .stRadio label {{
+            background: {surface} !important;
+            border: 1px solid {border} !important;
+            border-radius: 16px !important;
+            padding: 12px 13px !important;
+            margin: 8px 0 !important;
+            line-height: 1.55 !important;
+        }}
+        [data-testid="stSidebar"] .stRadio label:hover {{
+            border-color: {accent} !important;
+            background: {soft} !important;
+        }}
+
+        /* ===== 余白を守るOS：ボタン間隔を広げる ===== */
+        div[data-testid="stButton"],
+        div[data-testid="stDownloadButton"] {{
+            margin-top: .45rem !important;
+            margin-bottom: .75rem !important;
+        }}
+        div[data-testid="stButton"] button,
+        div[data-testid="stDownloadButton"] button {{
+            min-height: 62px !important;
+            border-radius: 20px !important;
+            font-size: 1.02rem !important;
+            font-weight: 750 !important;
+            letter-spacing: .02em;
+            white-space: normal !important;
+            line-height: 1.45 !important;
+            box-shadow: none !important;
+            border: 1px solid {border} !important;
+            background: {surface} !important;
+            color: {accent_dark} !important;
+        }}
+        div[data-testid="stButton"] button[kind="primary"],
+        div[data-testid="stButton"] button[kind="secondary"],
+        button[kind="primary"],
+        button[kind="secondary"] {{
+            color: {accent_dark} !important;
+        }}
+        div[data-testid="stButton"] button:focus,
+        div[data-testid="stDownloadButton"] button:focus,
+        input:focus,
+        textarea:focus {{
+            outline: 3px solid rgba(201,112,92,.20) !important;
+            outline-offset: 3px !important;
+        }}
+
+        /* ===== 余白を守るOS：入力欄 ===== */
+        div[data-baseweb="select"] > div,
+        input,
+        textarea,
+        .stTextInput input,
+        .stNumberInput input,
+        .stDateInput input {{
+            min-height: 58px !important;
+            font-size: 1.02rem !important;
+            border-radius: 18px !important;
+            line-height: 1.65 !important;
+            background: {surface} !important;
+        }}
+        textarea {{
+            min-height: 140px !important;
+            line-height: 1.85 !important;
+            padding-top: 14px !important;
+            padding-bottom: 14px !important;
+        }}
+        label, .stMarkdown {{
+            line-height: 1.75 !important;
+        }}
+
+        /* ===== 余白を守るOS：ラジオ・チェック ===== */
+        div[role="radiogroup"] label,
+        label[data-baseweb="checkbox"] {{
+            min-height: 50px !important;
+            padding-top: 9px !important;
+            padding-bottom: 9px !important;
+            margin-bottom: 6px !important;
+            font-size: 1.0rem !important;
+            line-height: 1.6 !important;
+        }}
+
+        /* ===== 余白を守るOS：カード ===== */
+        .ui-card,
+        .ui-card-soft,
+        .mindset-box,
+        .check-card,
+        .stop-card,
+        .staff-welcome,
+        .admin-welcome,
+        .safe-note,
+        .danger-note,
+        .info-box {{
+            background: {surface} !important;
+            border-radius: 26px !important;
+            padding: 24px 26px !important;
+            margin: 18px 0 26px 0 !important;
+            border: 1px solid {border} !important;
+            box-shadow: none !important;
+            line-height: 1.85 !important;
+        }}
+        .ui-card-soft,
+        .mindset-box,
+        .safe-note {{
+            background: {soft} !important;
+        }}
+        .danger-note {{
+            background: {soft} !important;
+        }}
+        .ui-card strong,
+        .ui-card-soft strong,
+        .mindset-title {{
+            font-size: 1.08rem !important;
+            line-height: 1.6 !important;
+        }}
+
+        .ui-section-title {{
+            margin: 26px 0 12px 0 !important;
+            gap: 12px !important;
+            line-height: 1.5 !important;
+        }}
+        .ui-section-caption {{
+            margin-bottom: 22px !important;
+            line-height: 1.85 !important;
+            color: {sub} !important;
+        }}
+        .ui-badge, .mini-badge {{
+            background: {surface} !important;
+            border: 1px solid {border} !important;
+            padding: 7px 13px !important;
+            margin: 5px 7px 5px 0 !important;
+            line-height: 1.5 !important;
+            box-shadow: none !important;
+        }}
+
+        /* ===== 余白を守るOS：タブ ===== */
+        .stTabs [data-baseweb="tab-list"] {{
+            gap: 12px !important;
+            flex-wrap: wrap !important;
+            margin-bottom: 18px !important;
+        }}
+        .stTabs [data-baseweb="tab"] {{
+            min-height: 52px !important;
+            border-radius: 999px !important;
+            padding: 12px 18px !important;
+            background: {surface} !important;
+            border: 1px solid {border} !important;
+            line-height: 1.45 !important;
+        }}
+
+        /* ===== 余白を守るOS：表 ===== */
+        div[data-testid="stDataFrame"] {{
+            border-radius: 22px !important;
+            overflow: hidden;
+            border: 1px solid {border} !important;
+            margin-top: 16px !important;
+            margin-bottom: 24px !important;
+            box-shadow: none !important;
+        }}
+
+        /* ===== 余白を守るOS：イラスト・装飾画像を非表示 ===== */
+        .hidamari-illust-row,
+        .hidamari-illust-card,
+        .hidamari-emoji,
+        img[alt*="イラスト"],
+        img[alt*="illustration"] {{
+            display: none !important;
+        }}
+
+        /* ヒーローは画像なし・白基調の静かな案内にする */
+        .hidamari-hero {{
+            background: {surface} !important;
+            border: 1px solid {border} !important;
+            border-radius: 28px !important;
+            padding: 30px 28px !important;
+            margin: 12px auto 34px auto !important;
+            max-width: 920px !important;
+            text-align: left !important;
+            box-shadow: none !important;
+        }}
+        .hidamari-hero-title {{
+            font-size: 1.9rem !important;
+            line-height: 1.45 !important;
+            margin-bottom: 14px !important;
+        }}
+        .hidamari-hero-sub {{
+            font-size: 1.03rem !important;
+            line-height: 1.9 !important;
+            color: {sub} !important;
+            margin-bottom: 0 !important;
+        }}
+
+        /* ===== 余白を守るOS：列間も少し広げる ===== */
+        div[data-testid="column"] {{
+            padding-left: .35rem !important;
+            padding-right: .35rem !important;
+        }}
+
+        /* ===== 余白を守るOS：iPad/Fire HD ===== */
+        @media (max-width: 1100px) {{
+            .block-container {{
+                padding-left: 1.0rem !important;
+                padding-right: 1.0rem !important;
+                padding-top: 1.3rem !important;
+            }}
+            div[data-testid="column"] {{
+                min-width: 100% !important;
+                flex: 1 1 100% !important;
+                padding-left: 0 !important;
+                padding-right: 0 !important;
+            }}
+            div[data-testid="stButton"] button,
+            div[data-testid="stDownloadButton"] button {{
+                min-height: 66px !important;
+                font-size: 1.06rem !important;
+            }}
+            .stTabs [data-baseweb="tab"] {{
+                min-height: 54px !important;
+                padding: 13px 18px !important;
+            }}
+            .ui-card,
+            .ui-card-soft,
+            .mindset-box,
+            .check-card,
+            .stop-card,
+            .staff-welcome,
+            .admin-welcome,
+            .safe-note,
+            .danger-note,
+            .info-box {{
+                padding: 20px 18px !important;
+                margin: 16px 0 24px 0 !important;
+                border-radius: 22px !important;
+            }}
+            .hidamari-hero {{
+                padding: 24px 20px !important;
+                border-radius: 24px !important;
+            }}
+            .hidamari-hero-title {{
+                font-size: 1.5rem !important;
+            }}
+        }}
+        </style>
+        """,
+        unsafe_allow_html=True,
+    )
+
+def product_ui_notice():
+    """商品化UIの短い案内。現在は固定案内を非表示。"""
+    return
+
+
+def danger_note(text):
+    """削除・復元などの危険操作用の共通表示。"""
+    st.markdown(f'<div class="danger-note">{clean_text(text)}</div>', unsafe_allow_html=True)
+
+
+def safe_note(text):
+    """通常の安心メッセージ用の共通表示。"""
+    st.markdown(f'<div class="safe-note">{clean_text(text)}</div>', unsafe_allow_html=True)
+
+
+
+
+def os_mindset_box(title, body, icon="📝"):
+    """Ver3.1 現場OSマインド共通表示。責めず、観察し、共有し、次につなぐ。"""
+    st.markdown(
+        f'<div class="mindset-box"><div class="mindset-title">{icon} {title}</div><div>{body}</div></div>',
+        unsafe_allow_html=True,
+    )
+
+
+def show_observation_perspective(kind="health"):
+    """入力画面の観察の視点表示。現在は非表示。"""
+    return
+
+
+def build_confirm_points_from_attention(row):
+    """注意利用者の表示を責める言葉ではなく確認ポイントへ変換する。"""
+    points = []
+    item = clean_text(row.get("注意項目"))
+    change = clean_text(row.get("気になる変化"))
+    family = clean_text(row.get("家族共有メモ"))
+    if "体温" in item or "発熱" in item:
+        points.append("体温を再確認し、水分・食事・普段との違いを見る")
+    if "SpO2" in item:
+        points.append("SpO2を再測定し、呼吸・顔色・傾眠の有無を見る")
+    if "食事" in item or "摂取" in item:
+        points.append("食事量だけでなく、口腔・むせ・好み・疲れを確認する")
+    if "排便" in item or "便" in item:
+        points.append("排便間隔、水分、腹部症状、下剤等の情報を確認する")
+    if change:
+        points.append("気になる変化を次勤務者へそのまま共有する")
+    if family:
+        points.append("家族へ共有してよい内容か、表現を確認する")
+    if not points:
+        points.append("普段との違いを確認し、必要な共有だけを残す")
+    return " / ".join(dict.fromkeys(points))
+
+
+def add_confirm_points_column(df):
+    """注意利用者一覧に確認ポイント列を追加する。"""
+    if df is None or df.empty:
+        return df
+    work = df.copy()
+    work["確認すること"] = work.apply(build_confirm_points_from_attention, axis=1)
+    preferred = [c for c in ["利用者名", "注意項目", "確認すること", "気になる変化", "家族共有メモ", "記録日"] if c in work.columns]
+    rest = [c for c in work.columns if c not in preferred]
+    return work[preferred + rest]
+
+
+def build_process_stop_summary(health_df, ex_df, handover_df, target_date):
+    """管理者向けに『どこで止まっているか』を整理する。"""
+    rows = []
+    try:
+        h = health_df.copy()
+        if not h.empty:
+            h["記録日"] = pd.to_datetime(h["記録日"], errors="coerce")
+            h_day = h[h["記録日"].dt.date == target_date]
+        else:
+            h_day = pd.DataFrame()
+        missing_health = max(len(active_users) - len(set(h_day.get("利用者名", []))), 0)
+        rows.append({"確認場所": "健康チェック", "止まりやすい点": "未入力・気になる変化の未共有", "件数": missing_health, "次に見ること": "未入力者を責めず、入力できなかった理由と入力導線を見る"})
+    except Exception:
+        pass
+    try:
+        ex_day = get_day_excretion_data(ex_df, target_date, None)
+        rows.append({"確認場所": "排泄チェック", "止まりやすい点": "時間帯別記録の不足", "件数": 0 if ex_day is None else len(ex_day), "次に見ること": "記録数ではなく、排便なし・濃縮尿など共有すべき点を見る"})
+    except Exception:
+        pass
+    try:
+        pending = 0
+        if handover_df is not None and not handover_df.empty and "対応状況" in handover_df.columns:
+            pending = int(handover_df[handover_df["対応状況"].astype(str).isin(["未対応", "対応中"])].shape[0])
+        rows.append({"確認場所": "申し送り", "止まりやすい点": "未対応・対応中のまま残る", "件数": pending, "次に見ること": "誰の責任かではなく、次の一手が書かれているか確認する"})
+    except Exception:
+        pass
+    return pd.DataFrame(rows, columns=["確認場所", "止まりやすい点", "件数", "次に見ること"])
+
+
+def format_handover_structured_note(fact_text, insight_text, next_text):
+    """事実／気づき／次に見ることを既存の申し送り欄へ保存しやすく整形する。"""
+    parts = []
+    if clean_text(fact_text):
+        parts.append("【事実】\n" + clean_text(fact_text))
+    if clean_text(insight_text):
+        parts.append("【気づき】\n" + clean_text(insight_text))
+    if clean_text(next_text):
+        parts.append("【次に見ること】\n" + clean_text(next_text))
+    return "\n\n".join(parts)
+
+def flatten_menu_groups(groups):
+    menus = []
+    for values in groups.values():
+        for item in values:
+            if item not in menus:
+                menus.append(item)
+    return menus
+
+
+def render_sidebar_menu(role):
+    """Ver3.0メニュー。カテゴリ選択＋メニュー選択でiPadでも迷いにくくする。"""
+    groups = build_menu_groups_from_settings(role)
+    filtered_flat = filter_admin_menus(flatten_menu_groups(groups))
+    with st.sidebar:
+        st.markdown(f'<div class="sidebar-title">ひだまり</div><div class="sidebar-sub">{APP_VERSION}<br>{APP_COPY}</div>', unsafe_allow_html=True)
+        st.caption(f"ログイン：{st.session_state.get('user_label', '')}")
+        st.divider()
+        if role != "admin":
+            category_names = list(groups.keys())
+            if not category_names:
+                category_names = ["今日の入力"]
+                groups = {"今日の入力": filtered_flat}
+            default_category = st.session_state.get("main_menu_category_staff", category_names[0])
+            if default_category not in category_names:
+                default_category = category_names[0]
+            category = st.selectbox("カテゴリ", category_names, index=category_names.index(default_category), key="main_menu_category_staff")
+            menu_options = [m for m in groups.get(category, []) if m in filtered_flat]
+            if not menu_options:
+                menu_options = filtered_flat
+            selected = st.radio("メニュー", menu_options, key=f"main_menu_staff_{category}")
+            return selected
+        category_names = list(groups.keys())
+        default_category = st.session_state.get("main_menu_category", category_names[0])
+        if default_category not in category_names:
+            default_category = category_names[0]
+        category = st.selectbox("カテゴリ", category_names, index=category_names.index(default_category), key="main_menu_category")
+        menu_options = [m for m in groups.get(category, []) if m in filtered_flat]
+        if not menu_options:
+            menu_options = filtered_flat
+        previous_menu = st.session_state.get("main_menu_selected", menu_options[0])
+        menu_index = menu_options.index(previous_menu) if previous_menu in menu_options else 0
+        selected = st.radio("メニュー", menu_options, index=menu_index, key=f"main_menu_selected_{category}")
+        st.session_state["main_menu_selected"] = selected
+        return selected
+
+
+apply_design()
+apply_product_ui_ux()
+
+if not login_check():
+    st.stop()
+
+logout_button()
+
+# SQLite・セキュリティテーブル初期化と1日1回自動バックアップ
+ensure_hidamari_db()
+ensure_security_tables()
+run_daily_auto_backup()
+
+if st.session_state.role == "admin":
+    show_hidamari_hero("admin")
+    show_admin_encouragement()
+else:
+    show_hidamari_hero("staff")
+    show_staff_encouragement()
+
+product_ui_notice()
+
+
+# =========================
+# メニュー（Ver3.0：カテゴリ化・iPad最適化）
+# =========================
+users_df = load_users(include_hidden=False)
+active_users = users_df["利用者名"].tolist()
+all_users = active_users
+
+menu = render_sidebar_menu(st.session_state.role)
+
+
+# =========================
+# 管理者LIFE管理（月次）
+# =========================
+LIFE_DB = DATA_DIR / "hidamari_life.db"
+
+def life_conn():
+    ensure_dirs()
+    conn = sqlite3.connect(LIFE_DB, timeout=DB_BUSY_TIMEOUT_MS / 1000, check_same_thread=False)
+    apply_sqlite_pragmas(conn, for_write=True)
+    return conn
+
+def init_life_db():
+    con = life_conn()
+    cur = con.cursor()
+    cur.execute("""
+    CREATE TABLE IF NOT EXISTS life_monthly (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        user_name TEXT,
+        target_month TEXT,
+        adl_walk TEXT,
+        adl_transfer TEXT,
+        adl_eat TEXT,
+        adl_toilet TEXT,
+        dementia_level TEXT,
+        life_check TEXT,
+        addition_check TEXT,
+        csv_status TEXT,
+        manager_memo TEXT
+    )
+    """)
+    con.commit()
+    con.close()
+
+def life_read_df(sql):
+    con = life_conn()
+    df = pd.read_sql(sql, con)
+    con.close()
+    return df
+
+def life_exec_sql(sql, params):
+    con = life_conn()
+    cur = con.cursor()
+    cur.execute(sql, params)
+    con.commit()
+    con.close()
+
+def show_manager_life_input():
+    if not is_admin_user():
+        st.warning("このメニューは管理者専用です。")
+        return
+
+    init_life_db()
+    st.header("管理者LIFE入力（月次）")
+    st.caption("ADL評価、認知症自立度、LIFE確認、科学的介護推進体制加算確認を管理者が月次で入力します。")
+
+    if not active_users:
+        st.warning("利用者マスタに表示中の利用者がいません。")
+        return
+
+    with st.form("life_manager_form"):
+        user_name = st.selectbox("利用者名", active_users)
+        target_month = st.text_input("対象月", value=format_now_jst("%Y-%m"))
+
+        st.subheader("ADL評価")
+        c1, c2, c3, c4 = st.columns(4)
+        with c1:
+            adl_walk = st.selectbox("歩行", ["自立", "見守り", "一部介助", "全介助"])
+        with c2:
+            adl_transfer = st.selectbox("移乗", ["自立", "見守り", "一部介助", "全介助"])
+        with c3:
+            adl_eat = st.selectbox("食事動作", ["自立", "見守り", "一部介助", "全介助"])
+        with c4:
+            adl_toilet = st.selectbox("排泄動作", ["自立", "見守り", "一部介助", "全介助"])
+
+        st.subheader("認知症・LIFE確認")
+        c5, c6, c7, c8 = st.columns(4)
+        with c5:
+            dementia_level = st.selectbox("認知症自立度", ["自立", "Ⅰ", "Ⅱa", "Ⅱb", "Ⅲa", "Ⅲb", "Ⅳ", "M"])
+        with c6:
+            life_check = st.selectbox("LIFE確認", ["未確認", "確認済"])
+        with c7:
+            addition_check = st.selectbox("科学的介護推進体制加算", ["未確認", "対象", "対象外"])
+        with c8:
+            csv_status = st.selectbox("CSV出力状態", ["未出力", "出力済"])
+
+        manager_memo = st.text_area("管理者メモ")
+        submitted = st.form_submit_button("登録する", use_container_width=True)
+
+    if submitted:
+        if not clean_text(user_name):
+            st.warning("利用者名を選択してください。")
+            return
+
+        life_exec_sql("""
+        INSERT INTO life_monthly(
+            user_name, target_month, adl_walk, adl_transfer, adl_eat, adl_toilet,
+            dementia_level, life_check, addition_check, csv_status, manager_memo
+        )
+        VALUES (?,?,?,?,?,?,?,?,?,?,?)
+        """, (
+            user_name, target_month, adl_walk, adl_transfer, adl_eat, adl_toilet,
+            dementia_level, life_check, addition_check, csv_status, manager_memo
+        ))
+        st.success("管理者LIFEデータを登録しました。")
+
+def judge_life_missing_items(row):
+    """LIFE管理データの不足項目を共通判定する。"""
+    missing = []
+    if row.get("life_check") != "確認済":
+        missing.append("LIFE未確認")
+    if row.get("csv_status") != "出力済":
+        missing.append("CSV未出力")
+    if row.get("addition_check") == "未確認":
+        missing.append("加算未確認")
+    return " / ".join(missing) if missing else "OK"
+
+
+def show_life_missing_check():
+    if not is_admin_user():
+        st.warning("このメニューは管理者専用です。")
+        return
+
+    init_life_db()
+    st.header("LIFE不足チェック")
+    df = life_read_df("SELECT * FROM life_monthly ORDER BY target_month DESC, user_name ASC")
+
+    if df.empty:
+        st.info("LIFE管理データはまだ登録されていません。")
+        return
+
+    df["不足項目"] = df.apply(judge_life_missing_items, axis=1)
+    st.dataframe(
+        df[["user_name", "target_month", "life_check", "addition_check", "csv_status", "不足項目"]],
+        use_container_width=True,
+        hide_index=True
+    )
+
+def show_life_csv_export():
+    if not is_admin_user():
+        st.warning("このメニューは管理者専用です。")
+        return
+
+    init_life_db()
+    st.header("LIFE CSV出力")
+    df = life_read_df("SELECT * FROM life_monthly ORDER BY target_month DESC, user_name ASC")
+
+    if df.empty:
+        st.info("出力できるLIFE管理データがありません。")
+        return
+
+    st.dataframe(df, use_container_width=True, hide_index=True)
+    csv = df.to_csv(index=False).encode("utf-8-sig")
+    st.download_button(
+        label="LIFE CSVダウンロード",
+        data=csv,
+        file_name="hidamari_life_export.csv",
+        mime="text/csv",
+        use_container_width=True
+    )
+    st.caption("現時点ではLIFE提出補助用の土台CSVです。正式提出形式はLIFE仕様に合わせて最終調整が必要です。")
+
+def show_life_record_list():
+    if not is_admin_user():
+        st.warning("このメニューは管理者専用です。")
+        return
+
+    init_life_db()
+    st.header("LIFE登録一覧")
+    df = life_read_df("SELECT * FROM life_monthly ORDER BY target_month DESC, user_name ASC")
+    if df.empty:
+        st.info("LIFE管理データはまだ登録されていません。")
+    else:
+        st.dataframe(df, use_container_width=True, hide_index=True)
+
+
+
+
+# =========================
+# システム設定（商品化向け：設定系SQLite一元管理）
+# =========================
+def show_system_settings_menu():
+    """JSON/Excel/コードに散らばる設定を、商品化に向けてSQLite側で管理する画面。"""
+    if not is_admin_user():
+        st.warning("このメニューは管理者専用です。")
+        return
+
+    ui_section("システム設定", "商品化に向けて、UI・色・LIFE・施設情報などの設定をSQLiteに集約して管理します。", "⚙️")
+    ui_card(
+        "設定DB化の状態",
+        "この画面で保存した内容は app_settings テーブルに保存されます。バックアップZIPにはSQLite DBが含まれるため、復元・移行がしやすくなります。",
+        "JSON／Excelへ分散しないための土台です。",
+        soft=True,
+    )
+
+    initialize_default_app_settings()
+
+    tab1, tab2, tab3, tab4, tab5 = st.tabs(["施設設定", "UI設定", "色設定", "LIFE設定", "設定一覧"])
+
+    with tab1:
+        st.subheader("施設設定")
+        facility = get_app_setting("facility_settings", {})
+        if not isinstance(facility, dict):
+            facility = {}
+        with st.form("facility_settings_form"):
+            c1, c2 = st.columns(2)
+            with c1:
+                facility_name = st.text_input("施設名", value=clean_text(facility.get("施設名"), "ひだまり"))
+                service_type = st.text_input("事業種別", value=clean_text(facility.get("事業種別"), "小規模介護施設"))
+                capacity = st.text_input("定員", value=clean_text(facility.get("定員")))
+            with c2:
+                manager = st.text_input("管理者名", value=clean_text(facility.get("管理者名")))
+                tel = st.text_input("連絡先", value=clean_text(facility.get("連絡先")))
+                address = st.text_input("所在地", value=clean_text(facility.get("所在地")))
+            if st.form_submit_button("施設設定を保存", type="primary", use_container_width=True):
+                set_app_setting(
+                    "facility_settings",
+                    {
+                        "施設名": facility_name,
+                        "事業種別": service_type,
+                        "定員": capacity,
+                        "所在地": address,
+                        "管理者名": manager,
+                        "連絡先": tel,
+                    },
+                    category="施設設定",
+                    description="施設名・管理者・帳票表示用の基本情報",
+                )
+                add_audit_log("施設設定更新", "app_settings", "facility_settings", "施設設定をSQLiteへ保存")
+                st.success("施設設定を保存しました。")
+                st.rerun()
+
+    with tab2:
+        st.subheader("UI設定")
+        ui = get_app_setting("ui_settings", {})
+        if not isinstance(ui, dict):
+            ui = {}
+        with st.form("ui_settings_form"):
+            theme_name = st.text_input("テーマ名", value=clean_text(ui.get("テーマ"), "ひだまり標準"))
+            ipad_opt = st.checkbox("iPad最適化", value=bool(ui.get("iPad最適化", True)))
+            large_button = st.checkbox("ボタン大型化", value=bool(ui.get("ボタン大型化", True)))
+            card_view = st.checkbox("カード表示", value=bool(ui.get("カード表示", True)))
+            font_scale = st.number_input("フォント倍率", min_value=0.8, max_value=1.4, value=float(ui.get("フォント倍率", 1.0)), step=0.05)
+            if st.form_submit_button("UI設定を保存", type="primary", use_container_width=True):
+                set_app_setting(
+                    "ui_settings",
+                    {
+                        "テーマ": theme_name,
+                        "iPad最適化": ipad_opt,
+                        "ボタン大型化": large_button,
+                        "カード表示": card_view,
+                        "フォント倍率": font_scale,
+                    },
+                    category="UI設定",
+                    description="画面表示・タブレット対応設定",
+                )
+                add_audit_log("UI設定更新", "app_settings", "ui_settings", "UI設定をSQLiteへ保存")
+                st.success("UI設定を保存しました。")
+                st.rerun()
+
+    with tab3:
+        st.subheader("色設定")
+        colors_setting = get_color_settings()
+        with st.form("color_settings_form"):
+            c1, c2 = st.columns(2)
+            with c1:
+                staff_bg = st.text_input("職員画面 背景色", value=clean_text(colors_setting.get("staff_bg"), "#FFFDF7"))
+                staff_accent = st.text_input("職員画面 アクセント色", value=clean_text(colors_setting.get("staff_accent"), "#C9705C"))
+                alert_color = st.text_input("注意色", value=clean_text(colors_setting.get("alert"), "#C9705C"))
+            with c2:
+                admin_bg = st.text_input("管理者画面 背景色", value=clean_text(colors_setting.get("admin_bg"), "#F6F8F7"))
+                admin_accent = st.text_input("管理者画面 アクセント色", value=clean_text(colors_setting.get("admin_accent"), "#2F6F5E"))
+                success_color = st.text_input("確認済み色", value=clean_text(colors_setting.get("success"), "#2F6F5E"))
+            if st.form_submit_button("色設定を保存", type="primary", use_container_width=True):
+                set_app_setting(
+                    "color_settings",
+                    {
+                        "staff_bg": staff_bg,
+                        "staff_accent": staff_accent,
+                        "admin_bg": admin_bg,
+                        "admin_accent": admin_accent,
+                        "alert": alert_color,
+                        "success": success_color,
+                    },
+                    category="色設定",
+                    description="UIカラー設定",
+                )
+                add_audit_log("色設定更新", "app_settings", "color_settings", "色設定をSQLiteへ保存")
+                st.success("色設定を保存しました。再読み込み後に反映されます。")
+                st.rerun()
+
+    with tab4:
+        st.subheader("LIFE設定")
+        life = get_app_setting("life_settings", {})
+        if not isinstance(life, dict):
+            life = {}
+        with st.form("life_settings_form"):
+            c1, c2 = st.columns(2)
+            with c1:
+                month_default = st.selectbox("対象月初期値", ["当月", "前月"], index=0 if clean_text(life.get("対象月初期値"), "当月") == "当月" else 1)
+                missing_view = st.checkbox("LIFE不足表示", value=bool(life.get("LIFE不足表示", True)))
+                csv_confirm = st.checkbox("CSV出力前確認", value=bool(life.get("CSV出力前確認", True)))
+            with c2:
+                avoid_diag = st.checkbox("診断表現を避ける", value=bool(life.get("診断表現を避ける", True)))
+                ai整理 = st.checkbox("AIは整理係", value=bool(life.get("AIは整理係", True)))
+            if st.form_submit_button("LIFE設定を保存", type="primary", use_container_width=True):
+                set_app_setting(
+                    "life_settings",
+                    {
+                        "対象月初期値": month_default,
+                        "LIFE不足表示": missing_view,
+                        "CSV出力前確認": csv_confirm,
+                        "診断表現を避ける": avoid_diag,
+                        "AIは整理係": ai整理,
+                    },
+                    category="LIFE設定",
+                    description="LIFE管理・AI整理・CSV出力設定",
+                )
+                add_audit_log("LIFE設定更新", "app_settings", "life_settings", "LIFE設定をSQLiteへ保存")
+                st.success("LIFE設定を保存しました。")
+                st.rerun()
+
+    with tab5:
+        st.subheader("app_settings 一覧")
+        settings_df = get_all_app_settings_df()
+        if settings_df.empty:
+            st.info("設定はまだ登録されていません。")
+        else:
+            st.dataframe(settings_df.sort_values(["分類", "設定キー"]), use_container_width=True, hide_index=True)
+            st.download_button(
+                "設定一覧をExcelでダウンロード",
+                data=to_excel_download(settings_df),
+                file_name=f"app_settings_{today_jst().strftime('%Y%m%d')}.xlsx",
+                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                use_container_width=True,
+            )
+
+
+# =========================
+# 自分専用ダッシュボード設定
+# =========================
+DASHBOARD_SETTINGS_FILE = DATA_DIR / "dashboard_settings.json"
+
+DASHBOARD_ITEMS = {
+    "前日の申し送り": "前日の業務全体申し送りを表示",
+    "未対応・至急申し送り": "未対応・至急の申し送りを表示",
+    "排便3日なし": "確認日までに排便が3日間ない利用者を表示",
+    "注意利用者": "発熱・SpO2低下・食事低下・気になる変化などを表示",
+    "確認日の排泄状況": "確認日の排泄記録を表示",
+    "最新体重・未測定確認": "最新体重と14日以上未測定を表示",
+    "LIFE不足チェック": "LIFE確認・加算確認・CSV出力の不足を表示",
+    "短期目標 実施状況": "短期目標の実施状況を表示",
+}
+
+DEFAULT_DASHBOARD_ITEMS = [
+    "前日の申し送り",
+    "未対応・至急申し送り",
+    "排便3日なし",
+    "注意利用者",
+    "最新体重・未測定確認",
+]
+
+def load_dashboard_settings(username=None):
+    ensure_dirs()
+    username = username or current_login_user()
+    if "dashboard_enabled_items" in st.session_state:
+        return set([x for x in st.session_state["dashboard_enabled_items"] if x in DASHBOARD_ITEMS])
+
+    data = get_app_setting("dashboard_settings_all", None)
+    if data is None:
+        data = migrate_json_file_setting_to_db(
+            "dashboard_settings_all",
+            DASHBOARD_SETTINGS_FILE,
+            category="ダッシュボード設定",
+            default={},
+        )
+    if not isinstance(data, dict):
+        data = {}
+
+    items = data.get(username)
+    if items is None:
+        # kanriで保存したものを他キーでも拾えるようにする
+        items = data.get("kanri", DEFAULT_DASHBOARD_ITEMS)
+
+    return set([x for x in items if x in DASHBOARD_ITEMS])
+
+def save_dashboard_settings(username, enabled_items):
+    ensure_dirs()
+    data = get_app_setting("dashboard_settings_all", {})
+    if not isinstance(data, dict):
+        data = {}
+
+    # ログインキーの揺れで反映されないのを防ぐため、管理者はkanriにも保存
+    clean_items = [x for x in enabled_items if x in DASHBOARD_ITEMS]
+    data[username] = clean_items
+    if username == "kanri" or is_admin_user():
+        data["kanri"] = clean_items
+
+    set_app_setting(
+        "dashboard_settings_all",
+        data,
+        category="ダッシュボード設定",
+        description="自分専用ダッシュボードの表示項目設定",
+    )
+
+
+def show_custom_dashboard_page():
+    if not is_admin_user():
+        st.warning("このメニューは管理者専用です。")
+        return
+
+    st.header("自分専用ダッシュボード")
+    st.caption("『自分専用ダッシュボード設定』で選択した項目だけを表示します。")
+
+    check_date = st.date_input("確認日", value=today_jst(), key="custom_dashboard_check_date")
+    show_my_dashboard_blocks(check_date)
+
+def show_custom_dashboard_settings():
+    if not is_admin_user():
+        st.warning("このメニューは管理者専用です。")
+        return
+
+    st.header("自分専用ダッシュボード設定")
+    st.caption("管理者ダッシュボードに表示する項目を選べます。保存後、管理者ダッシュボードへ戻ると反映されます。")
+
+    username = current_login_user()
+    current = load_dashboard_settings(username)
+
+    enabled_items = []
+    st.markdown("#### 表示する項目を選択")
+    for item, desc in DASHBOARD_ITEMS.items():
+        checked = st.checkbox(
+            item,
+            value=item in current,
+            help=desc,
+            key=f"dashboard_setting_{item}"
+        )
+        if checked:
+            enabled_items.append(item)
+
+    c1, c2 = st.columns(2)
+
+    with c1:
+        if st.button("自分設定を保存", type="primary", use_container_width=True):
+            save_dashboard_settings(username, enabled_items)
+            st.session_state["dashboard_settings_saved"] = True
+            st.session_state["dashboard_enabled_items"] = enabled_items
+            st.success("設定を保存しました。管理者ダッシュボードに戻ると反映されます。")
+            st.rerun()
+
+    with c2:
+        if st.button("標準設定に戻す", use_container_width=True):
+            save_dashboard_settings(username, DEFAULT_DASHBOARD_ITEMS)
+            st.success("標準設定に戻しました。")
+            st.rerun()
+
+    st.divider()
+    st.subheader("現在保存されている表示項目")
+    saved = load_dashboard_settings(username)
+    if saved:
+        st.write(" / ".join(saved))
+    else:
+        st.info("表示項目は選択されていません。")
+
+def show_my_dashboard_blocks(target_date=None):
+    if not is_admin_user():
+        return
+
+    username = current_login_user()
+    enabled = load_dashboard_settings(username)
+
+    if target_date is None:
+        target_date = today_jst()
+
+
+    if not enabled:
+        st.info("表示項目が選択されていません。『自分専用ダッシュボード設定』で表示項目を選んでください。")
+        return
+
+    health_df = load_health_data()
+    ex_df = load_excretion_data()
+
+    if "前日の申し送り" in enabled:
+        st.subheader("前日の申し送り")
+        try:
+            prev_day = target_date - timedelta(days=1)
+            df = load_business_handover_data()
+            prev_df = get_business_handover_by_date(df, prev_day)
+            if prev_df.empty:
+                st.info("前日の申し送りはありません。")
+            else:
+                for _, row in prev_df.iterrows():
+                    render_business_handover_card(row)
+        except Exception as e:
+            st.warning(f"前日の申し送りを表示できませんでした: {e}")
+
+    if "未対応・至急申し送り" in enabled:
+        st.subheader("未対応・至急申し送り")
+        try:
+            df = load_business_handover_data()
+            alert_df = get_business_handover_alerts(df)
+            if alert_df.empty:
+                st.success("未対応・至急の申し送りはありません。")
+            else:
+                for _, row in alert_df.iterrows():
+                    render_business_handover_card(row)
+        except Exception as e:
+            st.warning(f"未対応・至急申し送りを表示できませんでした: {e}")
+
+    if "排便3日なし" in enabled:
+        st.subheader("排便3日なし")
+        try:
+            no_stool_df = build_no_stool_3days_users(ex_df, target_date)
+            if no_stool_df.empty:
+                st.success("直近3日間の未排便該当者はいません。")
+            else:
+                st.dataframe(no_stool_df, use_container_width=True, hide_index=True)
+        except Exception as e:
+            st.warning(f"排便3日なしを表示できませんでした: {e}")
+
+    if "注意利用者" in enabled:
+        st.subheader("注意利用者")
+        try:
+            attention_df = build_attention_users(health_df, ex_df, target_date)
+            if attention_df.empty:
+                st.success("注意表示の対象者はいません。")
+            else:
+                st.dataframe(add_confirm_points_column(attention_df), use_container_width=True, hide_index=True)
+        except Exception as e:
+            st.warning(f"注意利用者を表示できませんでした: {e}")
+
+    if "最新体重・未測定確認" in enabled:
+        try:
+            show_latest_weight_block(health_df, active_users if "active_users" in globals() else None, target_date)
+            show_weight_overdue_block(health_df, active_users if "active_users" in globals() else None, target_date, threshold_days=14)
+        except Exception as e:
+            st.warning(f"体重確認を表示できませんでした: {e}")
+
+    if "確認日の排泄状況" in enabled:
+        st.subheader("確認日の排泄状況")
+        try:
+            day_ex = get_day_excretion_data(ex_df, target_date, None)
+            if day_ex.empty:
+                st.info("確認日の排泄記録はありません。")
+            else:
+                st.dataframe(day_ex, use_container_width=True, hide_index=True)
+        except Exception as e:
+            st.warning(f"排泄状況を表示できませんでした: {e}")
+
+    if "LIFE不足チェック" in enabled:
+        st.subheader("LIFE不足チェック")
+        try:
+            if "life_read_df" in globals():
+                init_life_db()
+                life_df = life_read_df("SELECT * FROM life_monthly ORDER BY target_month DESC, user_name ASC")
+                if life_df.empty:
+                    st.info("LIFE管理データはまだありません。")
+                else:
+                    life_df["不足項目"] = life_df.apply(judge_life_missing_items, axis=1)
+                    st.dataframe(
+                        life_df[["user_name", "target_month", "life_check", "addition_check", "csv_status", "不足項目"]],
+                        use_container_width=True,
+                        hide_index=True
+                    )
+            else:
+                st.info("LIFE管理機能がまだ読み込まれていません。")
+        except Exception as e:
+            st.warning(f"LIFE不足チェックを表示できませんでした: {e}")
+
+    if "短期目標 実施状況" in enabled:
+        st.subheader("短期目標 実施状況")
+        try:
+            checks = load_short_goal_checks()
+            if checks.empty:
+                st.info("短期目標の実施チェック記録はまだありません。")
+            else:
+                work = checks.copy()
+                work["日付_dt"] = pd.to_datetime(work["日付"], errors="coerce")
+                month_start = date(target_date.year, target_date.month, 1)
+                month_df = work[work["日付_dt"] >= pd.to_datetime(month_start)].copy()
+                if month_df.empty:
+                    st.info("今月の短期目標実施チェックはまだありません。")
+                else:
+                    summary = month_df.groupby(["利用者名", "実施状況"]).size().reset_index(name="件数")
+                    st.dataframe(summary, use_container_width=True, hide_index=True)
+        except Exception as e:
+            st.warning(f"短期目標実施状況を表示できませんでした: {e}")
+
+# =========================
+# 管理者ダッシュボード
+# =========================
+if menu == "管理者ダッシュボード":
+    if st.session_state.role != "admin":
+        st.error("この画面は管理者専用です。")
+        st.stop()
+
+    st.header("管理者ダッシュボード")
+    show_observation_perspective("admin")
+
+    health_df = load_health_data()
+    ex_df = load_excretion_data()
+    today = today_jst()
+    yesterday = today - timedelta(days=1)
+
+    st.markdown(
+        """
+        <div class="info-box">
+            <b>出勤時の確認用ダッシュボードです。</b><br>
+            初期表示は「昨日」です。前日の申し送り・注意記録・排泄状況を確認してから、本日の対応につなげます。
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
+
+    target_date = st.date_input(
+        "確認する日付（初期表示：昨日）",
+        value=yesterday,
+        key="admin_dashboard_target_date",
+        help="朝の確認では昨日の日付を基本にします。必要に応じて別日も確認できます。",
+    )
+
+    target_excretion = get_day_excretion_data(ex_df, target_date, None)
+
+    h_target = health_df.copy()
+    if not h_target.empty:
+        h_target["記録日"] = pd.to_datetime(h_target["記録日"], errors="coerce")
+        h_target = h_target[h_target["記録日"].dt.date == target_date]
+
+    col1, col2, col3, col4 = st.columns(4)
+    col1.metric("確認日の健康記録", len(h_target))
+    col2.metric("確認日の排泄記録", len(target_excretion))
+    col3.metric("利用者数", len(active_users))
+
+    ex_sum = summarize_excretion(target_excretion)
+    col4.metric("確認日の排便記録", ex_sum["排便回数"])
+
+    st.markdown("---")
+    show_latest_weight_block(health_df, active_users, target_date)
+    show_weight_overdue_block(health_df, active_users, target_date, threshold_days=14)
+
+    # 出勤時に最初に確認したい項目として、業務全体申し送りを上部に表示
+    st.markdown("---")
+    show_admin_business_handover_summary(target_date)
+    st.markdown("---")
+    show_admin_short_goal_summary(target_date)
+    st.markdown("---")
+
+    st.subheader("確認日の注意利用者")
+    attention_df = build_attention_users(health_df, ex_df, target_date)
+    if attention_df.empty:
+        st.success("確認日の注意利用者はありません。")
+    else:
+        st.warning("確認したい利用者がいます。")
+        st.dataframe(add_confirm_points_column(attention_df), use_container_width=True, hide_index=True)
+
+    st.subheader("どこで止まっているか")
+    st.caption("職員個人ではなく、記録・共有・対応の流れを確認します。")
+    try:
+        st.dataframe(build_process_stop_summary(health_df, ex_df, load_business_handover_data(), target_date), use_container_width=True, hide_index=True)
+    except Exception as e:
+        st.info(f"流れの確認表を作成できませんでした: {e}")
+
+    st.subheader("直近3日間、排便記録がない利用者")
+    st.caption("確認する日付を含めた直近3日間で、排便記録がない利用者を表示します。")
+    no_stool_3days_df = build_no_stool_3days_users(ex_df, target_date)
+    if no_stool_3days_df.empty:
+        st.success("確認日までの直近3日間で、排便記録がない利用者はありません。")
+    else:
+        st.warning("排便状況を確認したい利用者がいます。")
+        st.dataframe(no_stool_3days_df, use_container_width=True, hide_index=True)
+
+    st.subheader("前日の申し送り確認")
+    st.caption("初期表示は昨日です。出勤時に、前日の気になる変化・家族共有メモ・注意項目を確認できます。")
+    st.text_area(
+        "申し送りメモ",
+        value=create_handover_text(health_df, ex_df, target_date),
+        height=320,
+    )
+
+    st.subheader("前日の排泄状況確認")
+    st.caption("初期表示は昨日です。出勤時に、前日の排尿・排便・濃縮尿・下痢便・水様便の有無を確認できます。")
+    if target_excretion.empty:
+        st.info("前日（確認日）の排泄記録はまだありません。")
+    else:
+        st.dataframe(target_excretion, use_container_width=True, hide_index=True)
+
+        if ex_sum["濃縮尿"] or ex_sum["下痢便"] or ex_sum["水様便"]:
+            st.warning(
+                f"確認項目：濃縮尿 {ex_sum['濃縮尿']}件、"
+                f"下痢便 {ex_sum['下痢便']}件、水様便 {ex_sum['水様便']}件"
+            )
+        else:
+            st.success("前日（確認日）の排泄状況で大きな注意記録はありません。")
+
+    show_admin_backup_download()
+
+
+elif menu == "現場の気づき構造化・AI管理者支援":
+    show_structured_insight_menu()
+
+# =========================
+# 業務全体申し送り
+# =========================
+elif menu == "業務全体申し送り":
+    show_business_handover_menu()
+
+elif menu == "短期目標・モニタリング" and is_admin_user():
+    show_short_goal_top()
+
+elif menu == "短期目標マスタ":
+    if st.session_state.role != "admin":
+        st.error("この画面は管理者専用です。")
+        st.stop()
+    show_short_goal_master()
+
+elif menu == "日々の実施チェック":
+    show_daily_goal_check()
+
+elif menu == "実施履歴一覧":
+    show_goal_history()
+
+elif menu == "モニタリング下書き作成" and is_admin_user():
+    show_monitoring_draft()
+
+elif menu == "短期目標データ管理":
+    if st.session_state.role != "admin":
+        st.error("この画面は管理者専用です。")
+        st.stop()
+    show_short_goal_data_management()
+
+
+# =========================
+# LIFE入力標準化
+# =========================
+elif menu == "LIFE入力標準化" and is_admin_user():
+    show_life_standardization_menu()
+
+elif menu == "加算シミュレーション" and is_admin_user():
+    show_addon_simulation_menu()
+
+
+
+
+elif menu == "自分専用ダッシュボード":
+    show_custom_dashboard_page()
+
+elif menu == "自分専用ダッシュボード設定":
+    show_custom_dashboard_settings()
+
+elif menu == "管理者LIFE入力":
+    show_manager_life_input()
+
+elif menu == "LIFE不足チェック":
+    show_life_missing_check()
+
+elif menu == "LIFE CSV出力":
+    show_life_csv_export()
+
+elif menu == "LIFE登録一覧":
+    show_life_record_list()
+
+
+
+elif menu == "写真から半自動入力":
+    show_photo_import_menu()
+
+
+# =========================
+# 健康チェック入力
+# =========================
+elif menu == "健康チェック入力":
+    st.header("健康チェック入力")
+    show_observation_perspective("health")
+
+    if st.session_state.role == "staff":
+        st.write("バイタルと食事の様子を、今日の記録として残します。")
+
+    if not active_users:
+        st.warning("利用者マスタに表示中の利用者がいません。")
+        st.stop()
+
+    col1, col2, col3 = st.columns(3)
+    with col1:
+        record_date = st.date_input("記録日", value=today_jst(), key="health_date")
+    with col2:
+        user_name = st.selectbox("利用者名", active_users, key="health_user")
+    with col3:
+        input_staff = st.text_input("入力者", placeholder="例：藤野", key="health_staff")
+
+    health_df = load_health_data()
+    idx = find_health_index(health_df, record_date, user_name)
+
+    if idx is None:
+        existing_row = None
+        st.markdown(
+            """
+            <div style='background:#EAF4FF; border:1px solid #9CC7F0; color:#174A7C; padding:12px 14px; border-radius:10px; margin:8px 0 12px 0;'>
+                <b>この記録日・利用者名の健康チェックデータはありません。</b><br>
+                登録すると新規データとして保存されます。
+            </div>
+            """,
+            unsafe_allow_html=True,
+        )
+    else:
+        existing_row = health_df.loc[idx]
+        st.markdown(
+            """
+            <div style='background:#FFF3E0; border:1px solid #F0B36A; color:#8A4B00; padding:12px 14px; border-radius:10px; margin:8px 0 12px 0;'>
+                <b>この記録日・利用者名の健康チェックデータは既にあります。</b><br>
+                登録すると上書き更新されます。既存データを初期表示しています。
+            </div>
+            """,
+            unsafe_allow_html=True,
+        )
+
+    def row_float(col, default):
+        if existing_row is None:
+            return default
+        return safe_float(existing_row.get(col), default)
+
+    def row_int(col, default):
+        if existing_row is None:
+            return default
+        return safe_int(existing_row.get(col), default)
+
+    def row_text(col, default=""):
+        if existing_row is None:
+            return default
+        return clean_text(existing_row.get(col), default)
+
+    with st.form("health_form", clear_on_submit=False):
+        st.subheader("バイタル")
+
+        c1, c2, c3 = st.columns(3)
+        with c1:
+            temp = st.number_input("体温", min_value=0.0, max_value=45.0, value=row_float("体温", 0.0), step=0.1)
+        with c2:
+            bp_high = st.number_input("血圧上", min_value=0, max_value=250, value=row_int("血圧上", 0), step=1)
+        with c3:
+            bp_low = st.number_input("血圧下", min_value=0, max_value=150, value=row_int("血圧下", 0), step=1)
+
+        c4, c5, c6 = st.columns(3)
+        with c4:
+            pulse = st.number_input("脈拍", min_value=0, max_value=200, value=row_int("脈拍", 0), step=1)
+        with c5:
+            spo2 = st.number_input("SpO2", min_value=0, max_value=100, value=row_int("SpO2", 0), step=1)
+        with c6:
+            existing_weight_text = format_weight_value(row_text("体重", ""))
+            weight_raw = st.text_input(
+                "体重（任意）",
+                value=existing_weight_text,
+                placeholder="例：56.2",
+                help="週1回など、測定した日だけ入力します。未測定の場合は空欄でOKです。",
+            )
+            st.caption("※未測定の場合は空欄でOK")
+
+        st.divider()
+        st.subheader("食事摂取量（LIFE向け標準化）")
+        st.caption("自由な表現ではなく、選択式で保存します。内部では従来の摂取率も自動保存します。")
+
+        m1, m2, m3 = st.columns(3)
+        with m1:
+            breakfast_default = row_text("朝食摂取区分", meal_option_from_percent(row_int("朝食摂取率", 80)))
+            breakfast_code = st.selectbox("朝食", MEAL_INTAKE_OPTIONS, index=get_life_option_index(MEAL_INTAKE_OPTIONS, breakfast_default, 1))
+        with m2:
+            lunch_default = row_text("昼食摂取区分", meal_option_from_percent(row_int("昼食摂取率", 80)))
+            lunch_code = st.selectbox("昼食", MEAL_INTAKE_OPTIONS, index=get_life_option_index(MEAL_INTAKE_OPTIONS, lunch_default, 1))
+        with m3:
+            dinner_default = row_text("夕食摂取区分", meal_option_from_percent(row_int("夕食摂取率", 80)))
+            dinner_code = st.selectbox("夕食", MEAL_INTAKE_OPTIONS, index=get_life_option_index(MEAL_INTAKE_OPTIONS, dinner_default, 1))
+
+        breakfast = MEAL_INTAKE_PERCENT[breakfast_code]
+        lunch = MEAL_INTAKE_PERCENT[lunch_code]
+        dinner = MEAL_INTAKE_PERCENT[dinner_code]
+
+        st.divider()
+        st.subheader("LIFE補助項目")
+        l1, l2, l3, l4 = st.columns(4)
+        with l1:
+            water_ml = st.number_input("水分摂取量ml", min_value=0, max_value=5000, value=row_int("水分摂取量ml", 0), step=50)
+        with l2:
+            nutrition_risk = st.selectbox("栄養リスク", NUTRITION_RISK_OPTIONS, index=get_life_option_index(NUTRITION_RISK_OPTIONS, row_text("栄養リスク", "0: 通常")))
+        with l3:
+            oral_status = st.selectbox("口腔状態", ORAL_STATUS_OPTIONS, index=get_life_option_index(ORAL_STATUS_OPTIONS, row_text("口腔状態", "9: 未確認"), 4))
+        with l4:
+            denture_status = st.selectbox("義歯使用", DENTURE_OPTIONS, index=get_life_option_index(DENTURE_OPTIONS, row_text("義歯使用", "9: 未確認"), 3))
+
+        life_memo = st.text_area("LIFE補助メモ", value=row_text("LIFE補助メモ"), placeholder="食事・水分・口腔・栄養面で気になる点。提出前確認用の内部メモです。")
+        family_memo = st.text_area("家族共有メモ", value=row_text("家族共有メモ"), placeholder="ご家族へ共有してよい内容を入力")
+        changes = st.text_area("気になる変化", value=row_text("気になる変化"), placeholder="食事、睡眠、歩行、表情、体調など")
+
+        submitted = st.form_submit_button("登録する")
+
+    if submitted:
+        weight, weight_error = parse_optional_weight(weight_raw)
+        if weight_error:
+            st.error(weight_error)
+            st.stop()
+
+        record = {
+            "記録日": record_date,
+            "利用者名": user_name,
+            "体温": temp,
+            "血圧上": bp_high,
+            "血圧下": bp_low,
+            "脈拍": pulse,
+            "SpO2": spo2,
+            "体重": weight,
+            "朝食摂取率": breakfast,
+            "昼食摂取率": lunch,
+            "夕食摂取率": dinner,
+            "朝食摂取区分": breakfast_code,
+            "昼食摂取区分": lunch_code,
+            "夕食摂取区分": dinner_code,
+            "水分摂取量ml": water_ml,
+            "栄養リスク": nutrition_risk,
+            "口腔状態": oral_status,
+            "義歯使用": denture_status,
+            "LIFE補助メモ": life_memo,
+            "家族共有メモ": family_memo,
+            "気になる変化": changes,
+            "登録日時": format_now_jst("%Y-%m-%d %H:%M:%S"),
+            "入力者": input_staff,
+        }
+
+        errors, warnings = validate_health_record(record)
+
+        if errors:
+            st.error("保存できません。入力内容を確認してください。")
+            for msg in errors:
+                st.error(msg)
+        else:
+            if warnings:
+                st.warning("保存前確認があります。")
+                for msg in warnings:
+                    st.warning(msg)
+
+            diff_text = build_health_diff_text(health_df, record_date, user_name, record)
+            st.info(diff_text)
+
+            action = upsert_health_record(record)
+            st.success(f"健康チェックを{action}しました。")
+            st.rerun()
+
+
+# =========================
+# 排泄チェック入力
+# 未入力チェック一覧＋スマホ用ワンタップ風UI
+# =========================
+elif menu == "排泄チェック入力":
+    st.header("排泄チェック入力")
+    show_observation_perspective("excretion")
+    st.caption("排泄記録は健康チェックとは別データとして保存します。キーは「記録日＋利用者名＋時間帯」です。")
+
+    if st.session_state.role == "staff":
+        st.markdown("###  排泄チェック入力")
+        st.write("時間帯ごとに、尿・便の様子をワンタップ感覚で記録します。")
+
+    if not active_users:
+        st.warning("利用者マスタに表示中の利用者がいません。")
+        st.stop()
+
+    ex_df = load_excretion_data()
+
+    # まず日付を選ぶ。日付が変わると未入力一覧も切り替わる。
+    top1, top2 = st.columns([1, 2])
+    with top1:
+        record_date = st.date_input("記録日", value=today_jst(), key="ex_input_date")
+
+    # 利用者・入力者選択
+    col1, col2 = st.columns(2)
+    with col1:
+        # 未入力一覧はページ下部へ移動したため、ここでは通常の利用者選択にする
+        user_name = st.selectbox("利用者名", active_users, key="ex_input_user")
+    with col2:
+        input_staff = st.text_input("入力者", placeholder="例：藤野", key="ex_input_staff")
+
+    day_data = get_day_excretion_data(ex_df, record_date, user_name)
+
+    if day_data.empty:
+        st.markdown(
+            """
+            <div style='background:#EAF4FF; border:1px solid #9CC7F0; color:#174A7C; padding:12px 14px; border-radius:10px; margin:8px 0 12px 0;'>
+                <b>この記録日・利用者名の排泄データはありません。</b><br>
+                登録すると新規データとして保存されます。
+            </div>
+            """,
+            unsafe_allow_html=True,
+        )
+    else:
+        st.markdown(
+            """
+            <div style='background:#FFF3E0; border:1px solid #F0B36A; color:#8A4B00; padding:12px 14px; border-radius:10px; margin:8px 0 12px 0;'>
+                <b>この記録日・利用者名の排泄データは既にあります。</b><br>
+                登録すると時間帯ごとに上書き更新されます。
+            </div>
+            """,
+            unsafe_allow_html=True,
+        )
+
+    # スマホ用ワンタップ風UI
+    st.caption("尿量・便量は横並びボタン風に選べます。スマホでも押しやすいようにしています。")
+
+    with st.form("excretion_form", clear_on_submit=False):
+        records_to_save = []
+
+        def one_tap_radio(label, options, index, key):
+            return st.radio(
+                label,
+                options,
+                index=index,
+                horizontal=True,
+                key=key,
+            )
+
+        def render_slot(slot, time_label, card_color, border_color):
+            existing = get_excretion_row(ex_df, record_date, user_name, slot)
+            sig = "new" if existing is None else hashlib.md5(str(existing.to_dict()).encode("utf-8")).hexdigest()[:8]
+            key_base = f"ex_{record_date}_{user_name}_{slot}_{sig}"
+
+            st.markdown(
+                f"""
+                <div style='background:{card_color}; padding:12px; border-radius:14px; border:1px solid {border_color}; margin-bottom:10px;'>
+                    <b style='font-size:16px;'>{slot}</b><br>
+                    <span style='font-size:12px; color:#666;'>{time_label}</span>
+                </div>
+                """,
+                unsafe_allow_html=True,
+            )
+
+            urine_amount_default = existing.get("尿量", "なし") if existing is not None else "なし"
+            urine_type_default = existing.get("尿性状", "なし") if existing is not None else "なし"
+            stool_amount_default = existing.get("便量", "なし") if existing is not None else "なし"
+            stool_type_default = existing.get("便性状", "なし") if existing is not None else "なし"
+
+            urine_amount = one_tap_radio(
+                f"{slot} 尿量",
+                URINE_AMOUNT_OPTIONS,
+                get_option_index(URINE_AMOUNT_OPTIONS, urine_amount_default),
+                f"{key_base}_urine_amount",
+            )
+
+            urine_type = one_tap_radio(
+                f"{slot} 尿性状",
+                URINE_TYPE_OPTIONS,
+                get_option_index(URINE_TYPE_OPTIONS, urine_type_default),
+                f"{key_base}_urine_type",
+            )
+
+            stool_amount = one_tap_radio(
+                f"{slot} 便量",
+                STOOL_AMOUNT_OPTIONS,
+                get_option_index(STOOL_AMOUNT_OPTIONS, stool_amount_default),
+                f"{key_base}_stool_amount",
+            )
+
+            stool_type = one_tap_radio(
+                f"{slot} 便性状",
+                STOOL_TYPE_OPTIONS,
+                get_option_index(STOOL_TYPE_OPTIONS, stool_type_default),
+                f"{key_base}_stool_type",
+            )
+
+            memo = st.text_area(
+                f"{slot} メモ",
+                value=existing.get("排泄メモ", "") if existing is not None else "",
+                key=f"{key_base}_memo",
+                height=70,
+                placeholder="必要時のみ入力",
+            )
+
+            if urine_amount == "なし":
+                urine_type = "なし"
+            if stool_amount == "なし":
+                stool_type = "なし"
+
+            records_to_save.append({
+                "記録日": record_date,
+                "利用者名": user_name,
+                "時間帯": slot,
+                "時間帯目安": time_label,
+                "尿量": urine_amount,
+                "尿性状": urine_type,
+                "便量": stool_amount,
+                "便性状": stool_type,
+                "排泄メモ": memo,
+                "入力者": input_staff,
+                "登録日時": format_now_jst("%Y-%m-%d %H:%M:%S"),
+            })
+
+        st.markdown("####  日中帯（9時?17時）")
+        day_cols = st.columns(3)
+
+        for col, (slot, time_label) in zip(day_cols, EXCRETION_SLOTS[:3]):
+            with col:
+                render_slot(slot, time_label, "#FFF7EC", "#E5D5BF")
+
+        st.markdown("####  夜間帯（18時?翌8時）")
+        night_cols = st.columns(3)
+
+        for col, (slot, time_label) in zip(night_cols, EXCRETION_SLOTS[3:]):
+            with col:
+                render_slot(slot, time_label, "#EEF4FA", "#C9D8E6")
+
+        submitted = st.form_submit_button("排泄チェックを登録・更新する")
+
+    if submitted:
+        all_errors = []
+        all_warnings = []
+
+        for record in records_to_save:
+            errors, warnings = validate_excretion_record(record)
+            for msg in errors:
+                all_errors.append(f"{record['時間帯']}：{msg}")
+            for msg in warnings:
+                all_warnings.append(f"{record['時間帯']}：{msg}")
+
+        if all_errors:
+            st.error("保存できません。排泄入力内容を確認してください。")
+            for msg in all_errors:
+                st.error(msg)
+        else:
+            if all_warnings:
+                st.warning("保存前確認があります。")
+                for msg in all_warnings:
+                    st.warning(msg)
+
+            for record in records_to_save:
+                upsert_excretion_record(record)
+
+            st.info(build_excretion_diff_text(load_excretion_data(), record_date, user_name))
+            st.success("排泄チェックを保存しました。時間帯ごとに登録・更新されています。")
+            st.rerun()
+
+    st.subheader("この日の排泄記録")
+    day_data = get_day_excretion_data(load_excretion_data(), record_date, user_name)
+    if day_data.empty:
+        st.info("この日の排泄記録はまだありません。")
+    else:
+        st.dataframe(day_data, use_container_width=True, hide_index=True)
+
+    st.divider()
+
+    # 未入力チェック一覧（ページ下部へ移動）
+    st.subheader("未入力チェック一覧")
+
+    missing_rows = []
+    completed_rows = []
+
+    for user in active_users:
+        for slot, time_label in EXCRETION_SLOTS:
+            row = get_excretion_row(load_excretion_data(), record_date, user, slot)
+
+            if row is None:
+                missing_rows.append(
+                    {
+                        "利用者名": user,
+                        "時間帯": slot,
+                        "時間帯目安": time_label,
+                        "状態": "未入力",
+                    }
+                )
+            else:
+                completed_rows.append(
+                    {
+                        "利用者名": user,
+                        "時間帯": slot,
+                        "時間帯目安": time_label,
+                        "状態": "入力済み",
+                    }
+                )
+
+    total_count = len(active_users) * len(EXCRETION_SLOTS)
+    completed_count = len(completed_rows)
+    missing_count = len(missing_rows)
+
+    m1, m2, m3 = st.columns(3)
+    m1.metric("必要記録数", total_count)
+    m2.metric("入力済み", completed_count)
+    m3.metric("未入力", missing_count)
+
+    if missing_rows:
+        st.warning("未入力の排泄記録があります。")
+
+        with st.expander("未入力一覧を表示する", expanded=True):
+            st.dataframe(
+                pd.DataFrame(missing_rows),
+                use_container_width=True,
+                hide_index=True,
+            )
+    else:
+        st.success("この日の排泄記録はすべて入力済みです。")
+
+    with st.expander("入力済み一覧を表示する", expanded=False):
+        if completed_rows:
+            st.dataframe(
+                pd.DataFrame(completed_rows),
+                use_container_width=True,
+                hide_index=True,
+            )
+        else:
+            st.info("この日の入力済み記録はまだありません。")
+
+
+# =========================
+# 過去データ管理
+# =========================
+elif menu == "過去データ管理":
+    st.header("過去データ管理")
+    st.caption("健康チェックだけでなく、入力状況・注意記録・業務全体申し送りを切り替えて確認できます。")
+
+    data_mode = st.selectbox(
+        "確認・管理するデータ種別",
+        ["健康チェック", "入力状況", "注意記録", "業務全体申し送り"],
+        key="past_data_mode",
+    )
+
+    # ---------------------------------
+    # 健康チェック：従来の検索・更新・削除
+    # ---------------------------------
+    if data_mode == "健康チェック":
+        st.subheader("健康チェックデータ")
+        st.caption("健康チェックデータを、記録日＋利用者名で検索・更新・削除します。")
+
+        health_df = load_health_data()
+
+        if health_df.empty:
+            st.info("まだ健康チェックデータがありません。")
+        else:
+            col1, col2 = st.columns(2)
+            with col1:
+                key_date = st.date_input("記録日", value=today_jst(), key="past_health_date")
+            with col2:
+                key_user = st.selectbox("利用者名", all_users, key="past_health_user")
+
+            idx = find_health_index(health_df, key_date, key_user)
+
+            if idx is None:
+                st.info("この記録日・利用者名の健康チェックデータはありません。")
+            else:
+                st.success("該当データが見つかりました。")
+                row = health_df.loc[idx]
+
+                with st.form("health_update_form"):
+                    c1, c2, c3 = st.columns(3)
+                    with c1:
+                        temp = st.number_input("体温", value=safe_float(row.get("体温"), 0.0), step=0.1)
+                    with c2:
+                        bp_high = st.number_input("血圧上", value=safe_int(row.get("血圧上"), 0), step=1)
+                    with c3:
+                        bp_low = st.number_input("血圧下", value=safe_int(row.get("血圧下"), 0), step=1)
+
+                    c4, c5, c6 = st.columns(3)
+                    with c4:
+                        pulse = st.number_input("脈拍", value=safe_int(row.get("脈拍"), 0), step=1)
+                    with c5:
+                        spo2 = st.number_input("SpO2", value=safe_int(row.get("SpO2"), 0), step=1)
+                    with c6:
+                        weight_text = st.text_input("体重（任意）", value=format_weight_value(row.get("体重", "")), help="未測定の場合は空欄でOKです。")
+                        weight, weight_error = parse_optional_weight(weight_text)
+                        if weight_error:
+                            st.warning(weight_error)
+
+                    m1, m2, m3 = st.columns(3)
+                    with m1:
+                        breakfast = st.slider("朝食", 0, 100, safe_int(row.get("朝食摂取率"), 80), step=10)
+                    with m2:
+                        lunch = st.slider("昼食", 0, 100, safe_int(row.get("昼食摂取率"), 80), step=10)
+                    with m3:
+                        dinner = st.slider("夕食", 0, 100, safe_int(row.get("夕食摂取率"), 80), step=10)
+
+                    family_memo = st.text_area("家族共有メモ", value=clean_text(row.get("家族共有メモ", "")))
+                    changes = st.text_area("気になる変化", value=clean_text(row.get("気になる変化", "")))
+                    staff = st.text_input("入力者", value=clean_text(row.get("入力者", "")))
+
+                    update_submit = st.form_submit_button("更新する")
+
+                if update_submit:
+                    record = {
+                        "記録日": key_date,
+                        "利用者名": key_user,
+                        "体温": temp,
+                        "血圧上": bp_high,
+                        "血圧下": bp_low,
+                        "脈拍": pulse,
+                        "SpO2": spo2,
+                        "体重": weight,
+                        "朝食摂取率": breakfast,
+                        "昼食摂取率": lunch,
+                        "夕食摂取率": dinner,
+                        "朝食摂取区分": meal_option_from_percent(breakfast),
+                        "昼食摂取区分": meal_option_from_percent(lunch),
+                        "夕食摂取区分": meal_option_from_percent(dinner),
+                        "水分摂取量ml": clean_text(row.get("水分摂取量ml", "")),
+                        "栄養リスク": clean_text(row.get("栄養リスク", "")),
+                        "口腔状態": clean_text(row.get("口腔状態", "")),
+                        "義歯使用": clean_text(row.get("義歯使用", "")),
+                        "LIFE補助メモ": clean_text(row.get("LIFE補助メモ", "")),
+                        "家族共有メモ": family_memo,
+                        "気になる変化": changes,
+                        "登録日時": format_now_jst("%Y-%m-%d %H:%M:%S"),
+                        "入力者": staff,
+                    }
+                    action = upsert_health_record(record)
+                    try:
+                        add_audit_log("健康チェック更新", SQLITE_TABLE_HEALTH, f"{key_date}_{key_user}", "過去データ管理から更新")
+                    except Exception:
+                        pass
+                    st.success(f"{action}しました。")
+                    st.rerun()
+
+                st.warning("削除すると元に戻せません。")
+                delete_check = st.checkbox("この健康チェックデータを削除する")
+
+                if st.button("削除する"):
+                    if not delete_check:
+                        st.error("削除する場合は確認チェックを入れてください。")
+                    else:
+                        health_df = health_df.drop(index=idx).reset_index(drop=True)
+                        save_health_data(health_df)
+                        try:
+                            add_audit_log("健康チェック削除", SQLITE_TABLE_HEALTH, f"{key_date}_{key_user}", "過去データ管理から削除")
+                        except Exception:
+                            pass
+                        st.success("削除しました。")
+                        st.rerun()
+
+            st.divider()
+            st.subheader("一覧検索")
+
+            health_df = load_health_data()
+            if not health_df.empty:
+                health_df["記録日"] = pd.to_datetime(health_df["記録日"], errors="coerce")
+                year = st.number_input("年", min_value=2024, max_value=2035, value=today_jst().year, step=1, key="past_health_year")
+                month = st.number_input("月", min_value=1, max_value=12, value=today_jst().month, step=1, key="past_health_month")
+                user_filter = st.selectbox("利用者で絞り込み", ["全員"] + all_users, key="past_health_filter_user")
+
+                result = health_df[
+                    (health_df["記録日"].dt.year == int(year))
+                    & (health_df["記録日"].dt.month == int(month))
+                ]
+                if user_filter != "全員":
+                    result = result[result["利用者名"] == user_filter]
+
+                st.dataframe(result.sort_values(["記録日", "利用者名"]), use_container_width=True, hide_index=True)
+                st.download_button(
+                    "この一覧をExcelでダウンロード",
+                    data=to_excel_download(result.sort_values(["記録日", "利用者名"])),
+                    file_name=f"health_records_{int(year)}_{int(month):02d}.xlsx",
+                    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                    use_container_width=True,
+                )
+
+    # ---------------------------------
+    # 入力状況：健康・排泄・短期目標・申し送りの入力有無
+    # ---------------------------------
+    elif data_mode == "入力状況":
+        st.subheader("入力状況")
+        st.caption("指定日の健康チェック、排泄チェック、日々の実施チェック、業務全体申し送りの入力状況を一覧で確認します。")
+
+        target_day = st.date_input("確認日", value=today_jst(), key="past_input_status_date")
+        user_filter = st.selectbox("利用者で絞り込み", ["全員"] + all_users, key="past_input_status_user")
+
+        health_df = load_health_data()
+        ex_df = load_excretion_data()
+        goal_check_df = load_short_goal_check_data() if "load_short_goal_check_data" in globals() else pd.DataFrame(columns=SHORT_GOAL_CHECK_COLUMNS)
+        handover_df = load_business_handover_data()
+
+        if not health_df.empty:
+            health_df["記録日"] = pd.to_datetime(health_df["記録日"], errors="coerce")
+        if not ex_df.empty:
+            ex_df["記録日"] = pd.to_datetime(ex_df["記録日"], errors="coerce")
+        if not goal_check_df.empty:
+            goal_check_df["日付"] = pd.to_datetime(goal_check_df["日付"], errors="coerce")
+        if not handover_df.empty:
+            handover_df["日付"] = pd.to_datetime(handover_df["日付"], errors="coerce")
+
+        target_users = all_users if user_filter == "全員" else [user_filter]
+        status_rows = []
+        for user_name in target_users:
+            h_hit = pd.DataFrame()
+            e_hit = pd.DataFrame()
+            g_hit = pd.DataFrame()
+
+            if not health_df.empty:
+                h_hit = health_df[
+                    (health_df["記録日"].dt.date == target_day)
+                    & (health_df["利用者名"].astype(str) == str(user_name))
+                ]
+
+            if not ex_df.empty:
+                e_hit = ex_df[
+                    (ex_df["記録日"].dt.date == target_day)
+                    & (ex_df["利用者名"].astype(str) == str(user_name))
+                ]
+
+            if not goal_check_df.empty:
+                g_hit = goal_check_df[
+                    (goal_check_df["日付"].dt.date == target_day)
+                    & (goal_check_df["利用者名"].astype(str) == str(user_name))
+                ]
+
+            status_rows.append({
+                "確認日": target_day.strftime("%Y-%m-%d"),
+                "利用者名": user_name,
+                "健康チェック": "入力済" if not h_hit.empty else "未入力",
+                "排泄チェック": f"{len(e_hit)}件" if not e_hit.empty else "未入力",
+                "日々の実施チェック": f"{len(g_hit)}件" if not g_hit.empty else "未入力",
+                "健康メモ": "あり" if (not h_hit.empty and h_hit.get("気になる変化", pd.Series(dtype=str)).astype(str).str.strip().ne("").any()) else "",
+            })
+
+        status_df = pd.DataFrame(status_rows)
+        handover_count = 0
+        if not handover_df.empty:
+            handover_count = len(handover_df[handover_df["日付"].dt.date == target_day])
+
+        c1, c2, c3, c4 = st.columns(4)
+        with c1:
+            st.metric("健康チェック入力済", int((status_df["健康チェック"] == "入力済").sum()))
+        with c2:
+            st.metric("健康チェック未入力", int((status_df["健康チェック"] == "未入力").sum()))
+        with c3:
+            st.metric("排泄記録あり", int((status_df["排泄チェック"] != "未入力").sum()))
+        with c4:
+            st.metric("当日の申し送り", handover_count)
+
+        st.dataframe(status_df, use_container_width=True, hide_index=True)
+        st.download_button(
+            "入力状況をExcelでダウンロード",
+            data=to_excel_download(status_df),
+            file_name=f"input_status_{target_day.strftime('%Y%m%d')}.xlsx",
+            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            use_container_width=True,
+        )
+
+        with st.expander("当日の業務全体申し送りを確認", expanded=False):
+            if handover_df.empty:
+                st.info("申し送りデータはありません。")
+            else:
+                view_handover = handover_df[handover_df["日付"].dt.date == target_day].copy()
+                if view_handover.empty:
+                    st.info("この日の申し送りはありません。")
+                else:
+                    st.dataframe(view_handover, use_container_width=True, hide_index=True)
+
+    # ---------------------------------
+    # 注意記録：条件マスタに基づく抽出結果
+    # ---------------------------------
+    elif data_mode == "注意記録":
+        st.subheader("注意記録")
+        st.caption("条件設定マスタに基づいて、健康チェック・排泄チェックから注意候補を抽出します。診断ではなく、申し送り候補の確認です。")
+
+        target_day = st.date_input("抽出日", value=today_jst(), key="past_alert_date")
+        alert_df = build_handover_alerts_by_condition(target_day)
+
+        if alert_df.empty:
+            st.info("この日の条件該当者はありません。")
+        else:
+            f1, f2 = st.columns(2)
+            with f1:
+                severity_filter = st.selectbox("重要度で絞り込み", ["すべて"] + sorted(alert_df["重要度"].dropna().astype(str).unique().tolist()), key="past_alert_severity")
+            with f2:
+                user_filter = st.selectbox("利用者で絞り込み", ["全員"] + sorted(alert_df["利用者名"].dropna().astype(str).unique().tolist()), key="past_alert_user")
+
+            view = alert_df.copy()
+            if severity_filter != "すべて":
+                view = view[view["重要度"].astype(str) == severity_filter]
+            if user_filter != "全員":
+                view = view[view["利用者名"].astype(str) == user_filter]
+
+            severity_order = {"至急": 0, "注意": 1, "観察": 2, "通常": 3}
+            view["_order"] = view["重要度"].map(severity_order).fillna(9)
+            view = view.sort_values(["_order", "利用者名", "分類", "条件名"]).drop(columns=["_order"])
+
+            st.dataframe(view, use_container_width=True, hide_index=True)
+
+            st.markdown("#### 申し送り文プレビュー")
+            st.info(build_business_handover_auto_extract_text(target_day))
+
+            st.download_button(
+                "注意記録をExcelでダウンロード",
+                data=to_excel_download(view),
+                file_name=f"alert_records_{pd.to_datetime(target_day).strftime('%Y%m%d')}.xlsx",
+                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                use_container_width=True,
+            )
+
+    # ---------------------------------
+    # 業務全体申し送り：検索・更新・削除
+    # ---------------------------------
+    elif data_mode == "業務全体申し送り":
+        st.subheader("業務全体申し送り")
+        st.caption("業務全体申し送りを、日付・勤務帯・優先度・対応状況で検索し、必要に応じて更新・削除します。")
+
+        df = load_business_handover_data()
+
+        if df.empty:
+            st.info("まだ業務全体申し送りは登録されていません。")
+        else:
+            work = df.copy()
+            work["日付"] = pd.to_datetime(work["日付"], errors="coerce")
+
+            c1, c2, c3 = st.columns(3)
+            with c1:
+                from_day = st.date_input("開始日", value=today_jst() - timedelta(days=30), key="past_handover_from")
+            with c2:
+                to_day = st.date_input("終了日", value=today_jst(), key="past_handover_to")
+            with c3:
+                keyword = st.text_input("キーワード", key="past_handover_keyword", placeholder="申し送り・要確認事項など")
+
+            c4, c5, c6 = st.columns(3)
+            with c4:
+                shift_filter = st.selectbox("勤務帯", ["すべて"] + sorted([x for x in work["勤務帯"].dropna().astype(str).unique().tolist() if x]), key="past_handover_shift")
+            with c5:
+                priority_filter = st.selectbox("優先度", ["すべて"] + sorted([x for x in work["優先度"].dropna().astype(str).unique().tolist() if x]), key="past_handover_priority")
+            with c6:
+                status_filter = st.selectbox("対応状況", ["すべて"] + sorted([x for x in work["対応状況"].dropna().astype(str).unique().tolist() if x]), key="past_handover_status")
+
+            result = work[
+                (work["日付"].dt.date >= from_day)
+                & (work["日付"].dt.date <= to_day)
+            ].copy()
+
+            if shift_filter != "すべて":
+                result = result[result["勤務帯"].astype(str) == shift_filter]
+            if priority_filter != "すべて":
+                result = result[result["優先度"].astype(str) == priority_filter]
+            if status_filter != "すべて":
+                result = result[result["対応状況"].astype(str) == status_filter]
+            if clean_text(keyword):
+                kw = clean_text(keyword)
+                search_cols = ["全体申し送り", "要確認事項", "Excel自動抽出情報", "入力Excel表示情報", "記入者"]
+                mask = pd.Series(False, index=result.index)
+                for col in search_cols:
+                    if col in result.columns:
+                        mask = mask | result[col].astype(str).str.contains(kw, case=False, na=False)
+                result = result[mask]
+
+            st.dataframe(result.sort_values(["日付", "記録日時"], ascending=[False, False]), use_container_width=True, hide_index=True)
+
+            st.download_button(
+                "申し送り一覧をExcelでダウンロード",
+                data=to_excel_download(result.sort_values(["日付", "記録日時"], ascending=[False, False])),
+                file_name=f"business_handover_{from_day.strftime('%Y%m%d')}_{to_day.strftime('%Y%m%d')}.xlsx",
+                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                use_container_width=True,
+            )
+
+            st.divider()
+            st.markdown("#### 選択した申し送りを更新・削除")
+
+            if result.empty:
+                st.info("更新・削除できる対象がありません。")
+            else:
+                result_ids = result["記録ID"].astype(str).tolist()
+                selected_id = st.selectbox("対象の記録ID", result_ids, key="past_handover_selected_id")
+                selected = df[df["記録ID"].astype(str) == str(selected_id)]
+
+                if selected.empty:
+                    st.error("対象データが見つかりません。")
+                else:
+                    row = selected.iloc[-1]
+                    with st.form("past_handover_update_form"):
+                        uc1, uc2, uc3 = st.columns(3)
+                        with uc1:
+                            edit_date = st.date_input("日付", value=pd.to_datetime(row.get("日付"), errors="coerce").date() if not pd.isna(pd.to_datetime(row.get("日付"), errors="coerce")) else today_jst(), key="past_handover_edit_date")
+                        with uc2:
+                            edit_shift = st.selectbox("勤務帯", ["日勤", "夜勤"], index=0 if clean_text(row.get("勤務帯"), "日勤") == "日勤" else 1, key="past_handover_edit_shift")
+                        with uc3:
+                            edit_priority = st.selectbox("優先度", ["通常", "注意", "至急"], index=["通常", "注意", "至急"].index(clean_text(row.get("優先度"), "通常")) if clean_text(row.get("優先度"), "通常") in ["通常", "注意", "至急"] else 0, key="past_handover_edit_priority")
+
+                        edit_writer = st.text_input("記入者", value=clean_text(row.get("記入者", "")), key="past_handover_edit_writer")
+                        edit_status = st.selectbox(
+                            "対応状況",
+                            ["未対応", "対応中", "完了", "共有のみ"],
+                            index=["未対応", "対応中", "完了", "共有のみ"].index(clean_text(row.get("対応状況"), "未対応")) if clean_text(row.get("対応状況"), "未対応") in ["未対応", "対応中", "完了", "共有のみ"] else 0,
+                            key="past_handover_edit_status",
+                        )
+                        edit_main = st.text_area("全体申し送り", value=clean_text(row.get("全体申し送り", "")), height=120, key="past_handover_edit_main")
+                        edit_confirm = st.text_area("要確認事項", value=clean_text(row.get("要確認事項", "")), height=120, key="past_handover_edit_confirm")
+                        edit_auto = st.text_area("Excel自動抽出情報", value=clean_text(row.get("Excel自動抽出情報", "")), height=150, key="past_handover_edit_auto")
+                        update_handover_submit = st.form_submit_button("申し送りを更新する", type="primary", use_container_width=True)
+
+                    if update_handover_submit:
+                        update_df = load_business_handover_data()
+                        mask = update_df["記録ID"].astype(str) == str(selected_id)
+                        if not mask.any():
+                            st.error("更新対象の記録が見つかりません。")
+                        else:
+                            update_df.loc[mask, "日付"] = pd.to_datetime(edit_date)
+                            update_df.loc[mask, "勤務帯"] = edit_shift
+                            update_df.loc[mask, "記入者"] = edit_writer
+                            update_df.loc[mask, "優先度"] = edit_priority
+                            update_df.loc[mask, "対応状況"] = edit_status
+                            update_df.loc[mask, "全体申し送り"] = edit_main
+                            update_df.loc[mask, "要確認事項"] = edit_confirm
+                            update_df.loc[mask, "Excel自動抽出情報"] = edit_auto
+                            update_df.loc[mask, "記録日時"] = format_now_jst("%Y-%m-%d %H:%M:%S")
+                            save_business_handover_data(update_df)
+                            try:
+                                add_audit_log("申し送り更新", SQLITE_TABLE_HANDOVER, selected_id, "過去データ管理から更新")
+                            except Exception:
+                                pass
+                            st.success("申し送りを更新しました。")
+                            st.rerun()
+
+                    st.warning("削除すると元に戻せません。")
+                    delete_handover_check = st.checkbox("この申し送りを削除する", key="past_handover_delete_check")
+                    if st.button("選択した申し送りを削除する", disabled=not delete_handover_check, key="past_handover_delete_button"):
+                        delete_df = load_business_handover_data()
+                        before_count = len(delete_df)
+                        delete_df = delete_df[delete_df["記録ID"].astype(str) != str(selected_id)].copy()
+                        if len(delete_df) == before_count:
+                            st.error("削除対象が見つかりません。")
+                        else:
+                            save_business_handover_data(delete_df)
+                            try:
+                                add_audit_log("申し送り削除", SQLITE_TABLE_HANDOVER, selected_id, "過去データ管理から削除")
+                            except Exception:
+                                pass
+                            st.success("申し送りを削除しました。")
+                            st.rerun()
+
+
+# =========================
+# 排泄詳細管理
+# =========================
+elif menu == "排泄詳細管理":
+    if st.session_state.role != "admin":
+        st.error("この画面は管理者専用です。")
+        st.stop()
+
+    st.header("排泄詳細管理")
+    st.caption("排泄チェックデータを、記録日＋利用者名＋時間帯で管理します。")
+
+    ex_df = load_excretion_data()
+
+    if ex_df.empty:
+        st.info("まだ排泄チェックデータがありません。")
+        st.stop()
+
+    col1, col2, col3 = st.columns(3)
+    with col1:
+        ex_user = st.selectbox("利用者", ["全員"] + all_users, key="ex_admin_user")
+    with col2:
+        start_date = st.date_input("開始日", value=today_jst(), key="ex_admin_start")
+    with col3:
+        end_date = st.date_input("終了日", value=today_jst(), key="ex_admin_end")
+
+    work = ex_df.copy()
+    work["記録日"] = pd.to_datetime(work["記録日"], errors="coerce")
+    work = work[
+        (work["記録日"].dt.date >= start_date)
+        & (work["記録日"].dt.date <= end_date)
+    ]
+
+    if ex_user != "全員":
+        work = work[work["利用者名"] == ex_user]
+
+    st.subheader("排泄サマリー")
+    if work.empty:
+        st.warning("該当する排泄データがありません。")
+    else:
+        summary_rows = []
+        for user in work["利用者名"].dropna().unique():
+            user_df = work[work["利用者名"] == user]
+            s = summarize_excretion(user_df)
+            summary_rows.append({
+                "利用者名": user,
+                "記録数": len(user_df),
+                "排尿回数": s["排尿回数"],
+                "排便回数": s["排便回数"],
+                "濃縮尿": s["濃縮尿"],
+                "下痢便": s["下痢便"],
+                "水様便": s["水様便"],
+                "排便なし枠": s["排便なし枠"],
+            })
+        st.dataframe(pd.DataFrame(summary_rows), use_container_width=True, hide_index=True)
+
+        st.subheader("注意して確認したい排泄記録")
+        alert = work[
+            (work["尿性状"] == "濃縮尿")
+            | (work["便性状"].isin(["下痢便", "水様便"]))
+        ]
+
+        if alert.empty:
+            st.success("指定期間内に、濃縮尿・下痢便・水様便の記録はありません。")
+        else:
+            st.warning("確認したい排泄記録があります。")
+            st.dataframe(alert, use_container_width=True, hide_index=True)
+
+        st.subheader("時系列の排泄詳細")
+        slot_order = {slot: i for i, (slot, _) in enumerate(EXCRETION_SLOTS)}
+        work["_slot_order"] = work["時間帯"].map(slot_order).fillna(99)
+        work = work.sort_values(["記録日", "利用者名", "_slot_order"]).drop(columns=["_slot_order"])
+        st.dataframe(work, use_container_width=True, hide_index=True)
+
+        csv = work.to_csv(index=False).encode("utf-8-sig")
+        st.download_button(
+            "排泄詳細CSVをダウンロード",
+            data=csv,
+            file_name="排泄詳細データ.csv",
+            mime="text/csv",
+        )
+
+        st.subheader("管理者向け確認メモ")
+        memo_lines = [
+            "排泄詳細データをもとにした管理者確認メモです。",
+            "医療判断ではなく、職員間の共有と見守り方針の整理に使用してください。",
+            "",
+        ]
+
+        for _, row in pd.DataFrame(summary_rows).iterrows():
+            memo_lines.append(
+                f"■ {row['利用者名']}：排尿{row['排尿回数']}回、排便{row['排便回数']}回、"
+                f"濃縮尿{row['濃縮尿']}回、下痢便{row['下痢便']}回、水様便{row['水様便']}回。"
+            )
+
+        st.text_area("確認メモ", value="\n".join(memo_lines), height=260)
+
+    st.divider()
+    st.subheader("排泄データの更新・削除")
+
+    c1, c2, c3 = st.columns(3)
+    with c1:
+        key_date = st.date_input("更新対象日", value=today_jst(), key="ex_edit_date")
+    with c2:
+        key_user = st.selectbox("更新対象利用者", all_users, key="ex_edit_user")
+    with c3:
+        key_slot = st.selectbox("時間帯", [slot for slot, _ in EXCRETION_SLOTS], key="ex_edit_slot")
+
+    current = get_excretion_row(load_excretion_data(), key_date, key_user, key_slot)
+
+    if current is None:
+        st.info("このキーの排泄データはありません。")
+    else:
+        st.success("該当する排泄データがあります。")
+
+    with st.form("ex_edit_form"):
+        time_label = dict(EXCRETION_SLOTS).get(key_slot, "")
+
+        urine_amount = st.selectbox(
+            "尿量",
+            URINE_AMOUNT_OPTIONS,
+            index=get_option_index(URINE_AMOUNT_OPTIONS, current.get("尿量", "なし") if current is not None else "なし"),
+        )
+        urine_type = st.selectbox(
+            "尿性状",
+            URINE_TYPE_OPTIONS,
+            index=get_option_index(URINE_TYPE_OPTIONS, current.get("尿性状", "なし") if current is not None else "なし"),
+        )
+        stool_amount = st.selectbox(
+            "便量",
+            STOOL_AMOUNT_OPTIONS,
+            index=get_option_index(STOOL_AMOUNT_OPTIONS, current.get("便量", "なし") if current is not None else "なし"),
+        )
+        stool_type = st.selectbox(
+            "便性状",
+            STOOL_TYPE_OPTIONS,
+            index=get_option_index(STOOL_TYPE_OPTIONS, current.get("便性状", "なし") if current is not None else "なし"),
+        )
+        memo = st.text_area("排泄メモ", value=current.get("排泄メモ", "") if current is not None else "")
+        staff = st.text_input("入力者", value=current.get("入力者", "") if current is not None else "")
+
+        submit = st.form_submit_button("登録・更新する")
+
+    if submit:
+        if urine_amount == "なし":
+            urine_type = "なし"
+        if stool_amount == "なし":
+            stool_type = "なし"
+
+        record = {
+            "記録日": key_date,
+            "利用者名": key_user,
+            "時間帯": key_slot,
+            "時間帯目安": time_label,
+            "尿量": urine_amount,
+            "尿性状": urine_type,
+            "便量": stool_amount,
+            "便性状": stool_type,
+            "排泄メモ": memo,
+            "入力者": staff,
+            "登録日時": format_now_jst("%Y-%m-%d %H:%M:%S"),
+        }
+        action = upsert_excretion_record(record)
+        st.success(f"排泄データを{action}しました。")
+        st.rerun()
+
+    if current is not None:
+        delete_check = st.checkbox("この排泄データを削除する")
+        if st.button("排泄データを削除する"):
+            if not delete_check:
+                st.error("削除する場合は確認チェックを入れてください。")
+            else:
+                ex_df = load_excretion_data()
+                idx = find_excretion_index(ex_df, key_date, key_user, key_slot)
+                if idx is not None:
+                    ex_df = ex_df.drop(index=idx).reset_index(drop=True)
+                    save_excretion_data(ex_df)
+                    st.success("削除しました。")
+                    st.rerun()
+
+
+# =========================
+# 家族向けレポート作成
+# =========================
+elif menu == "家族向けレポート作成":
+    if st.session_state.role != "admin":
+        st.error("この画面は管理者専用です。")
+        st.stop()
+
+    st.header("家族向けレポート作成")
+
+    if not all_users:
+        st.warning("利用者が登録されていません。")
+        st.stop()
+
+    col1, col2, col3 = st.columns(3)
+    with col1:
+        report_user = st.selectbox("利用者", all_users, key="family_report_user")
+    with col2:
+        report_year = st.number_input("対象年", min_value=2024, max_value=2035, value=today_jst().year, step=1)
+    with col3:
+        report_month = st.number_input("対象月", min_value=1, max_value=12, value=today_jst().month, step=1)
+
+    health_df = load_health_data()
+    ex_df = load_excretion_data()
+
+    report_text = create_family_summary_text(health_df, ex_df, report_user, report_year, report_month)
+    st.text_area("家族向け文章", value=report_text, height=420)
+
+    ex_target = get_month_excretion_data(ex_df, report_user, report_year, report_month)
+    with st.expander("排泄記録を確認する"):
+        if ex_target.empty:
+            st.info("対象月の排泄記録はありません。")
+        else:
+            st.dataframe(ex_target, use_container_width=True, hide_index=True)
+
+
+# =========================
+# ひだまりレポートPDF
+# =========================
+elif menu == "ひだまりレポートPDF":
+    if st.session_state.role != "admin":
+        st.error("この画面は管理者専用です。")
+        st.stop()
+
+    st.header("ひだまりレポートPDF")
+
+    if not all_users:
+        st.warning("利用者が登録されていません。")
+        st.stop()
+
+    col1, col2, col3 = st.columns(3)
+    with col1:
+        pdf_user = st.selectbox("利用者", all_users, key="pdf_user")
+    with col2:
+        pdf_year = st.number_input("対象年", min_value=2024, max_value=2035, value=today_jst().year, step=1, key="pdf_year")
+    with col3:
+        pdf_month = st.number_input("対象月", min_value=1, max_value=12, value=today_jst().month, step=1, key="pdf_month")
+
+    if st.button("ひだまりレポートPDFを作成する"):
+        try:
+            path = create_hidamari_pdf(load_health_data(), load_excretion_data(), pdf_user, pdf_year, pdf_month)
+            with open(path, "rb") as f:
+                st.download_button(
+                    "PDFをダウンロード",
+                    data=f,
+                    file_name=path.name,
+                    mime="application/pdf",
+                )
+            st.success("PDFを作成しました。")
+        except Exception as e:
+            st.error(f"PDF作成中にエラーが発生しました：{e}")
+
+
+# =========================
+# 管理者支援
+# =========================
+elif menu == "管理者支援":
+    if st.session_state.role != "admin":
+        st.error("この画面は管理者専用です。")
+        st.stop()
+
+    st.header("管理者支援")
+    health_df = load_health_data()
+    ex_df = load_excretion_data()
+
+    tab1, tab2, tab3, tab4, tab5, tab6, tab7, tab8 = st.tabs([
+        "AI家族レポート",
+        "バイタル推移グラフ",
+        "気になる変化",
+        "ChatGPT連携",
+        "申し送り支援",
+        "注意通知",
+        "条件設定マスタ変更",
+        "体重未測定確認",
+    ])
+
+    with tab1:
+        st.subheader("AI家族レポート自動文章")
+        col1, col2, col3 = st.columns(3)
+        with col1:
+            ai_user = st.selectbox("利用者", all_users, key="ai_user")
+        with col2:
+            ai_year = st.number_input("対象年", min_value=2024, max_value=2035, value=today_jst().year, step=1, key="ai_year")
+        with col3:
+            ai_month = st.number_input("対象月", min_value=1, max_value=12, value=today_jst().month, step=1, key="ai_month")
+
+        summary = create_family_summary_text(health_df, ex_df, ai_user, ai_year, ai_month)
+        st.text_area("家族向け文章", value=summary, height=360)
+
+    with tab2:
+        st.subheader("バイタル推移グラフ")
+        if health_df.empty:
+            st.info("データがありません。")
+        else:
+            col1, col2, col3, col4 = st.columns(4)
+            with col1:
+                graph_user = st.selectbox("利用者", all_users, key="graph_user")
+            with col2:
+                graph_item = st.selectbox("項目", ["体温", "血圧上", "血圧下", "脈拍", "SpO2", "体重", "朝食摂取率", "昼食摂取率", "夕食摂取率"], key="graph_item")
+            with col3:
+                graph_year = st.number_input("年", min_value=2024, max_value=2035, value=today_jst().year, step=1, key="graph_year")
+            with col4:
+                graph_month = st.number_input("月", min_value=1, max_value=12, value=today_jst().month, step=1, key="graph_month")
+
+            target = get_month_health_data(health_df, graph_user, graph_year, graph_month)
+            if target.empty:
+                st.warning("対象データがありません。")
+            else:
+                chart_df = target[["記録日", graph_item]].copy()
+                chart_df[graph_item] = pd.to_numeric(chart_df[graph_item], errors="coerce")
+                chart_df = chart_df.dropna()
+                chart_df = chart_df.set_index("記録日")
+                st.line_chart(chart_df)
+
+
+    with tab3:
+        st.subheader("気になる変化（日付別一覧）")
+        st.caption("健康チェック入力の『気になる変化』を、利用者・年月で絞り込み、日付ごとに確認できます。")
+
+        if health_df.empty:
+            st.info("健康チェックデータがありません。")
+        else:
+            col1, col2, col3 = st.columns(3)
+            with col1:
+                change_user = st.selectbox("利用者", all_users, key="change_user")
+            with col2:
+                change_year = st.number_input("年", min_value=2024, max_value=2035, value=today_jst().year, step=1, key="change_year")
+            with col3:
+                change_month = st.number_input("月", min_value=1, max_value=12, value=today_jst().month, step=1, key="change_month")
+
+            change_target = get_month_health_data(health_df, change_user, change_year, change_month)
+
+            if change_target.empty:
+                st.warning("対象月の健康チェックデータがありません。")
+            else:
+                change_rows = change_target.copy()
+                change_rows["気になる変化"] = change_rows["気になる変化"].fillna("").astype(str).str.strip()
+                change_rows = change_rows[change_rows["気になる変化"] != ""]
+
+                if change_rows.empty:
+                    st.success("対象月に『気になる変化』の記録はありません。")
+                else:
+                    change_rows = change_rows.sort_values("記録日")
+                    display_df = change_rows[["記録日", "利用者名", "気になる変化", "家族共有メモ", "入力者", "登録日時"]].copy()
+                    display_df["日付"] = pd.to_datetime(display_df["記録日"], errors="coerce").dt.strftime("%Y/%m/%d")
+                    display_df = display_df[["日付", "利用者名", "気になる変化", "家族共有メモ", "入力者", "登録日時"]]
+
+                    st.warning(f"{change_user} の {int(change_year)}年{int(change_month)}月に、気になる変化が {len(display_df)} 件あります。")
+                    st.dataframe(display_df, use_container_width=True, hide_index=True)
+
+                    st.markdown("#### 日付ごとの確認メモ")
+                    memo_lines = []
+                    for _, row in display_df.iterrows():
+                        date_label = clean_text(row.get("日付", ""))
+                        change_text = clean_text(row.get("気になる変化", ""))
+                        family_text = clean_text(row.get("家族共有メモ", ""))
+                        staff_text = clean_text(row.get("入力者", ""))
+
+                        st.markdown(
+                            f"""
+                            <div style='background:#FFF8E8; border:1px solid #E5C782; border-radius:14px; padding:12px 14px; margin:8px 0;'>
+                                <b>{date_label}</b><br>
+                                <span style='color:#7A4A00;'>気になる変化：</span>{change_text}<br>
+                                <span style='color:#666;'>家族共有メモ：</span>{family_text if family_text else '記録なし'}<br>
+                                <span style='color:#888; font-size:0.9rem;'>入力者：{staff_text if staff_text else '未入力'}</span>
+                            </div>
+                            """,
+                            unsafe_allow_html=True,
+                        )
+
+                        memo_lines.append(
+                            f"{date_label}\n"
+                            f"気になる変化：{change_text}\n"
+                            f"家族共有メモ：{family_text if family_text else '記録なし'}\n"
+                            f"入力者：{staff_text if staff_text else '未入力'}"
+                        )
+
+                    export_text = f"{change_user}　{int(change_year)}年{int(change_month)}月　気になる変化一覧\n\n" + "\n\n".join(memo_lines)
+                    st.text_area("コピー用テキスト", value=export_text, height=260)
+                    st.download_button(
+                        "気になる変化一覧をテキストでダウンロード",
+                        data=export_text.encode("utf-8-sig"),
+                        file_name=f"気になる変化一覧_{change_user}_{int(change_year)}年{int(change_month)}月.txt",
+                        mime="text/plain",
+                        use_container_width=True,
+                    )
+
+    with tab4:
+        st.subheader("ChatGPT連携用プロンプト")
+        col1, col2, col3 = st.columns(3)
+        with col1:
+            prompt_user = st.selectbox("利用者", all_users, key="prompt_user")
+        with col2:
+            prompt_year = st.number_input("年", min_value=2024, max_value=2035, value=today_jst().year, step=1, key="prompt_year")
+        with col3:
+            prompt_month = st.number_input("月", min_value=1, max_value=12, value=today_jst().month, step=1, key="prompt_month")
+
+        target_h = get_month_health_data(health_df, prompt_user, prompt_year, prompt_month)
+        target_e = get_month_excretion_data(ex_df, prompt_user, prompt_year, prompt_month)
+
+        prompt = f"""あなたは介護施設の家族向けレポートを整える文章整理係です。
+以下の健康チェック記録・排泄記録・アセスメント情報をもとに、ご家族へ渡す月間レポート文を作成してください。
+
+【重要ルール】
+・医療判断、診断、治療効果の断定はしない。
+・「問題ありません」「改善しました」「安心です」と断定しない。
+・記録に基づく表現にする。
+・不安を煽らず、やわらかく丁寧な文章にする。
+
+【利用者】
+{prompt_user}
+
+【アセスメント情報】
+{build_assessment_context_text(prompt_user)}
+
+【健康チェック記録】
+{target_h.to_string(index=False)}
+
+【排泄記録】
+{target_e.to_string(index=False)}
+"""
+        st.text_area("プロンプト", value=prompt, height=520)
+
+    with tab5:
+        st.subheader("申し送り支援")
+        target_date = st.date_input("対象日", value=today_jst(), key="handover_date")
+        handover = create_handover_text(health_df, ex_df, target_date)
+        st.text_area("申し送り案", value=handover, height=360)
+
+    with tab6:
+        st.subheader("注意通知")
+        alert_date = st.date_input("注意通知の対象日", value=today_jst(), key="alert_date")
+        alert_df = build_handover_alerts_by_condition(alert_date)
+
+        if alert_df.empty:
+            st.success("対象日の注意通知はありません。")
+        else:
+            st.warning("条件設定マスタに該当する注意通知があります。")
+            st.dataframe(alert_df, use_container_width=True, hide_index=True)
+
+        st.caption("注意通知は診断ではなく、条件設定マスタと記録に基づく確認支援です。")
+
+
+    with tab7:
+        st.subheader("条件設定マスタ変更")
+        st.caption("未排便・発熱・SpO2低下・食事量低下など、業務全体申し送りや注意通知で使う抽出条件を管理します。")
+        show_alert_condition_master_menu()
+
+    with tab8:
+        st.subheader("体重未測定確認")
+        st.caption("体重は測定した日だけ入力します。14日以上測定が空いている場合だけ確認対象にします。")
+        check_day = st.date_input("確認日", value=today_jst(), key="weight_overdue_check_day")
+        show_latest_weight_block(health_df, all_users, check_day)
+        show_weight_overdue_block(health_df, all_users, check_day, threshold_days=14)
+
+
+# =========================
+# 利用者マスタ管理
+# =========================
+elif menu == "メニューカテゴリ設定":
+    show_menu_category_settings_menu()
+
+elif menu == "システム設定":
+    show_system_settings_menu()
+
+elif menu == "データダウンロード":
+    show_admin_data_download_menu()
+
+elif menu == "利用者マスタ管理":
+    if st.session_state.role != "admin":
+        st.error("この画面は管理者専用です。")
+        st.stop()
+
+    st.header("利用者マスタ管理")
+    st.caption("利用者の追加・非表示・アセスメント情報の登録管理ができます。")
+
+    df_users = load_users(include_hidden=True)
+
+    st.subheader("現在の利用者一覧")
+    st.dataframe(df_users, use_container_width=True, hide_index=True)
+
+    st.divider()
+    st.subheader("利用者を追加")
+
+    with st.form("add_user_form", clear_on_submit=True):
+        new_user = st.text_input("追加する利用者名", placeholder="例：田中様")
+        add_submit = st.form_submit_button("追加する")
+
+    if add_submit:
+        ok, msg = add_user(new_user)
+        if ok:
+            st.success(msg)
+            st.rerun()
+        else:
+            st.error(msg)
+
+    st.divider()
+    st.subheader("アセスメント情報の登録・更新")
+
+    if df_users.empty:
+        st.info("利用者が登録されていません。")
+    else:
+        selected_user = st.selectbox("アセスメントを編集する利用者", df_users["利用者名"].tolist(), key="assessment_user")
+        selected = df_users[df_users["利用者名"] == selected_user].iloc[0]
+
+        with st.form("assessment_form"):
+            values = {}
+            values["基本情報"] = st.text_area("基本情報（氏名・住所など）", value=clean_text(selected.get("基本情報", "")), height=80)
+            values["主訴"] = st.text_area("主訴（本人・家族の希望や困りごと）", value=clean_text(selected.get("主訴", "")), height=100)
+            values["生活状況"] = st.text_area("生活状況（1日の流れ）", value=clean_text(selected.get("生活状況", "")), height=120)
+            values["ADL"] = st.text_area("ADL（日常生活動作）", value=clean_text(selected.get("ADL", "")), height=100)
+            values["IADL"] = st.text_area("IADL（生活関連動作）", value=clean_text(selected.get("IADL", "")), height=100)
+            values["認知機能"] = st.text_area("認知機能（判断・記憶）", value=clean_text(selected.get("認知機能", "")), height=100)
+            values["健康状態"] = st.text_area("健康状態（疾患・服薬）", value=clean_text(selected.get("健康状態", "")), height=100)
+            values["課題"] = st.text_area("課題（支援が必要な問題点）", value=clean_text(selected.get("課題", "")), height=100)
+            values["支援内容"] = st.text_area("支援内容（具体的な対応）", value=clean_text(selected.get("支援内容", "")), height=100)
+            assessment_submit = st.form_submit_button("アセスメント情報を保存する")
+
+        if assessment_submit:
+            df_save = load_users(include_hidden=True)
+            mask = df_save["利用者名"] == selected_user
+            for col, value in values.items():
+                df_save.loc[mask, col] = value
+            save_users(df_save)
+            st.success("アセスメント情報を保存しました。")
+            st.rerun()
+
+    st.divider()
+    st.subheader("利用者を入力候補から外す")
+
+    visible_users = load_users(include_hidden=False)["利用者名"].tolist()
+
+    if visible_users:
+        target_user = st.selectbox("対象利用者", visible_users, key="hide_user")
+        st.warning("この操作は、入力画面の候補から外すだけです。過去データとアセスメント情報は削除されません。")
+
+        if st.button("入力候補から外す"):
+            ok, msg = hide_user(target_user)
+            if ok:
+                st.success(msg)
+                st.rerun()
+            else:
+                st.error(msg)
+
+    hidden_df = load_users(include_hidden=True)
+    hidden_df = hidden_df[hidden_df["表示"] == "非表示"]
+
+    st.subheader("非表示の利用者を戻す")
+
+    if not hidden_df.empty:
+        restore_user = st.selectbox("表示に戻す利用者", hidden_df["利用者名"].tolist(), key="restore_user")
+        if st.button("表示に戻す"):
+            ok, msg = add_user(restore_user)
+            if ok:
+                st.success(msg)
+                st.rerun()
+            else:
+                st.error(msg)
+    else:
+        st.info("非表示の利用者はいません。")
+
+    st.download_button(
+        "利用者マスタExcelをダウンロード",
+        data=export_user_master_excel_bytes(),
+        file_name="利用者マスタ.xlsx",
+        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+    )
+# =========================
+# 利用者ID移行チェック
+# =========================
+elif menu == "利用者ID移行チェック" and is_admin_user():
+    show_user_id_migration_check()
+elif menu == "利用者名ゆれ紐づけマスタ" and is_admin_user():
+    show_user_name_alias_master_menu()
+
+# =========================
+# ログイン・職員ID管理
+# =========================
+elif menu == "ログイン・職員ID管理" and is_admin_user():
+    show_login_user_management_menu()
+elif menu == "セキュリティ・保守管理" and is_admin_user():
+    # Streamlit magic が戻り値（DeltaGenerator）を画面表示しないよう、明示的に代入して呼び出す
+    _security_menu_result = show_security_maintenance_menu()
+    _security_menu_result = None
