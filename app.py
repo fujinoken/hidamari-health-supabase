@@ -229,13 +229,23 @@ db_read_dataframe = db_engine.db_read_dataframe
 
 # =========================
 # Supabase外部DB対応（Ver4.5）
-# 主要3機能だけ外部DB化：健康チェック／排泄チェック／業務全体申し送り
-# それ以外のテーブルは従来通り SQLite + バックアップ方式。
+# 正式方針：
+#   Supabase正本：users／health_records／excretion_records／handover_logs
+#   SQLite補助：その他テーブル＋Supabase成功後のミラー
+#   保存方式：upsert（全削除→全保存は行わない）
 # =========================
 SUPABASE_CORE_TABLES = {
-    "health_records": ["記録日", "利用者名"],
-    "excretion_records": ["記録日", "利用者名", "時間帯"],
+    "users": ["user_id"],
+    "health_records": ["記録日", "user_id"],
+    "excretion_records": ["記録日", "user_id", "時間帯"],
     "handover_logs": ["記録ID"],
+}
+
+SUPABASE_CORE_LABELS = {
+    "users": "利用者マスタ",
+    "health_records": "健康チェック",
+    "excretion_records": "排泄チェック",
+    "handover_logs": "業務全体申し送り",
 }
 
 _original_save_sqlite_table = db_engine.save_sqlite_table
@@ -275,33 +285,78 @@ def _sb_json_safe(value):
     return value
 
 
-def _supabase_config():
+def _secret_get(container, key, default=""):
+    """Streamlit Secretsのdict／AttrDict／通常属性を安全に読む。"""
+    if container is None:
+        return default
     try:
-        sb = st.secrets.get("supabase", {}) if hasattr(st, "secrets") else {}
+        value = container.get(key, default)
+        if value not in [None, ""]:
+            return value
     except Exception:
-        sb = {}
+        pass
+    try:
+        value = container[key]
+        if value not in [None, ""]:
+            return value
+    except Exception:
+        pass
+    try:
+        value = getattr(container, key)
+        if value not in [None, ""]:
+            return value
+    except Exception:
+        pass
+    return default
+
+
+def _supabase_config():
+    """
+    Streamlit Secretsを柔軟に読む。
+    推奨：
+        [supabase]
+        enabled = true
+        url = "https://xxxxx.supabase.co"
+        key = "sb_publishable_xxxxx"
+
+    互換：
+        SUPABASE_URL = "..."
+        SUPABASE_KEY = "..."
+    """
+    secrets = None
+    try:
+        secrets = st.secrets if hasattr(st, "secrets") else None
+    except Exception:
+        secrets = None
+
+    sb = _secret_get(secrets, "supabase", {})
 
     def pick(*keys):
         for key in keys:
-            try:
-                if isinstance(sb, dict) and sb.get(key):
-                    return str(sb.get(key)).strip()
-            except Exception:
-                pass
-            try:
-                if hasattr(st, "secrets") and st.secrets.get(key):
-                    return str(st.secrets.get(key)).strip()
-            except Exception:
-                pass
+            value = _secret_get(sb, key, "")
+            if value not in [None, ""]:
+                return str(value).strip().strip('"').strip("'")
+        for key in keys:
+            value = _secret_get(secrets, key, "")
+            if value not in [None, ""]:
+                return str(value).strip().strip('"').strip("'")
         return ""
 
     enabled_raw = pick("enabled", "SUPABASE_ENABLED")
     url = pick("url", "SUPABASE_URL")
     key = pick("key", "service_role_key", "anon_key", "SUPABASE_KEY", "SUPABASE_SERVICE_ROLE_KEY", "SUPABASE_ANON_KEY")
+
+    # Data API の /rest/v1/ まで貼ってしまった場合でも自動補正する
+    url = url.strip()
+    if "/rest/v1" in url:
+        url = url.split("/rest/v1")[0]
+    url = url.rstrip("/")
+
     enabled = str(enabled_raw).lower() in ["1", "true", "yes", "on", "有効"]
     if not enabled and url and key:
         enabled = True
-    return {"enabled": enabled, "url": url.rstrip("/"), "key": key}
+
+    return {"enabled": enabled, "url": url, "key": key}
 
 
 def supabase_is_enabled():
@@ -328,9 +383,33 @@ def _supabase_endpoint(table_name: str, query: str = ""):
 
 def _make_supabase_record_key(row: dict, table_name: str, unique_cols=None):
     cols = unique_cols or SUPABASE_CORE_TABLES.get(table_name, [])
+
+    # 利用者マスタは user_id を最優先
+    if table_name == "users":
+        user_id = _sb_clean(row.get("user_id"))
+        if user_id:
+            return user_id
+        user_name = _sb_clean(row.get("利用者名"))
+        if user_name and "make_user_id_from_name" in globals():
+            return make_user_id_from_name(user_name)
+
+    # 健康・排泄は user_id が空なら利用者名でフォールバック
+    if table_name in ["health_records", "excretion_records"]:
+        if "user_id" in cols and not _sb_clean(row.get("user_id")):
+            cols = ["記録日", "利用者名"] + (["時間帯"] if table_name == "excretion_records" else [])
+
     if not cols:
         cols = ["記録ID"] if "記録ID" in row else []
-    key = "__".join([_sb_clean(row.get(col)) for col in cols]).strip("_")
+
+    parts = []
+    for col in cols:
+        value = _sb_clean(row.get(col))
+        if col == "記録日":
+            dt = pd.to_datetime(value, errors="coerce")
+            value = dt.strftime("%Y-%m-%d") if not pd.isna(dt) else value
+        parts.append(value)
+
+    key = "__".join(parts).strip("_")
     return key or str(uuid.uuid4())
 
 
@@ -338,14 +417,19 @@ def _df_to_supabase_payload(df: pd.DataFrame, table_name: str, unique_cols=None)
     if df is None or df.empty:
         return []
     payload = []
-    for _, row in df.copy().iterrows():
+    work = df.copy()
+    for _, row in work.iterrows():
         data = {str(k): _sb_json_safe(v) for k, v in row.to_dict().items()}
         payload.append({
             "record_key": _make_supabase_record_key(data, table_name, unique_cols),
             "data": data,
             "updated_at": format_now_jst("%Y-%m-%dT%H:%M:%S+09:00") if "format_now_jst" in globals() else datetime.utcnow().isoformat(),
         })
-    return payload
+    # 同じrecord_keyがある場合は後勝ちにしてupsert対象を整理
+    dedup = {}
+    for item in payload:
+        dedup[item["record_key"]] = item
+    return list(dedup.values())
 
 
 def supabase_read_table(table_name: str, columns=None) -> pd.DataFrame:
@@ -376,39 +460,57 @@ def supabase_read_table(table_name: str, columns=None) -> pd.DataFrame:
         return _original_load_sqlite_table(table_name, columns or [])
 
 
-def supabase_replace_table(df: pd.DataFrame, table_name: str, columns=None, unique_cols=None) -> bool:
+def supabase_upsert_table(df: pd.DataFrame, table_name: str, columns=None, unique_cols=None) -> bool:
+    """
+    Ver4.5正式方式：upsert。
+    全削除→全保存は行わず、同じrecord_keyは更新、なければ追加する。
+    """
     if not supabase_is_enabled() or table_name not in SUPABASE_CORE_TABLES:
         return False
     try:
-        del_url = _supabase_endpoint(table_name, "?record_key=neq.__never_delete_marker__")
-        del_res = requests.delete(del_url, headers=_supabase_headers(), timeout=20)
-        del_res.raise_for_status()
         payload = _df_to_supabase_payload(df, table_name, unique_cols=unique_cols)
-        if payload:
-            post_url = _supabase_endpoint(table_name)
-            for i in range(0, len(payload), 500):
-                chunk = payload[i:i + 500]
-                post_res = requests.post(post_url, headers=_supabase_headers(), json=chunk, timeout=30)
-                post_res.raise_for_status()
+        if not payload:
+            return True
+
+        post_url = _supabase_endpoint(table_name, "?on_conflict=record_key")
+        headers = _supabase_headers(prefer="resolution=merge-duplicates,return=minimal")
+
+        for i in range(0, len(payload), 300):
+            chunk = payload[i:i + 300]
+            post_res = requests.post(post_url, headers=headers, json=chunk, timeout=30)
+            post_res.raise_for_status()
         return True
     except Exception as e:
         try:
-            st.error(f"Supabase保存に失敗しました。ローカルSQLiteへ保存します：{table_name} / {e}")
+            st.error(f"Supabase upsert保存に失敗しました。ローカルSQLiteへ保存します：{table_name} / {e}")
         except Exception:
             pass
         return False
 
 
+# 旧関数名との互換。内部はupsert方式。
+def supabase_replace_table(df: pd.DataFrame, table_name: str, columns=None, unique_cols=None) -> bool:
+    return supabase_upsert_table(df, table_name, columns=columns, unique_cols=unique_cols)
+
+
 def save_sqlite_table(df, table_name, columns, date_cols=None, unique_cols=None, sort_cols=None):
-    if table_name in SUPABASE_CORE_TABLES and supabase_replace_table(df, table_name, columns=columns, unique_cols=unique_cols):
-        try:
-            return _original_save_sqlite_table(df, table_name, columns, date_cols=date_cols, unique_cols=unique_cols, sort_cols=sort_cols)
-        except Exception:
-            return None
+    """
+    4つの基幹テーブルは Supabase を正本としてupsert保存。
+    保存成功後、SQLiteにもミラー保存する。
+    失敗時はSQLiteへ退避保存する。
+    """
+    if table_name in SUPABASE_CORE_TABLES:
+        ok = supabase_upsert_table(df, table_name, columns=columns, unique_cols=unique_cols)
+        # Supabase成功・失敗に関係なくSQLiteにも保存する（ミラー／退避）
+        return _original_save_sqlite_table(df, table_name, columns, date_cols=date_cols, unique_cols=unique_cols, sort_cols=sort_cols)
     return _original_save_sqlite_table(df, table_name, columns, date_cols=date_cols, unique_cols=unique_cols, sort_cols=sort_cols)
 
 
 def load_sqlite_table(table_name, columns, date_cols=None):
+    """
+    4つの基幹テーブルは Supabase 優先で読む。
+    Supabaseが未設定・失敗時だけSQLiteを読む。
+    """
     if table_name in SUPABASE_CORE_TABLES and supabase_is_enabled():
         return supabase_read_table(table_name, columns=columns)
     return _original_load_sqlite_table(table_name, columns, date_cols=date_cols)
@@ -423,18 +525,52 @@ def get_supabase_storage_status():
     if not cfg.get("enabled"):
         return "Supabase未有効：enabled=true を設定してください。"
     try:
-        url = _supabase_endpoint("health_records", "?select=record_key&limit=1")
-        res = requests.get(url, headers=_supabase_headers(prefer=""), timeout=10)
-        if res.status_code in [200, 206]:
-            return "Supabase接続OK：健康チェック・排泄チェック・申し送りは外部DB保存です。"
-        return f"Supabase接続注意：HTTP {res.status_code} / {res.text[:120]}"
+        checks = []
+        for table_name in ["users", "health_records", "excretion_records", "handover_logs"]:
+            url = _supabase_endpoint(table_name, "?select=record_key&limit=1")
+            res = requests.get(url, headers=_supabase_headers(prefer=""), timeout=10)
+            if res.status_code not in [200, 206]:
+                return f"Supabase接続注意：{table_name} / HTTP {res.status_code} / {res.text[:160]}"
+            checks.append(f"{SUPABASE_CORE_LABELS.get(table_name, table_name)}OK")
+        return "Supabase接続OK：利用者マスタ・健康チェック・排泄チェック・申し送りは外部DB保存です。"
     except Exception as e:
         return f"Supabase接続エラー：{e}"
+
+
+def get_supabase_diagnostic_rows():
+    """管理画面表示用の簡易診断。"""
+    cfg = _supabase_config()
+    rows = [
+        {"項目": "requests", "状態": "OK" if requests is not None else "NG", "詳細": "requests利用可能" if requests is not None else "requestsが利用できません"},
+        {"項目": "enabled", "状態": "OK" if cfg.get("enabled") else "NG", "詳細": str(cfg.get("enabled"))},
+        {"項目": "url", "状態": "OK" if cfg.get("url") else "NG", "詳細": cfg.get("url", "")},
+        {"項目": "key", "状態": "OK" if cfg.get("key") else "NG", "詳細": "設定済み" if cfg.get("key") else "未設定"},
+    ]
+    if supabase_is_enabled():
+        for table_name in ["users", "health_records", "excretion_records", "handover_logs"]:
+            try:
+                url = _supabase_endpoint(table_name, "?select=record_key&limit=1")
+                res = requests.get(url, headers=_supabase_headers(prefer=""), timeout=10)
+                ok = res.status_code in [200, 206]
+                rows.append({
+                    "項目": table_name,
+                    "状態": "OK" if ok else "NG",
+                    "詳細": f"HTTP {res.status_code}" if not ok else "接続OK",
+                })
+            except Exception as e:
+                rows.append({"項目": table_name, "状態": "NG", "詳細": str(e)})
+    return pd.DataFrame(rows)
 
 
 def get_supabase_create_table_sql():
     return """
 -- Supabase SQL Editorで実行してください
+create table if not exists public.users (
+  record_key text primary key,
+  data jsonb not null default '{}'::jsonb,
+  updated_at timestamptz default now()
+);
+
 create table if not exists public.health_records (
   record_key text primary key,
   data jsonb not null default '{}'::jsonb,
@@ -452,9 +588,6 @@ create table if not exists public.handover_logs (
   data jsonb not null default '{}'::jsonb,
   updated_at timestamptz default now()
 );
-
--- service_role key をStreamlit Secretsで使う場合はRLSを有効化しなくても動作します。
--- anon key を使う場合は、別途RLSポリシーが必要です。
 """.strip()
 
 def initialize_sqlite_engine():
@@ -668,10 +801,10 @@ def get_storage_unification_status():
     """商品版向け：保存先の簡易表示用。"""
     if "supabase_is_enabled" in globals() and supabase_is_enabled():
         return {
-            "正データ": "Supabase（健康チェック・排泄チェック・申し送り）／SQLite（その他）",
+            "正データ": "Supabase（利用者マスタ・健康チェック・排泄チェック・申し送り）／SQLite（その他）",
             "Excel保存": "廃止（ダウンロード出力のみ）",
             "JSON保存": "廃止（app_settingsテーブルへ統合）",
-            "バックアップ": "主要3機能はSupabase正本＋SQLiteミラー／その他はSQLite DB + 添付ファイル",
+            "バックアップ": "主要4機能はSupabase正本＋SQLiteミラー／その他はSQLite DB + 添付ファイル",
         }
     return {
         "正データ": "SQLite",
@@ -1148,7 +1281,7 @@ def show_security_maintenance_menu():
 
     with tab6:
         st.subheader("Supabase設定")
-        st.caption("健康チェック・排泄チェック・業務全体申し送りの3機能だけを外部DBへ保存します。その他の機能は従来通りSQLite＋バックアップ方式です。")
+        st.caption("利用者マスタ・健康チェック・排泄チェック・業務全体申し送りの4機能をSupabaseへ保存します。その他の機能は従来通りSQLite＋バックアップ方式です。")
         status = get_supabase_storage_status() if "get_supabase_storage_status" in globals() else "Supabase設定関数が見つかりません。"
         if "接続OK" in status:
             st.success(status)
@@ -1157,11 +1290,19 @@ def show_security_maintenance_menu():
         else:
             st.warning(status)
 
+        st.markdown("#### Supabase接続診断")
+        try:
+            diag_df = get_supabase_diagnostic_rows() if "get_supabase_diagnostic_rows" in globals() else pd.DataFrame()
+            if not diag_df.empty:
+                st.dataframe(diag_df, use_container_width=True, hide_index=True)
+        except Exception as e:
+            st.warning(f"診断表示に失敗しました：{e}")
+
         st.markdown("#### Streamlit Secrets 設定例")
         st.code('''[supabase]
 enabled = true
 url = "https://xxxxxxxx.supabase.co"
-key = "SUPABASE_SERVICE_ROLE_KEY"''', language="toml")
+key = "sb_publishable_xxxxxxxxxxxxxxxxx"''', language="toml")
 
         st.markdown("#### Supabase SQL Editorで実行するSQL")
         st.code(get_supabase_create_table_sql() if "get_supabase_create_table_sql" in globals() else "", language="sql")
@@ -1170,15 +1311,16 @@ key = "SUPABASE_SERVICE_ROLE_KEY"''', language="toml")
         st.write(get_storage_unification_status() if "get_storage_unification_status" in globals() else {})
 
         st.markdown("#### 既存SQLiteデータの移行")
-        st.caption("手元や旧環境のSQLiteに残っている主要3機能データを、Supabaseへ初回移行するためのボタンです。")
-        if st.button("ローカルSQLiteから主要3機能をSupabaseへ移行", use_container_width=True):
+        st.caption("手元や旧環境のSQLiteに残っている主要4機能データを、Supabaseへ初回移行するためのボタンです。")
+        if st.button("ローカルSQLiteから主要4機能をSupabaseへ移行", use_container_width=True):
             if not supabase_is_enabled():
                 st.error("Supabaseが未設定または接続できません。Secretsとテーブル作成を確認してください。")
             else:
                 migrated = []
                 targets = [
-                    (SQLITE_TABLE_HEALTH, HEALTH_COLUMNS, ["記録日", "利用者名"]),
-                    (SQLITE_TABLE_EXCRETION, EXCRETION_COLUMNS, ["記録日", "利用者名", "時間帯"]),
+                    (SQLITE_TABLE_USERS, USER_COLUMNS, ["user_id"]),
+                    (SQLITE_TABLE_HEALTH, HEALTH_COLUMNS, ["記録日", "user_id"]),
+                    (SQLITE_TABLE_EXCRETION, EXCRETION_COLUMNS, ["記録日", "user_id", "時間帯"]),
                     (SQLITE_TABLE_HANDOVER, BUSINESS_HANDOVER_COLUMNS, ["記録ID"]),
                 ]
                 for table_name, cols, keys in targets:
@@ -2745,13 +2887,25 @@ def normalize_users_df(df):
     return work.reset_index(drop=True)
 
 
+
 def ensure_user_file():
     """
-    利用者マスタをSQLiteで管理する。
-    既存の user_master.xlsx がある場合は初回のみSQLiteへ移行し、
-    以後はSQLiteを正とする。
+    利用者マスタを用意する。
+    Ver4.5ではSupabase対象テーブルだが、SQLiteにもミラー保存する。
+    Supabaseに既存利用者がある場合は、それを優先してローカルへミラーする。
     """
     ensure_dirs()
+
+    # Supabaseに既存データがあれば、それをローカルSQLiteへミラーして終了
+    if "supabase_is_enabled" in globals() and supabase_is_enabled():
+        try:
+            remote_df = supabase_read_table(SQLITE_TABLE_USERS, USER_COLUMNS)
+            remote_df = normalize_users_df(remote_df)
+            if not remote_df.empty:
+                _original_save_sqlite_table(remote_df, SQLITE_TABLE_USERS, USER_COLUMNS, unique_cols=["user_id"])
+                return
+        except Exception:
+            pass
 
     # 既にSQLiteにデータがあれば何もしない
     if sqlite_table_row_count(SQLITE_TABLE_USERS) > 0:
@@ -2774,7 +2928,6 @@ def ensure_user_file():
     # 何もなければ初期利用者マスタを作成
     df = pd.DataFrame(default_user_rows(), columns=USER_COLUMNS)
     save_sqlite_table(df, SQLITE_TABLE_USERS, USER_COLUMNS, unique_cols=["user_id"])
-
 
 def load_users(include_hidden=False):
     ensure_user_file()

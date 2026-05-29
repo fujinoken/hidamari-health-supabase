@@ -1,51 +1,31 @@
-# hidamari-health-supabase
+# ひだまり健康チェック管理システム Ver4.5 Supabase upsert版
 
-ひだまり健康チェック管理システム Ver4.5 Supabase対応版です。
+## Supabase正本
+- users
+- health_records
+- excretion_records
+- handover_logs
 
-## 方針
+## SQLite補助
+- LIFE
+- 短期目標
+- モニタリング
+- AI分析
+- 設定
+- 監査ログ
+- バックアップ履歴
 
-主要3機能だけをSupabase外部DBに保存します。
-
-- 健康チェック: `health_records`
-- 排泄チェック: `excretion_records`
-- 業務全体申し送り: `handover_logs`
-
-その他の機能は従来どおりSQLiteを補助保存・バックアップ用途として残します。
-
-## GitHubへ入れるファイル
-
-このフォルダ内をそのまま新リポジトリ `hidamari-health-supabase` にアップロードしてください。
-
-```text
-app.py
-db/
-requirements.txt
-sql/supabase_tables.sql
-.streamlit/secrets.example.toml
-.gitignore
-README.md
-```
-
-## Supabase側の準備
-
-1. Supabaseで新規プロジェクト作成
-2. SQL Editorを開く
-3. `sql/supabase_tables.sql` の内容を実行
-4. Streamlit Cloud の Secrets に以下を設定
-
+## Streamlit Secrets
 ```toml
 [supabase]
 enabled = true
-url = "https://xxxxxxxxxxxxxxxxxxxx.supabase.co"
-key = "YOUR_SUPABASE_SERVICE_ROLE_OR_ANON_KEY"
+url = "https://huufblmiqvloudecqtjp.supabase.co"
+key = "sb_publishable_xxxxxxxxxxxxxxxxx"
 ```
 
-## Streamlit Cloud設定
-
-- Main file path: `app.py`
-- Python version: 標準で可
-- Secrets: `.streamlit/secrets.example.toml` を参考に入力
-
-## 注意
-
-`data/` 内のSQLite DBはGitHubに上げないでください。Streamlit Cloudではローカル保存は永続化されないため、主要3機能はSupabaseを正本にします。
+## 変更点
+- Secrets読み込みを `[supabase]` と従来の `SUPABASE_URL` 形式の両方に対応
+- users をSupabase対象に追加
+- 4テーブルをupsert方式に変更
+- Supabase接続診断画面を追加
+- Supabase成功後もSQLiteへミラー保存
