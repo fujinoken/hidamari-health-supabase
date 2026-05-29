@@ -37,6 +37,12 @@ except Exception:
     plt = None
 
 try:
+    from PIL import Image, ImageOps
+except Exception:
+    Image = None
+    ImageOps = None
+
+try:
     from reportlab.lib import colors
     from reportlab.lib.pagesizes import A4
     from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
@@ -836,6 +842,20 @@ def initialize_default_app_settings():
             description="施設名・管理者名・帳票表示用の基本設定",
         )
 
+    if get_app_setting("photo_storage_settings", None) is None:
+        set_app_setting(
+            "photo_storage_settings",
+            {
+                "auto_compress": True,
+                "max_kb": 300,
+                "max_width": 800,
+                "retention_days": 180,
+                "backup_before_delete": True,
+            },
+            category="写真設定",
+            description="申し送り写真の自動圧縮・保存期間・削除前バックアップ設定",
+        )
+
 
 
 
@@ -1201,7 +1221,7 @@ def show_security_maintenance_menu():
     st.header("セキュリティ・保守管理")
     st.caption("DBバックアップ・復元・監査ログ・権限管理を、この画面にまとめています。")
 
-    tab1, tab2, tab3, tab4, tab5, tab6 = st.tabs(["バックアップ", "監査ログ", "権限管理", "データ復元", "DB整合性", "Supabase設定"])
+    tab1, tab2, tab3, tab4, tab5, tab6, tab7 = st.tabs(["バックアップ", "監査ログ", "権限管理", "データ復元", "DB整合性", "Supabase設定", "写真設定"])
 
     with tab1:
         st.subheader("バックアップ")
@@ -1371,6 +1391,60 @@ key = "sb_secret_xxxxxxxxxxxxxxxxx"''', language="toml")
                     ok = supabase_replace_table(local_df, table_name, columns=cols, unique_cols=keys)
                     migrated.append({"テーブル": table_name, "件数": len(local_df), "結果": "移行OK" if ok else "移行失敗"})
                 st.dataframe(pd.DataFrame(migrated), use_container_width=True, hide_index=True)
+
+    with tab7:
+        st.subheader("写真設定")
+        st.caption("申し送り写真の容量を抑え、Supabase無料枠やSQLite DBの肥大化を防ぎます。")
+        settings = get_photo_settings()
+
+        c1, c2, c3 = st.columns(3)
+        with c1:
+            auto_compress = st.checkbox("自動圧縮を有効にする", value=bool(settings.get("auto_compress", True)))
+        with c2:
+            max_kb = st.number_input("圧縮後の最大サイズ（KB）", min_value=100, max_value=1024, value=int(settings.get("max_kb", PHOTO_MAX_DISPLAY_KB)), step=50)
+        with c3:
+            max_width = st.number_input("画像の最大長辺（px）", min_value=480, max_value=1600, value=int(settings.get("max_width", PHOTO_MAX_WIDTH)), step=80)
+
+        c4, c5 = st.columns(2)
+        with c4:
+            retention_days = st.number_input("写真保存期間（日）", min_value=30, max_value=3650, value=int(settings.get("retention_days", PHOTO_RETENTION_DAYS)), step=30)
+        with c5:
+            backup_before_delete = st.checkbox("削除前にバックアップを作成する", value=bool(settings.get("backup_before_delete", True)))
+
+        st.info(f"現在の標準：写真1枚／自動圧縮／最大{int(max_kb)}KB／保存期間{int(retention_days)}日／削除前バックアップ")
+
+        if st.button("写真設定を保存", type="primary", use_container_width=True):
+            set_app_setting(
+                "photo_storage_settings",
+                {
+                    "auto_compress": bool(auto_compress),
+                    "max_kb": int(max_kb),
+                    "max_width": int(max_width),
+                    "retention_days": int(retention_days),
+                    "backup_before_delete": bool(backup_before_delete),
+                },
+                category="写真設定",
+                description="申し送り写真の圧縮・保存期間設定",
+            )
+            add_audit_log("写真設定更新", "app_settings", "photo_storage_settings", "写真軽量化・保存期間設定を更新")
+            st.success("写真設定を保存しました。")
+            st.rerun()
+
+        st.divider()
+        st.subheader("写真保存期間の手動整理")
+        st.caption("保存期間を超えた写真を、削除前バックアップ後に整理します。DB内のbase64写真も保存期間終了マーカーに置き換えます。")
+        if st.button("期限切れ写真を今すぐ整理", use_container_width=True):
+            result = cleanup_expired_handover_photos(
+                retention_days=int(retention_days),
+                backup_before_delete=bool(backup_before_delete),
+            )
+            if result.get("error"):
+                st.error(result.get("error"))
+            else:
+                st.success(f"整理完了：対象確認 {result.get('checked', 0)}件／整理 {result.get('updated', 0)}件／削除ファイル {result.get('deleted', 0)}件")
+                if result.get("backup"):
+                    st.info(f"削除前バックアップ：{result.get('backup')}")
+
 
 
 
@@ -5062,7 +5136,320 @@ def get_business_handover_alerts(df):
 
 
 
-PHOTO_MAX_BYTES = 2 * 1024 * 1024  # Ver5.0 レベル1：申し送り写真1枚。DB肥大化予防のため2MBまで。
+# =========================
+# 申し送り写真 軽量化・保存期間管理（Ver4.1）
+# =========================
+PHOTO_MAX_BYTES = 300 * 1024  # 商品版標準：DB/Supabase容量保護のため圧縮後300KB以下
+PHOTO_MAX_DISPLAY_KB = 300
+PHOTO_MAX_WIDTH = 800
+PHOTO_JPEG_MIN_QUALITY = 35
+PHOTO_RETENTION_DAYS = 180
+
+
+def format_file_size(size_bytes) -> str:
+    try:
+        size_bytes = int(size_bytes or 0)
+    except Exception:
+        size_bytes = 0
+    if size_bytes >= 1024 * 1024:
+        return f"{size_bytes / (1024 * 1024):.2f}MB"
+    return f"{size_bytes / 1024:.1f}KB"
+
+
+def get_photo_settings():
+    default = {
+        "auto_compress": True,
+        "max_kb": PHOTO_MAX_DISPLAY_KB,
+        "max_width": PHOTO_MAX_WIDTH,
+        "retention_days": PHOTO_RETENTION_DAYS,
+        "backup_before_delete": True,
+    }
+    try:
+        saved = get_app_setting("photo_storage_settings", default)
+        if isinstance(saved, dict):
+            default.update(saved)
+    except Exception:
+        pass
+
+    # 安全側に丸める
+    try:
+        default["max_kb"] = int(default.get("max_kb") or PHOTO_MAX_DISPLAY_KB)
+    except Exception:
+        default["max_kb"] = PHOTO_MAX_DISPLAY_KB
+    try:
+        default["max_width"] = int(default.get("max_width") or PHOTO_MAX_WIDTH)
+    except Exception:
+        default["max_width"] = PHOTO_MAX_WIDTH
+    try:
+        default["retention_days"] = int(default.get("retention_days") or PHOTO_RETENTION_DAYS)
+    except Exception:
+        default["retention_days"] = PHOTO_RETENTION_DAYS
+
+    default["max_kb"] = max(100, min(default["max_kb"], 1024))
+    default["max_width"] = max(480, min(default["max_width"], 1600))
+    default["retention_days"] = max(30, min(default["retention_days"], 3650))
+    default["auto_compress"] = bool(default.get("auto_compress", True))
+    default["backup_before_delete"] = bool(default.get("backup_before_delete", True))
+    return default
+
+
+def _open_uploaded_image(uploaded_file):
+    if uploaded_file is None or Image is None:
+        return None, b""
+    uploaded_file.seek(0)
+    raw = uploaded_file.read()
+    uploaded_file.seek(0)
+    if not raw:
+        return None, b""
+    image = Image.open(BytesIO(raw))
+    if ImageOps is not None:
+        image = ImageOps.exif_transpose(image)
+    return image, raw
+
+
+def compress_handover_photo_upload(uploaded_file, max_bytes=None, max_width=None):
+    """アップロード写真を300KB目安まで自動圧縮する。失敗時は安全にエラー情報を返す。"""
+    settings = get_photo_settings()
+    max_bytes = int(max_bytes or settings.get("max_kb", PHOTO_MAX_DISPLAY_KB) * 1024)
+    max_width = int(max_width or settings.get("max_width", PHOTO_MAX_WIDTH))
+
+    result = {
+        "ok": False,
+        "bytes": b"",
+        "mime": "image/jpeg",
+        "suffix": ".jpg",
+        "original_size": 0,
+        "compressed_size": 0,
+        "compressed": False,
+        "message": "",
+    }
+
+    if uploaded_file is None:
+        result["message"] = "写真が選択されていません。"
+        return result
+
+    original_name = clean_text(getattr(uploaded_file, "name", ""), "photo.jpg")
+    original_suffix = Path(original_name).suffix.lower()
+    if original_suffix in [".jpg", ".jpeg"]:
+        original_mime = "image/jpeg"
+    elif original_suffix == ".png":
+        original_mime = "image/png"
+    elif original_suffix == ".webp":
+        original_mime = "image/webp"
+    else:
+        original_mime = "image/jpeg"
+
+    try:
+        image, raw = _open_uploaded_image(uploaded_file)
+        result["original_size"] = len(raw)
+
+        # Pillowが使えない場合は、300KB以下の画像だけ許可
+        if Image is None or image is None:
+            if len(raw) <= max_bytes:
+                result.update({
+                    "ok": True,
+                    "bytes": raw,
+                    "mime": original_mime,
+                    "suffix": original_suffix if original_suffix in [".jpg", ".jpeg", ".png", ".webp"] else ".jpg",
+                    "compressed_size": len(raw),
+                    "compressed": False,
+                    "message": "Pillow未導入のため元画像を保存しました。",
+                })
+            else:
+                result["message"] = "画像圧縮ライブラリ（Pillow）がないため、300KBを超える写真は保存できません。"
+            return result
+
+        # 透過PNG等も安全にJPEG化するためRGBへ変換
+        if image.mode not in ("RGB", "L"):
+            bg = Image.new("RGB", image.size, (255, 255, 255))
+            if image.mode in ("RGBA", "LA"):
+                bg.paste(image, mask=image.split()[-1])
+                image = bg
+            else:
+                image = image.convert("RGB")
+        elif image.mode == "L":
+            image = image.convert("RGB")
+
+        # 長辺をmax_width以内に縮小
+        width, height = image.size
+        long_side = max(width, height)
+        if long_side > max_width:
+            ratio = max_width / long_side
+            new_size = (max(1, int(width * ratio)), max(1, int(height * ratio)))
+            image = image.resize(new_size, Image.LANCZOS)
+
+        # JPEG品質を段階的に下げて300KB以下へ
+        best_bytes = b""
+        best_quality = None
+        for quality in [85, 78, 72, 68, 64, 60, 55, 50, 45, 40, PHOTO_JPEG_MIN_QUALITY]:
+            out = BytesIO()
+            image.save(out, format="JPEG", quality=quality, optimize=True)
+            data = out.getvalue()
+            best_bytes = data
+            best_quality = quality
+            if len(data) <= max_bytes:
+                break
+
+        # まだ大きい場合は幅をさらに小さくして再試行
+        current_width = max(image.size)
+        while len(best_bytes) > max_bytes and current_width > 480:
+            current_width = int(current_width * 0.85)
+            width, height = image.size
+            long_side = max(width, height)
+            ratio = current_width / long_side
+            resized = image.resize((max(1, int(width * ratio)), max(1, int(height * ratio))), Image.LANCZOS)
+            for quality in [60, 50, 45, 40, PHOTO_JPEG_MIN_QUALITY]:
+                out = BytesIO()
+                resized.save(out, format="JPEG", quality=quality, optimize=True)
+                data = out.getvalue()
+                best_bytes = data
+                best_quality = quality
+                if len(data) <= max_bytes:
+                    image = resized
+                    break
+            if len(best_bytes) <= max_bytes:
+                break
+            image = resized
+
+        if len(best_bytes) > max_bytes:
+            result["message"] = f"写真を圧縮しましたが、上限{int(max_bytes/1024)}KB以下にできませんでした。別の写真で再試行してください。"
+            result["compressed_size"] = len(best_bytes)
+            return result
+
+        result.update({
+            "ok": True,
+            "bytes": best_bytes,
+            "mime": "image/jpeg",
+            "suffix": ".jpg",
+            "compressed_size": len(best_bytes),
+            "compressed": len(best_bytes) < len(raw) or original_mime != "image/jpeg",
+            "message": f"圧縮OK：{format_file_size(len(raw))} → {format_file_size(len(best_bytes))}（JPEG品質{best_quality}）",
+        })
+        return result
+    except Exception as e:
+        result["message"] = f"写真の圧縮に失敗しました：{e}"
+        return result
+
+
+def render_photo_compression_preview(uploaded_file):
+    """フォーム内で圧縮前後サイズを表示する。"""
+    if uploaded_file is None:
+        return
+    info = compress_handover_photo_upload(uploaded_file)
+    if info.get("ok"):
+        st.success(f"写真軽量化：{format_file_size(info.get('original_size'))} → {format_file_size(info.get('compressed_size'))}（上限{get_photo_settings().get('max_kb')}KB）")
+        try:
+            st.image(info.get("bytes"), caption="圧縮後プレビュー", use_container_width=True)
+        except Exception:
+            st.image(uploaded_file, caption="添付予定の写真", use_container_width=True)
+    else:
+        st.warning(info.get("message", "写真を圧縮できませんでした。"))
+
+
+def build_expired_photo_marker(info, reason="保存期間終了"):
+    marker = {
+        "mode": "expired",
+        "filename": clean_text(info.get("filename")),
+        "original_name": clean_text(info.get("original_name")),
+        "local_path": clean_text(info.get("local_path")),
+        "saved_at": clean_text(info.get("saved_at")),
+        "expired_at": format_now_jst("%Y-%m-%d %H:%M:%S"),
+        "reason": reason,
+        "message": "写真は保存期間終了のため削除しました。記録本文は保持されています。",
+    }
+    return json.dumps(marker, ensure_ascii=False)
+
+
+def cleanup_expired_handover_photos(retention_days=None, backup_before_delete=True):
+    """180日を超えた申し送り写真を、削除前バックアップ後に削除する。"""
+    settings = get_photo_settings()
+    retention_days = int(retention_days or settings.get("retention_days", PHOTO_RETENTION_DAYS))
+    backup_before_delete = bool(backup_before_delete and settings.get("backup_before_delete", True))
+
+    try:
+        df = load_business_handover_data()
+        if df.empty:
+            return {"checked": 0, "deleted": 0, "updated": 0, "backup": ""}
+
+        cutoff = now_jst_dt() - timedelta(days=retention_days)
+        updated = False
+        deleted_count = 0
+        checked = 0
+        backup_name = ""
+
+        # 先に対象有無だけ確認
+        targets = []
+        for idx, row in df.iterrows():
+            for col in ["写真1", "写真2"]:
+                info = _parse_handover_photo_value(row.get(col, ""))
+                if not info or info.get("mode") == "expired":
+                    continue
+                checked += 1
+                saved_at = clean_text(info.get("saved_at")) or clean_text(row.get("記録日時"))
+                dt = pd.to_datetime(saved_at, errors="coerce")
+                if pd.isna(dt):
+                    continue
+                try:
+                    dt_py = dt.to_pydatetime()
+                    if dt_py.tzinfo is None and JST:
+                        dt_py = dt_py.replace(tzinfo=JST)
+                except Exception:
+                    dt_py = None
+                if dt_py and dt_py < cutoff:
+                    targets.append((idx, col, info))
+
+        if not targets:
+            return {"checked": checked, "deleted": 0, "updated": 0, "backup": ""}
+
+        if backup_before_delete and "create_backup_zip" in globals():
+            zip_path, err = create_backup_zip(kind="写真削除前")
+            if zip_path and not err:
+                backup_name = zip_path.name
+            elif err:
+                try:
+                    st.warning(f"写真削除前バックアップに失敗したため、自動削除を中止しました：{err}")
+                except Exception:
+                    pass
+                return {"checked": checked, "deleted": 0, "updated": 0, "backup": "", "error": err}
+
+        for idx, col, info in targets:
+            local_path = clean_text(info.get("local_path"))
+            if local_path:
+                try:
+                    path = Path(local_path)
+                    if path.exists() and path.is_file():
+                        path.unlink()
+                        deleted_count += 1
+                except Exception:
+                    pass
+            # DB内base64も消すため、写真欄を期限切れマーカーへ置換
+            df.at[idx, col] = build_expired_photo_marker(info)
+            updated = True
+
+        if updated:
+            save_business_handover_data(df)
+            try:
+                add_audit_log("写真保存期間整理", SQLITE_TABLE_HANDOVER, "", f"{retention_days}日超の写真を{len(targets)}件整理。削除前バックアップ：{backup_name}")
+            except Exception:
+                pass
+
+        return {"checked": checked, "deleted": deleted_count, "updated": len(targets), "backup": backup_name}
+    except Exception as e:
+        return {"checked": 0, "deleted": 0, "updated": 0, "backup": "", "error": str(e)}
+
+
+def run_daily_photo_retention_cleanup():
+    """1日1回だけ写真保存期間整理を実行する。"""
+    try:
+        ensure_security_dirs()
+        today_key = today_jst().strftime("%Y%m%d")
+        marker = BACKUP_DIR / f".photo_cleanup_{today_key}.done"
+        if marker.exists():
+            return
+        result = cleanup_expired_handover_photos()
+        marker.write_text(json.dumps(result, ensure_ascii=False), encoding="utf-8")
+    except Exception:
+        pass
 
 
 def _guess_image_mime(suffix: str) -> str:
@@ -5097,10 +5484,12 @@ def save_business_handover_photo(uploaded_file, record_id, photo_no=1):
     """
     業務全体申し送りに添付された写真を保存し、保存値を返す。
 
-    Ver5.0 レベル1方針：
-    - 写真は1枚運用を基本にする
-    - Streamlit Cloudでローカルファイルが消えても表示できるよう、data_url(base64)をJSONとしてDBにも保存
-    - 同時にローカルにも保存し、バックアップZIPへ含められるようにする
+    Ver4.1 写真軽量化・保存期間管理版：
+    - 写真は1件1枚運用
+    - 保存前に自動圧縮し、300KB以下を標準にする
+    - 圧縮前後サイズを保存値に保持する
+    - ローカル保存＋DB内data_url保持（Supabase/Streamlit Cloudでも表示可能）
+    - 180日超の写真は削除前バックアップ後、写真欄を保存期間終了マーカーへ置換
     """
     if uploaded_file is None:
         return ""
@@ -5108,24 +5497,22 @@ def save_business_handover_photo(uploaded_file, record_id, photo_no=1):
     ensure_dirs()
     BUSINESS_HANDOVER_PHOTO_DIR.mkdir(parents=True, exist_ok=True)
     original_name = clean_text(getattr(uploaded_file, "name", ""), "photo.jpg")
-    suffix = Path(original_name).suffix.lower()
-    if suffix not in [".jpg", ".jpeg", ".png", ".webp"]:
-        suffix = ".jpg"
 
     safe_record_id = re.sub(r"[^A-Za-z0-9_-]", "_", clean_text(record_id, "handover"))
-    file_name = f"{safe_record_id}_photo{photo_no}{suffix}"
+    file_name = f"{safe_record_id}_photo{photo_no}.jpg"
     save_path = BUSINESS_HANDOVER_PHOTO_DIR / file_name
 
     try:
-        uploaded_file.seek(0)
-        photo_bytes = uploaded_file.read()
-        if not photo_bytes:
-            return ""
-        if len(photo_bytes) > PHOTO_MAX_BYTES:
+        compressed = compress_handover_photo_upload(uploaded_file)
+        if not compressed.get("ok"):
             try:
-                st.warning("写真サイズが大きすぎます。2MB以下の画像にしてください。")
+                st.warning(compressed.get("message", "写真を保存できませんでした。"))
             except Exception:
                 pass
+            return ""
+
+        photo_bytes = compressed["bytes"]
+        if not photo_bytes:
             return ""
 
         # ローカルにも保存（バックアップZIP用）
@@ -5134,20 +5521,28 @@ def save_business_handover_photo(uploaded_file, record_id, photo_no=1):
         except Exception:
             pass
 
-        mime = _guess_image_mime(suffix)
-        data_url = f"{mime};base64,{base64.b64encode(photo_bytes).decode('ascii')}"
-        # data: を後から付ける方式ではなく、完全なData URLとして保存
-        data_url = "data:" + data_url
+        mime = compressed.get("mime", "image/jpeg")
+        data_url = f"data:{mime};base64,{base64.b64encode(photo_bytes).decode('ascii')}"
+
         value = {
             "mode": "embedded_base64",
             "filename": file_name,
             "original_name": original_name,
             "mime": mime,
             "size": len(photo_bytes),
+            "original_size": compressed.get("original_size", 0),
+            "compressed_size": compressed.get("compressed_size", len(photo_bytes)),
+            "compressed": compressed.get("compressed", False),
+            "max_kb": get_photo_settings().get("max_kb", PHOTO_MAX_DISPLAY_KB),
+            "retention_days": get_photo_settings().get("retention_days", PHOTO_RETENTION_DAYS),
             "local_path": str(save_path),
             "data_url": data_url,
             "saved_at": format_now_jst("%Y-%m-%d %H:%M:%S") if "format_now_jst" in globals() else datetime.utcnow().isoformat(),
         }
+        try:
+            st.success(f"写真を軽量化して保存しました：{format_file_size(value['original_size'])} → {format_file_size(value['compressed_size'])}")
+        except Exception:
+            pass
         return json.dumps(value, ensure_ascii=False)
     except Exception as e:
         try:
@@ -5156,13 +5551,16 @@ def save_business_handover_photo(uploaded_file, record_id, photo_no=1):
             pass
         return ""
 
-
 def show_business_handover_photo(photo_path, caption="添付写真"):
     """保存済み写真を画面表示する。旧ファイルパス／新base64埋込の両方に対応。"""
     info = _parse_handover_photo_value(photo_path)
     if not info:
         return
     try:
+        if info.get("mode") == "expired":
+            st.caption(clean_text(info.get("message"), "写真は保存期間終了のため削除済みです。"))
+            return
+
         data_url = clean_text(info.get("data_url"))
         if data_url.startswith("data:image/") and ";base64," in data_url:
             b64 = data_url.split(";base64,", 1)[1]
@@ -6725,9 +7123,9 @@ def show_business_handover_menu():
             st.markdown("#### 写真添付")
             st.caption("申し送りに写真を1枚添付できます。皮膚状態・物品破損・居室環境など、文章で伝わりにくい内容の共有に使います。")
             photo1_file = st.file_uploader("写真を1枚添付", type=["jpg", "jpeg", "png", "webp"], key="business_handover_photo1")
-            photo2_file = None  # Ver5.0 レベル1では写真1枚運用。旧カラム互換のため変数のみ残す。
+            photo2_file = None  # 写真1枚運用。旧カラム互換のため変数のみ残す。
             if photo1_file is not None:
-                st.image(photo1_file, caption="添付予定の写真", use_container_width=True)
+                render_photo_compression_preview(photo1_file)
 
             st.markdown("#### 入力Excelデータ添付")
             input_excel_file = st.file_uploader(
@@ -10058,6 +10456,7 @@ logout_button()
 ensure_hidamari_db()
 ensure_security_tables()
 run_daily_auto_backup()
+run_daily_photo_retention_cleanup()
 
 if st.session_state.role == "admin":
     show_hidamari_hero("admin")
