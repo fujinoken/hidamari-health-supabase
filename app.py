@@ -10226,6 +10226,59 @@ def show_force_password_change_screen():
     return False
 
 
+
+
+def render_auto_backup_download_from_session():
+    """終了時バックアップ後、ログイン画面でバックアップZIPをダウンロードできるように表示する。"""
+    try:
+        backup_file = st.session_state.get("last_backup_file", "")
+        backup_name = st.session_state.get("backup_download_name", "")
+        if not backup_file:
+            return
+        path = Path(backup_file)
+        if not path.exists():
+            st.warning("バックアップファイルが見つかりません。管理者メニューのバックアップ履歴を確認してください。")
+            return
+
+        data = path.read_bytes()
+        file_name = backup_name or path.name
+
+        st.info("バックアップZIPを作成しました。下のボタンからこの端末に保存してください。")
+        st.download_button(
+            "バックアップZIPをダウンロード",
+            data=data,
+            file_name=file_name,
+            mime="application/zip",
+            type="primary",
+            use_container_width=True,
+        )
+
+        # ブラウザ設定によって自動保存が止まることがあるため、download_buttonも必ず残す。
+        try:
+            b64 = base64.b64encode(data).decode("utf-8")
+            components.html(
+                f"""
+                <script>
+                (function() {{
+                    const a = document.createElement('a');
+                    a.href = 'data:application/zip;base64,{b64}';
+                    a.download = '{file_name}';
+                    document.body.appendChild(a);
+                    a.click();
+                    document.body.removeChild(a);
+                }})();
+                </script>
+                """,
+                height=0,
+            )
+        except Exception:
+            pass
+
+        st.caption("自動ダウンロードが始まらない場合は、上のボタンを押してください。")
+    except Exception as e:
+        st.warning(f"バックアップダウンロード表示に失敗しました：{e}")
+
+
 def login_check():
     if "logged_in" not in st.session_state:
         st.session_state.logged_in = False
@@ -10252,7 +10305,9 @@ def login_check():
         end_msg = st.session_state.pop("hidamari_after_logout_message", "")
         if end_msg:
             st.success(end_msg)
+        if st.session_state.get("backup_download_pending") or st.session_state.get("last_backup_file"):
             render_auto_backup_download_from_session()
+            st.session_state["backup_download_pending"] = False
 
         input_id = st.text_input("ID")
         input_password = st.text_input("パスワード", type="password")
@@ -10359,6 +10414,9 @@ def finish_work_backup_and_logout():
                 st.session_state["last_backup_file"] = str(zip_path)
                 st.session_state["backup_download_pending"] = True
                 st.session_state["backup_download_name"] = Path(zip_path).name
+                st.session_state["hidamari_after_logout_message"] = (
+                    f"終了時バックアップを作成しました：{Path(zip_path).name}"
+                )
             except Exception:
                 pass
         clear_login_session()
