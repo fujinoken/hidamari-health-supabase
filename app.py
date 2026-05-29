@@ -10343,31 +10343,64 @@ def render_keep_alive_widget(interval_seconds: int = 240, show_status: bool = Fa
         pass
 
 
-def logout_button():
-    with st.sidebar:
-        st.caption(f"ログイン中：{st.session_state.user_label}")
+def finish_work_backup_and_logout():
+    """管理者用：終了時バックアップを作成してからログアウトする。
 
-        st.markdown("### 終了操作")
-        st.caption("作業を終えるときは、下のボタンでバックアップを作成してから終了します。")
-        if st.button("本日の入力を保存して終了", type="primary", use_container_width=True):
+    職員画面には終了ボタンを表示しない方針のため、
+    この処理は管理者の保守操作からのみ呼び出す。
+    Supabaseには書き込まず、バックアップZIP作成とセッション終了だけを行う。
+    """
+    try:
+        zip_path, err = create_backup_zip(kind="終了時")
+        if err:
+            return False, err
+        if zip_path:
+            try:
+                st.session_state["last_backup_file"] = str(zip_path)
+                st.session_state["backup_download_pending"] = True
+                st.session_state["backup_download_name"] = Path(zip_path).name
+            except Exception:
+                pass
+        clear_login_session()
+        return True, f"終了時バックアップを作成しました：{Path(zip_path).name if zip_path else ''}"
+    except Exception as e:
+        return False, f"終了時バックアップに失敗しました：{e}"
+
+
+def logout_button():
+    """サイドバーの終了・接続維持操作。
+
+    職員には終了ボタンも接続維持・手動操作も表示しない。
+    管理者だけがバックアップ付き終了、接続確認、通常ログアウトを操作できる。
+    """
+    if not is_admin_user():
+        return
+
+    with st.sidebar:
+        st.caption(f"ログイン中：{st.session_state.get('user_label', '')}")
+
+        st.markdown("### 管理者終了操作")
+        st.caption("管理者が作業を終えるときだけ、必要に応じてバックアップを作成して終了します。")
+        if st.button("バックアップを作成して終了", type="primary", use_container_width=True):
             ok, msg = finish_work_backup_and_logout()
             if ok:
+                st.success(msg)
                 st.rerun()
             else:
                 st.error(msg)
 
-        # 接続維持・手動操作は管理者だけに表示する。
-        # 職員画面では「本日の入力を保存して終了」に一本化し、迷いと誤操作を減らす。
-        if is_admin_user():
-            with st.expander("接続維持・手動操作", expanded=False):
-                st.caption("画面を開いている間は、アプリが眠りにくいように軽い通信を行います。")
-                if st.button("今すぐ接続確認", use_container_width=True):
+        with st.expander("接続維持・手動操作", expanded=False):
+            st.caption("管理者用です。職員画面には表示されません。")
+            if st.button("今すぐ接続確認", use_container_width=True):
+                try:
                     add_audit_log("接続確認", "keep_alive", "", "手動の接続確認を実行")
-                    st.success(f"接続確認OK：{format_now_jst('%Y-%m-%d %H:%M:%S')}")
-                st.caption("通常のログアウトだけ行う場合はこちら。バックアップは作成しません。")
-                if st.button("ログアウトのみ", use_container_width=True):
-                    clear_login_session()
-                    st.rerun()
+                except Exception:
+                    pass
+                st.success(f"接続確認OK：{format_now_jst('%Y-%m-%d %H:%M:%S')}")
+            st.caption("通常のログアウトだけ行う場合はこちら。バックアップは作成しません。")
+            if st.button("ログアウトのみ", use_container_width=True):
+                clear_login_session()
+                st.rerun()
 
 
 # =========================
@@ -11185,8 +11218,9 @@ if not login_check():
     st.stop()
 
 # 画面を開いている間のスリープ対策
-# 職員には技術的な接続維持表示を出さず、管理者だけ状態表示する。
-render_keep_alive_widget(interval_seconds=240, show_status=is_admin_user())
+# 接続維持の表示・通信・手動操作は管理者だけに限定する。
+if is_admin_user():
+    render_keep_alive_widget(interval_seconds=240, show_status=True)
 
 logout_button()
 
