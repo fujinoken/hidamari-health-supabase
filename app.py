@@ -10252,6 +10252,7 @@ def login_check():
         end_msg = st.session_state.pop("hidamari_after_logout_message", "")
         if end_msg:
             st.success(end_msg)
+            render_auto_backup_download_from_session()
 
         input_id = st.text_input("ID")
         input_password = st.text_input("パスワード", type="password")
@@ -10330,6 +10331,71 @@ def render_keep_alive_widget(interval_seconds: int = 240):
         pass
 
 
+
+
+def render_auto_backup_download_from_session():
+    """
+    終了時バックアップ作成後、ログイン画面でZIPをPCへ保存させる。
+    まず自動ダウンロードを試み、失敗時のために手動ダウンロードボタンも表示する。
+    """
+    backup_name = st.session_state.get("hidamari_backup_download_name", "")
+    backup_bytes = st.session_state.get("hidamari_backup_download_bytes", None)
+    if not backup_name or not backup_bytes:
+        return
+
+    st.info("バックアップZIPをPCに保存します。自動で保存されない場合は、下のボタンを押してください。")
+
+    try:
+        if isinstance(backup_bytes, str):
+            backup_bytes_for_button = backup_bytes.encode("utf-8")
+        else:
+            backup_bytes_for_button = bytes(backup_bytes)
+
+        # 手動ダウンロードの保険
+        st.download_button(
+            "バックアップZIPをダウンロード",
+            data=backup_bytes_for_button,
+            file_name=backup_name,
+            mime="application/zip",
+            use_container_width=True,
+            key=f"download_backup_{backup_name}",
+        )
+
+        # 自動ダウンロードを試行
+        b64 = base64.b64encode(backup_bytes_for_button).decode("ascii")
+        safe_name = json.dumps(backup_name, ensure_ascii=False)
+        html = f'''
+        <script>
+        (function() {{
+            const storageKey = "hidamari_auto_download_" + {safe_name};
+            if (sessionStorage.getItem(storageKey) === "done") {{ return; }}
+            sessionStorage.setItem(storageKey, "done");
+            const b64 = "{b64}";
+            const byteCharacters = atob(b64);
+            const byteNumbers = new Array(byteCharacters.length);
+            for (let i = 0; i < byteCharacters.length; i++) {{
+                byteNumbers[i] = byteCharacters.charCodeAt(i);
+            }}
+            const byteArray = new Uint8Array(byteNumbers);
+            const blob = new Blob([byteArray], {{type: "application/zip"}});
+            const url = URL.createObjectURL(blob);
+            const a = document.createElement("a");
+            a.href = url;
+            a.download = {safe_name};
+            document.body.appendChild(a);
+            a.click();
+            setTimeout(function() {{
+                URL.revokeObjectURL(url);
+                a.remove();
+            }}, 1000);
+        }})();
+        </script>
+        '''
+        components.html(html, height=0)
+    except Exception as e:
+        st.warning(f"自動ダウンロードの準備に失敗しました：{e}")
+
+
 def finish_work_backup_and_logout():
     """
     職員が最後に押すボタン用。
@@ -10343,7 +10409,16 @@ def finish_work_backup_and_logout():
         return False, f"バックアップに失敗しました：{err}"
 
     backup_name = zip_path.name if zip_path else ""
-    add_audit_log("保存して終了", "backup_history", backup_name, "職員終了ボタンから一括バックアップを作成してログアウト")
+
+    # サーバー内保存だけでなく、ログアウト後にPCへ自動ダウンロードできるようセッションへ保持
+    try:
+        if zip_path and Path(zip_path).exists():
+            st.session_state["hidamari_backup_download_name"] = backup_name
+            st.session_state["hidamari_backup_download_bytes"] = Path(zip_path).read_bytes()
+    except Exception as e:
+        add_audit_log("終了時バックアップ読込失敗", "backup_history", backup_name, str(e))
+
+    add_audit_log("保存して終了", "backup_history", backup_name, "職員終了ボタンから一括バックアップを作成し、PCダウンロード用データを準備してログアウト")
     clear_login_session()
     st.session_state["hidamari_after_logout_message"] = f"本日の入力を保存しました。終了時バックアップ：{backup_name}"
     return True, st.session_state["hidamari_after_logout_message"]
