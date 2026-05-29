@@ -310,55 +310,14 @@ def _secret_get(container, key, default=""):
     return default
 
 
-def _normalize_supabase_url(url: str) -> str:
-    """
-    Supabase URLを安全に正規化する。
-
-    今回の事故防止ポイント：
-    - /rest/v1/ まで貼っても自動で Project URL に戻す
-    - .supabase.corest のような入力ミスを補正する
-    - huufblmiqvloudeqctjp と huufblmiqvloudeqctjp の c/q 入れ替わりを補正する
-    - 末尾スラッシュを削除する
-    """
-    if not url:
-        return ""
-
-    url = str(url).strip().strip('"').strip("'")
-    url = url.replace(" ", "").replace("\n", "").replace("\r", "").replace("\t", "")
-
-    # よくある誤入力: .co/rest が .corest になった場合
-    url = url.replace(".supabase.corest", ".supabase.co/rest")
-
-    # スキームがない場合の補完
-    if url and not url.startswith(("http://", "https://")):
-        url = "https://" + url
-
-    # Data API URLをそのまま貼った場合でもProject URLに戻す
-    if "/rest/v1" in url:
-        url = url.split("/rest/v1")[0]
-
-    url = url.rstrip("/")
-
-    # 今回確認済みの正しいProject Ref
-    correct_ref = "huufblmiqvloudeqctjp"
-    known_bad_refs = {
-        "huufblmiqvloudecqtjp": correct_ref,  # c と q の位置違い
-    }
-    for bad, good in known_bad_refs.items():
-        url = url.replace(bad, good)
-
-    return url
-
-
 def _supabase_config():
     """
     Streamlit Secretsを柔軟に読む。
-
     推奨：
         [supabase]
         enabled = true
-        url = "https://huufblmiqvloudeqctjp.supabase.co"
-        key = "sb_secret_xxxxx"
+        url = "https://xxxxx.supabase.co"
+        key = "sb_publishable_xxxxx"
 
     互換：
         SUPABASE_URL = "..."
@@ -384,21 +343,21 @@ def _supabase_config():
         return ""
 
     enabled_raw = pick("enabled", "SUPABASE_ENABLED")
-    raw_url = pick("url", "SUPABASE_URL")
+    url = pick("url", "SUPABASE_URL")
     key = pick("key", "service_role_key", "anon_key", "SUPABASE_KEY", "SUPABASE_SERVICE_ROLE_KEY", "SUPABASE_ANON_KEY")
 
-    url = _normalize_supabase_url(raw_url)
+    # Data API の /rest/v1/ まで貼ってしまった場合でも自動補正する
+    url = url.strip()
+    if "/rest/v1" in url:
+        url = url.split("/rest/v1")[0]
+    url = url.rstrip("/")
 
     enabled = str(enabled_raw).lower() in ["1", "true", "yes", "on", "有効"]
     if not enabled and url and key:
         enabled = True
 
-    return {
-        "enabled": enabled,
-        "url": url,
-        "key": key,
-        "raw_url": raw_url,
-    }
+    return {"enabled": enabled, "url": url, "key": key}
+
 
 def supabase_is_enabled():
     cfg = _supabase_config()
@@ -585,8 +544,6 @@ def get_supabase_diagnostic_rows():
         {"項目": "requests", "状態": "OK" if requests is not None else "NG", "詳細": "requests利用可能" if requests is not None else "requestsが利用できません"},
         {"項目": "enabled", "状態": "OK" if cfg.get("enabled") else "NG", "詳細": str(cfg.get("enabled"))},
         {"項目": "url", "状態": "OK" if cfg.get("url") else "NG", "詳細": cfg.get("url", "")},
-        {"項目": "raw_url", "状態": "参考", "詳細": cfg.get("raw_url", "")},
-        {"項目": "project_ref", "状態": "OK" if "huufblmiqvloudeqctjp" in cfg.get("url", "") else "確認", "詳細": "正：huufblmiqvloudeqctjp ／ 誤：huufblmiqvloudecqtjp"},
         {"項目": "key", "状態": "OK" if cfg.get("key") else "NG", "詳細": "設定済み" if cfg.get("key") else "未設定"},
     ]
     if supabase_is_enabled():
@@ -1344,8 +1301,8 @@ def show_security_maintenance_menu():
         st.markdown("#### Streamlit Secrets 設定例")
         st.code('''[supabase]
 enabled = true
-url = "https://huufblmiqvloudeqctjp.supabase.co"
-key = "sb_secret_xxxxxxxxxxxxxxxxx"''', language="toml")
+url = "https://xxxxxxxx.supabase.co"
+key = "sb_publishable_xxxxxxxxxxxxxxxxx"''', language="toml")
 
         st.markdown("#### Supabase SQL Editorで実行するSQL")
         st.code(get_supabase_create_table_sql() if "get_supabase_create_table_sql" in globals() else "", language="sql")
@@ -5062,12 +5019,51 @@ def get_business_handover_alerts(df):
 
 
 
-def save_business_handover_photo(uploaded_file, record_id, photo_no):
-    """業務全体申し送りに添付された写真を保存し、保存パスを返す。"""
+PHOTO_MAX_BYTES = 2 * 1024 * 1024  # Ver5.0 レベル1：申し送り写真1枚。DB肥大化予防のため2MBまで。
+
+
+def _guess_image_mime(suffix: str) -> str:
+    suffix = (suffix or "").lower()
+    if suffix in [".jpg", ".jpeg"]:
+        return "image/jpeg"
+    if suffix == ".png":
+        return "image/png"
+    if suffix == ".webp":
+        return "image/webp"
+    return "image/jpeg"
+
+
+def _parse_handover_photo_value(photo_value):
+    """写真保存値を後方互換で読む。旧：ファイルパス／新：JSON(base64埋込)。"""
+    text = clean_text(photo_value)
+    if not text:
+        return {}
+    if text.startswith("data:image/"):
+        return {"mode": "data_url", "data_url": text, "filename": "photo"}
+    if text.startswith("{"):
+        try:
+            data = json.loads(text)
+            if isinstance(data, dict):
+                return data
+        except Exception:
+            pass
+    return {"mode": "local_path", "local_path": text, "filename": Path(text).name}
+
+
+def save_business_handover_photo(uploaded_file, record_id, photo_no=1):
+    """
+    業務全体申し送りに添付された写真を保存し、保存値を返す。
+
+    Ver5.0 レベル1方針：
+    - 写真は1枚運用を基本にする
+    - Streamlit Cloudでローカルファイルが消えても表示できるよう、data_url(base64)をJSONとしてDBにも保存
+    - 同時にローカルにも保存し、バックアップZIPへ含められるようにする
+    """
     if uploaded_file is None:
         return ""
 
     ensure_dirs()
+    BUSINESS_HANDOVER_PHOTO_DIR.mkdir(parents=True, exist_ok=True)
     original_name = clean_text(getattr(uploaded_file, "name", ""), "photo.jpg")
     suffix = Path(original_name).suffix.lower()
     if suffix not in [".jpg", ".jpeg", ".png", ".webp"]:
@@ -5079,23 +5075,65 @@ def save_business_handover_photo(uploaded_file, record_id, photo_no):
 
     try:
         uploaded_file.seek(0)
-        save_path.write_bytes(uploaded_file.read())
-        return str(save_path)
-    except Exception:
+        photo_bytes = uploaded_file.read()
+        if not photo_bytes:
+            return ""
+        if len(photo_bytes) > PHOTO_MAX_BYTES:
+            try:
+                st.warning("写真サイズが大きすぎます。2MB以下の画像にしてください。")
+            except Exception:
+                pass
+            return ""
+
+        # ローカルにも保存（バックアップZIP用）
+        try:
+            save_path.write_bytes(photo_bytes)
+        except Exception:
+            pass
+
+        mime = _guess_image_mime(suffix)
+        data_url = f"{mime};base64,{base64.b64encode(photo_bytes).decode('ascii')}"
+        # data: を後から付ける方式ではなく、完全なData URLとして保存
+        data_url = "data:" + data_url
+        value = {
+            "mode": "embedded_base64",
+            "filename": file_name,
+            "original_name": original_name,
+            "mime": mime,
+            "size": len(photo_bytes),
+            "local_path": str(save_path),
+            "data_url": data_url,
+            "saved_at": format_now_jst("%Y-%m-%d %H:%M:%S") if "format_now_jst" in globals() else datetime.utcnow().isoformat(),
+        }
+        return json.dumps(value, ensure_ascii=False)
+    except Exception as e:
+        try:
+            st.warning(f"写真の保存に失敗しました：{e}")
+        except Exception:
+            pass
         return ""
 
 
 def show_business_handover_photo(photo_path, caption="添付写真"):
-    """保存済み写真を画面表示する。"""
-    photo_path = clean_text(photo_path)
-    if not photo_path:
-        return
-    path = Path(photo_path)
-    if not path.exists():
-        st.caption(f"{caption}：保存ファイルが見つかりません。")
+    """保存済み写真を画面表示する。旧ファイルパス／新base64埋込の両方に対応。"""
+    info = _parse_handover_photo_value(photo_path)
+    if not info:
         return
     try:
-        st.image(str(path), caption=caption, use_container_width=True)
+        data_url = clean_text(info.get("data_url"))
+        if data_url.startswith("data:image/") and ";base64," in data_url:
+            b64 = data_url.split(";base64,", 1)[1]
+            st.image(base64.b64decode(b64), caption=caption, use_container_width=True)
+            return
+
+        local_path = clean_text(info.get("local_path"))
+        if local_path:
+            path = Path(local_path)
+            if path.exists():
+                st.image(str(path), caption=caption, use_container_width=True)
+                return
+
+        st.caption(f"{caption}：保存ファイルが見つかりません。")
     except Exception:
         st.caption(f"{caption}：画像を表示できませんでした。")
 
@@ -6554,13 +6592,11 @@ def render_business_handover_card(row):
             show_business_handover_excel_preview(input_excel_path, input_excel_text)
 
     photo1 = clean_text(row.get("写真1"))
-    photo2 = clean_text(row.get("写真2"))
-    if photo1 or photo2:
-        p1, p2 = st.columns(2)
-        with p1:
-            show_business_handover_photo(photo1, "写真1")
-        with p2:
-            show_business_handover_photo(photo2, "写真2")
+    photo2 = clean_text(row.get("写真2"))  # 旧データ互換用
+    if photo1:
+        show_business_handover_photo(photo1, "添付写真")
+    elif photo2:
+        show_business_handover_photo(photo2, "添付写真（旧写真2）")
 
 
 
@@ -6644,11 +6680,11 @@ def show_business_handover_menu():
                 status = st.selectbox("対応状況", ["未対応", "対応中", "対応済"], index=0, key="business_handover_status")
 
             st.markdown("#### 写真添付")
-            p1, p2 = st.columns(2)
-            with p1:
-                photo1_file = st.file_uploader("写真1", type=["jpg", "jpeg", "png", "webp"], key="business_handover_photo1")
-            with p2:
-                photo2_file = st.file_uploader("写真2", type=["jpg", "jpeg", "png", "webp"], key="business_handover_photo2")
+            st.caption("申し送りに写真を1枚添付できます。皮膚状態・物品破損・居室環境など、文章で伝わりにくい内容の共有に使います。")
+            photo1_file = st.file_uploader("写真を1枚添付", type=["jpg", "jpeg", "png", "webp"], key="business_handover_photo1")
+            photo2_file = None  # Ver5.0 レベル1では写真1枚運用。旧カラム互換のため変数のみ残す。
+            if photo1_file is not None:
+                st.image(photo1_file, caption="添付予定の写真", use_container_width=True)
 
             st.markdown("#### 入力Excelデータ添付")
             input_excel_file = st.file_uploader(
@@ -6684,7 +6720,7 @@ def show_business_handover_menu():
 
             record_id = make_business_handover_id(record_date, shift_type, staff_name)
             photo1_path = save_business_handover_photo(photo1_file, record_id, 1)
-            photo2_path = save_business_handover_photo(photo2_file, record_id, 2)
+            photo2_path = ""  # Ver5.0 レベル1では写真1枚運用
             input_excel_path = save_business_handover_excel(input_excel_file, record_id)
             input_excel_display_text = build_uploaded_excel_display_text(input_excel_file) if input_excel_file is not None else ""
             auto_extract_text = build_business_handover_auto_extract_text(record_date)
@@ -6891,13 +6927,15 @@ def show_business_handover_menu():
                 )
 
             st.markdown("#### 写真添付の更新")
-            up1, up2 = st.columns(2)
-            with up1:
-                update_photo1_file = st.file_uploader("写真1を差し替える", type=["jpg", "jpeg", "png", "webp"], key="bh_update_photo1")
-                remove_photo1 = st.checkbox("写真1を削除", key="bh_remove_photo1")
-            with up2:
-                update_photo2_file = st.file_uploader("写真2を差し替える", type=["jpg", "jpeg", "png", "webp"], key="bh_update_photo2")
-                remove_photo2 = st.checkbox("写真2を削除", key="bh_remove_photo2")
+            current_photo_preview = clean_text(selected_row.get("写真1")) or clean_text(selected_row.get("写真2"))
+            if current_photo_preview:
+                show_business_handover_photo(current_photo_preview, "現在の添付写真")
+            update_photo1_file = st.file_uploader("写真を差し替える", type=["jpg", "jpeg", "png", "webp"], key="bh_update_photo1")
+            remove_photo1 = st.checkbox("添付写真を削除", key="bh_remove_photo1")
+            update_photo2_file = None  # 旧カラム互換用
+            remove_photo2 = False
+            if update_photo1_file is not None:
+                st.image(update_photo1_file, caption="差し替え予定の写真", use_container_width=True)
 
             st.markdown("#### 入力Excelデータの更新")
             current_excel_path = clean_text(selected_row.get("入力Excelファイル"))
@@ -6952,16 +6990,12 @@ def show_business_handover_menu():
             df_update.loc[mask, "優先度"] = update_priority
             df_update.loc[mask, "対応状況"] = update_status
 
-            current_photo1 = clean_text(selected_row.get("写真1"))
-            current_photo2 = clean_text(selected_row.get("写真2"))
+            current_photo1 = clean_text(selected_row.get("写真1")) or clean_text(selected_row.get("写真2"))
+            current_photo2 = ""
             if remove_photo1:
                 current_photo1 = ""
             elif update_photo1_file is not None:
                 current_photo1 = save_business_handover_photo(update_photo1_file, selected_id, 1)
-            if remove_photo2:
-                current_photo2 = ""
-            elif update_photo2_file is not None:
-                current_photo2 = save_business_handover_photo(update_photo2_file, selected_id, 2)
 
             current_input_excel = clean_text(selected_row.get("入力Excelファイル"))
             current_input_excel_text = clean_text(selected_row.get("入力Excel表示情報"))
