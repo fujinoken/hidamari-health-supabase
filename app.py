@@ -725,6 +725,43 @@ def supabase_delete_by_record_keys(table_name: str, record_keys) -> int:
     return deleted
 
 
+def supabase_find_record_keys_by_data_field(table_name: str, field_name: str, value) -> list:
+    """
+    Supabase JSONB汎用テーブルで、data内の値からrecord_keyを探す。
+    旧データや一部保存時に record_key と 記録ID がずれていても削除できるようにする保険。
+    """
+    if not supabase_is_enabled() or table_name not in SUPABASE_CORE_TABLES:
+        return []
+    if requests is None:
+        return []
+    target = clean_text(value) if "clean_text" in globals() else str(value or "").strip()
+    if not target:
+        return []
+    try:
+        # 件数が小規模施設想定なので、確実性優先でJSONを読み、Python側で照合する。
+        url = _supabase_endpoint(table_name, "?select=record_key,data&limit=10000")
+        res = requests.get(url, headers=_supabase_headers(prefer=""), timeout=30)
+        res.raise_for_status()
+        rows = res.json() or []
+        keys = []
+        for item in rows:
+            data = item.get("data") or {}
+            if not isinstance(data, dict):
+                continue
+            data_value = clean_text(data.get(field_name)) if "clean_text" in globals() else str(data.get(field_name, "")).strip()
+            if data_value == target:
+                record_key = clean_text(item.get("record_key")) if "clean_text" in globals() else str(item.get("record_key", "")).strip()
+                if record_key and record_key not in keys:
+                    keys.append(record_key)
+        return keys
+    except Exception as e:
+        try:
+            st.warning(f"Supabase削除キー検索に失敗しました：{table_name} / {field_name}={target} / {e}")
+        except Exception:
+            pass
+        return []
+
+
 def _build_supabase_delete_key(table_name: str, row: dict, unique_cols=None) -> str:
     try:
         return _make_supabase_record_key(row, table_name, unique_cols=unique_cols)
@@ -758,15 +795,50 @@ def delete_record_common(table_name: str, sqlite_where: dict, supabase_keys=None
 
 
 def delete_business_handover_record(record_id: str, source="") -> dict:
+    """
+    業務全体申し送りを削除する。
+    Supabase側は record_key=記録ID の想定だが、旧データ等でずれている可能性があるため、
+    data["記録ID"] からもrecord_keyを探索して直接DELETEする。
+    """
     record_id = clean_text(record_id) if "clean_text" in globals() else str(record_id).strip()
-    return delete_record_common(
+    supabase_keys = [record_id]
+    try:
+        for key in supabase_find_record_keys_by_data_field(SQLITE_TABLE_HANDOVER, "記録ID", record_id):
+            if key and key not in supabase_keys:
+                supabase_keys.append(key)
+    except Exception:
+        pass
+
+    result = delete_record_common(
         SQLITE_TABLE_HANDOVER,
         {"記録ID": record_id},
-        supabase_keys=[record_id],
+        supabase_keys=supabase_keys,
         operation="申し送り削除",
         target_key=record_id,
         summary=source or "業務全体申し送りを削除",
     )
+
+    # SQLite側の削除確認。直接DELETEで消えない場合の保険として、SQLiteだけ再保存する。
+    try:
+        local_df = _original_load_sqlite_table(SQLITE_TABLE_HANDOVER, BUSINESS_HANDOVER_COLUMNS)
+        if not local_df.empty and "記録ID" in local_df.columns:
+            before = len(local_df)
+            local_df = local_df[local_df["記録ID"].astype(str).str.strip() != str(record_id).strip()].copy()
+            if len(local_df) != before:
+                _original_save_sqlite_table(
+                    local_df,
+                    SQLITE_TABLE_HANDOVER,
+                    BUSINESS_HANDOVER_COLUMNS,
+                    date_cols=["日付"],
+                    unique_cols=["記録ID"],
+                    sort_cols=["記録日時"],
+                )
+                result["sqlite_deleted"] = max(int(result.get("sqlite_deleted", 0) or 0), before - len(local_df))
+                result["ok"] = True
+    except Exception:
+        pass
+
+    return result
 
 
 def delete_health_record(record_date, user_name, user_id="", source="") -> dict:
@@ -8120,16 +8192,18 @@ def show_business_handover_menu():
         st.warning("削除すると、この申し送り記録は一覧と管理者ダッシュボードから消えます。")
         confirm_delete = st.checkbox("この申し送りを削除することを確認しました", key="bh_confirm_delete")
         if st.button("この申し送りを削除する", type="primary", disabled=not confirm_delete, use_container_width=True, key="bh_delete_button"):
-            df_delete = load_business_handover_data()
-            before_count = len(df_delete)
-            df_delete = df_delete[df_delete["記録ID"].astype(str) != str(selected_id)].copy()
-            after_count = len(df_delete)
-
-            if before_count == after_count:
-                st.error("削除対象の記録が見つかりません。")
+            result = delete_business_handover_record(selected_id, source="業務全体申し送り画面から削除")
+            if result.get("ok"):
+                st.success(
+                    f"業務全体申し送りを削除しました。"
+                    f" SQLite削除:{result.get('sqlite_deleted', 0)} / Supabase削除:{result.get('supabase_deleted', 0)}"
+                )
+                st.rerun()
             else:
-                result = delete_business_handover_record(selected_id, source="業務全体申し送り画面から削除")
-                show_delete_result_and_rerun(result, "業務全体申し送りを削除しました。")
+                if result.get("error"):
+                    st.error(f"削除に失敗しました：{result.get('error')}")
+                else:
+                    st.error("削除対象が見つかりません。SupabaseとSQLiteの記録IDを確認してください。")
 
     if handover_mode == "予定候補抽出・出力":
         show_handover_schedule_export_menu()
