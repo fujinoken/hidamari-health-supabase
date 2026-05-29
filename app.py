@@ -1,4 +1,5 @@
 import streamlit as st
+import streamlit.components.v1 as components
 import pandas as pd
 import json
 import hashlib
@@ -1318,21 +1319,140 @@ def record_backup_history(kind, file_path, result="成功", memo=""):
 
 
 
+def _list_sqlite_tables_for_backup():
+    """SQLite内のユーザーテーブル一覧を取得する。"""
+    try:
+        if not HIDAMARI_DB_FILE.exists():
+            return []
+        with get_hidamari_conn() as conn:
+            rows = conn.execute(
+                "SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%' ORDER BY name"
+            ).fetchall()
+        return [r[0] for r in rows]
+    except Exception:
+        return []
+
+
+def _sqlite_table_to_df_for_backup(table_name: str) -> pd.DataFrame:
+    try:
+        validate_sqlite_identifier(table_name)
+        with get_hidamari_conn() as conn:
+            return pd.read_sql_query(f'SELECT * FROM "{table_name}"', conn)
+    except Exception as e:
+        return pd.DataFrame([{"backup_error": str(e)}])
+
+
+def _make_all_sqlite_tables_excel_bytes():
+    """SQLite全テーブルを1つのExcelに退避する。復旧確認・監査用。"""
+    output = BytesIO()
+    tables = _list_sqlite_tables_for_backup()
+    with pd.ExcelWriter(output, engine="openpyxl") as writer:
+        if not tables:
+            pd.DataFrame([{"message": "SQLiteテーブルが見つかりません"}]).to_excel(writer, sheet_name="empty", index=False)
+        for table_name in tables:
+            df = _sqlite_table_to_df_for_backup(table_name)
+            # Excelのシート名は31文字制限
+            safe_sheet = re.sub(r"[\[\]\:\*\?\/\\]", "_", str(table_name))[:31] or "table"
+            df.to_excel(writer, sheet_name=safe_sheet, index=False)
+    output.seek(0)
+    return output.getvalue()
+
+
+def _read_supabase_core_tables_for_backup():
+    """Supabase主要4機能をJSON/Excel退避用に読み込む。"""
+    result = {}
+    if not ("supabase_is_enabled" in globals() and supabase_is_enabled()):
+        return result
+    for table_name, cols in [
+        (SQLITE_TABLE_USERS, USER_COLUMNS if "USER_COLUMNS" in globals() else []),
+        (SQLITE_TABLE_HEALTH, HEALTH_COLUMNS if "HEALTH_COLUMNS" in globals() else []),
+        (SQLITE_TABLE_EXCRETION, EXCRETION_COLUMNS if "EXCRETION_COLUMNS" in globals() else []),
+        (SQLITE_TABLE_HANDOVER, BUSINESS_HANDOVER_COLUMNS if "BUSINESS_HANDOVER_COLUMNS" in globals() else []),
+    ]:
+        try:
+            result[table_name] = supabase_read_table(table_name, columns=cols).to_dict(orient="records")
+        except Exception as e:
+            result[table_name] = [{"backup_error": str(e)}]
+    return result
+
+
+def _make_supabase_core_excel_bytes(supabase_data: dict):
+    output = BytesIO()
+    with pd.ExcelWriter(output, engine="openpyxl") as writer:
+        if not supabase_data:
+            pd.DataFrame([{"message": "Supabase未設定または主要データなし"}]).to_excel(writer, sheet_name="supabaseなし", index=False)
+        for table_name, records in supabase_data.items():
+            df = pd.DataFrame(records)
+            safe_sheet = re.sub(r"[\[\]\:\*\?\/\\]", "_", str(table_name))[:31] or "table"
+            df.to_excel(writer, sheet_name=safe_sheet, index=False)
+    output.seek(0)
+    return output.getvalue()
+
+
+def get_backup_target_status_df():
+    """バックアップ対象の検査表。管理画面に表示する。"""
+    rows = []
+    rows.append({
+        "対象": "SQLite DB本体",
+        "状態": "OK" if HIDAMARI_DB_FILE.exists() else "未作成",
+        "詳細": str(HIDAMARI_DB_FILE),
+    })
+    rows.append({
+        "対象": "SQLite全テーブルExcel退避",
+        "状態": "OK" if _list_sqlite_tables_for_backup() else "確認",
+        "詳細": f"{len(_list_sqlite_tables_for_backup())} テーブル",
+    })
+    rows.append({
+        "対象": "Supabase主要4機能JSON/Excel退避",
+        "状態": "OK" if ("supabase_is_enabled" in globals() and supabase_is_enabled()) else "未設定",
+        "詳細": "利用者マスタ・健康チェック・排泄チェック・申し送り",
+    })
+    for folder in [BUSINESS_HANDOVER_PHOTO_DIR, BUSINESS_HANDOVER_EXCEL_DIR]:
+        count = 0
+        if folder.exists():
+            count = len([f for f in folder.rglob("*") if f.is_file()])
+        rows.append({
+            "対象": folder.name,
+            "状態": "OK" if folder.exists() else "未作成",
+            "詳細": f"{count} ファイル",
+        })
+    return pd.DataFrame(rows)
+
+
 def create_backup_zip(kind="手動"):
     """
-    SQLite正本のDBと添付ファイルをZIP化して保存する。
-    商品版ではExcel/JSON互換ファイルをバックアップ対象にしません。
+    一括バックアップを作成する。
+    - SQLite DB本体
+    - SQLite全テーブルExcel退避
+    - Supabase主要4機能 JSON/Excel退避
+    - 写真・添付ファイル
+    - バックアップ情報
     """
     ensure_security_dirs()
     timestamp = format_now_jst("%Y%m%d_%H%M%S")
-    zip_path = BACKUP_DIR / f"hidamari_backup_{kind}_{timestamp}.zip"
+    safe_kind = re.sub(r"[^\w一-龥ぁ-んァ-ンー\-]", "_", str(kind))
+    zip_path = BACKUP_DIR / f"hidamari_backup_{safe_kind}_{timestamp}.zip"
 
     try:
         if HIDAMARI_DB_FILE.exists():
             with get_hidamari_conn() as conn:
                 conn.execute("PRAGMA wal_checkpoint(FULL);")
 
+        supabase_data = _read_supabase_core_tables_for_backup()
+        backup_info = {
+            "app": "ひだまり 健康チェック管理システム",
+            "created_at": format_now_jst("%Y-%m-%d %H:%M:%S"),
+            "kind": str(kind),
+            "user": current_login_user() if "current_login_user" in globals() else "",
+            "sqlite_db": str(HIDAMARI_DB_FILE),
+            "supabase_enabled": bool("supabase_is_enabled" in globals() and supabase_is_enabled()),
+            "sqlite_tables": _list_sqlite_tables_for_backup(),
+            "note": "SQLite本体に加えて、確認用ExcelとSupabase主要4機能の退避データを含みます。",
+        }
+
         with zipfile.ZipFile(zip_path, "w", zipfile.ZIP_DEFLATED) as zf:
+            zf.writestr("backup_info.json", json.dumps(backup_info, ensure_ascii=False, indent=2))
+
             if HIDAMARI_DB_FILE.exists():
                 zf.write(HIDAMARI_DB_FILE, arcname=f"data/{HIDAMARI_DB_FILE.name}")
 
@@ -1340,13 +1460,30 @@ def create_backup_zip(kind="手動"):
                 if life_db.exists():
                     zf.write(life_db, arcname=f"data/{life_db.name}")
 
+            # SQLite全テーブル確認用Excel
+            try:
+                zf.writestr("exports/sqlite_all_tables.xlsx", _make_all_sqlite_tables_excel_bytes())
+            except Exception as e:
+                zf.writestr("exports/sqlite_all_tables_error.txt", str(e))
+
+            # Supabase主要4機能退避
+            try:
+                zf.writestr(
+                    "exports/supabase_core_tables.json",
+                    json.dumps(supabase_data, ensure_ascii=False, indent=2, default=str),
+                )
+                zf.writestr("exports/supabase_core_tables.xlsx", _make_supabase_core_excel_bytes(supabase_data))
+            except Exception as e:
+                zf.writestr("exports/supabase_core_tables_error.txt", str(e))
+
+            # 写真・添付ファイル
             for folder in [BUSINESS_HANDOVER_PHOTO_DIR, BUSINESS_HANDOVER_EXCEL_DIR]:
                 if folder.exists():
                     for file in folder.rglob("*"):
                         if file.is_file():
                             zf.write(file, arcname=str(file))
 
-        record_backup_history(kind, zip_path, "成功", "SQLite正本バックアップ作成")
+        record_backup_history(kind, zip_path, "成功", "一括バックアップ作成")
         add_audit_log("バックアップ作成", "backup_history", zip_path.name, f"{kind}バックアップを作成")
         return zip_path, ""
     except Exception as e:
@@ -1416,6 +1553,314 @@ def restore_from_backup_zip(uploaded_file):
     except Exception as e:
         add_audit_log("データ復元失敗", "restore", "", str(e))
         return False, f"復元に失敗しました：{e}"
+
+
+# =========================
+# 起動時DB安全チェック・異常時復元（Ver4.8）
+# 自動復元はしない。異常を検知した場合のみ、管理者確認で最新バックアップから復元する。
+# =========================
+STARTUP_CRITICAL_TABLES = [
+    SQLITE_TABLE_USERS,
+    SQLITE_TABLE_HEALTH,
+    SQLITE_TABLE_EXCRETION,
+    SQLITE_TABLE_HANDOVER,
+    SQLITE_TABLE_SHORT_GOAL_CHECKS,
+    SQLITE_TABLE_APP_SETTINGS,
+]
+
+def get_latest_backup_zip():
+    """最新のバックアップZIPを返す。なければNone。"""
+    try:
+        ensure_security_dirs()
+        backups = sorted(
+            BACKUP_DIR.glob("hidamari_backup_*.zip"),
+            key=lambda x: x.stat().st_mtime,
+            reverse=True,
+        )
+        return backups[0] if backups else None
+    except Exception:
+        return None
+
+
+def _startup_sqlite_quick_check():
+    """SQLite quick_checkを直接実行する。起動前検査なので本体初期化に依存しすぎない。"""
+    try:
+        if not HIDAMARI_DB_FILE.exists():
+            return False, "DBファイルが存在しません。"
+        conn = sqlite3.connect(HIDAMARI_DB_FILE, timeout=DB_BUSY_TIMEOUT_MS / 1000)
+        try:
+            cur = conn.execute("PRAGMA quick_check;")
+            result = cur.fetchone()
+            text = str(result[0]) if result else ""
+            ok = text.lower() == "ok"
+            return ok, text or "quick_check結果なし"
+        finally:
+            conn.close()
+    except Exception as e:
+        return False, str(e)
+
+
+def _startup_table_counts():
+    """主要テーブルの存在と件数を確認する。"""
+    rows = []
+    try:
+        if not HIDAMARI_DB_FILE.exists():
+            return rows
+        conn = sqlite3.connect(HIDAMARI_DB_FILE, timeout=DB_BUSY_TIMEOUT_MS / 1000)
+        try:
+            existing = set(
+                r[0] for r in conn.execute(
+                    "SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%'"
+                ).fetchall()
+            )
+            for table_name in STARTUP_CRITICAL_TABLES:
+                if table_name not in existing:
+                    rows.append({
+                        "テーブル": table_name,
+                        "状態": "未作成",
+                        "件数": "",
+                        "詳細": "主要テーブルが見つかりません",
+                    })
+                    continue
+                try:
+                    count = conn.execute(f'SELECT COUNT(*) FROM "{table_name}"').fetchone()[0]
+                    rows.append({
+                        "テーブル": table_name,
+                        "状態": "OK",
+                        "件数": int(count),
+                        "詳細": "",
+                    })
+                except Exception as e:
+                    rows.append({
+                        "テーブル": table_name,
+                        "状態": "確認エラー",
+                        "件数": "",
+                        "詳細": str(e),
+                    })
+        finally:
+            conn.close()
+    except Exception as e:
+        rows.append({"テーブル": "SQLite接続", "状態": "確認エラー", "件数": "", "詳細": str(e)})
+    return rows
+
+
+def check_startup_database_health():
+    """
+    起動時の安全確認。
+    戻り値:
+      ok=True なら通常起動。
+      ok=False なら本体起動を止め、管理者だけ復元操作を出す。
+    """
+    latest_backup = get_latest_backup_zip()
+    result = {
+        "ok": True,
+        "severity": "normal",
+        "messages": [],
+        "db_exists": HIDAMARI_DB_FILE.exists(),
+        "quick_check_ok": None,
+        "quick_check_detail": "",
+        "table_rows": [],
+        "latest_backup": latest_backup,
+        "checked_at": format_now_jst("%Y-%m-%d %H:%M:%S"),
+    }
+
+    # 管理者が「新規DBとして続行」を明示した場合だけ、同一セッションでは止めない。
+    if st.session_state.get("startup_db_continue_without_restore"):
+        result["messages"].append("管理者確認により、このセッションでは新規DBとして続行します。")
+        return result
+
+    if not HIDAMARI_DB_FILE.exists():
+        if latest_backup:
+            result["ok"] = False
+            result["severity"] = "missing_db_with_backup"
+            result["messages"].append("SQLite DBファイルが見つかりません。最新バックアップから復元できます。")
+        else:
+            # 初回起動など、バックアップがない場合は通常初期化へ進める
+            result["messages"].append("SQLite DBファイルは未作成です。バックアップが無いため初回起動として初期化します。")
+        return result
+
+    quick_ok, quick_detail = _startup_sqlite_quick_check()
+    result["quick_check_ok"] = quick_ok
+    result["quick_check_detail"] = quick_detail
+    if not quick_ok:
+        result["ok"] = False
+        result["severity"] = "corrupt_db"
+        result["messages"].append(f"SQLite整合性チェックに失敗しました：{quick_detail}")
+
+    table_rows = _startup_table_counts()
+    result["table_rows"] = table_rows
+
+    missing_tables = [r["テーブル"] for r in table_rows if r.get("状態") == "未作成"]
+    error_tables = [r["テーブル"] for r in table_rows if r.get("状態") == "確認エラー"]
+
+    if latest_backup and missing_tables:
+        result["ok"] = False
+        result["severity"] = "missing_tables"
+        result["messages"].append("主要テーブルが不足しています：" + "、".join(missing_tables))
+
+    if error_tables:
+        result["ok"] = False
+        result["severity"] = "table_error"
+        result["messages"].append("主要テーブルの確認に失敗しました：" + "、".join(error_tables))
+
+    # バックアップがあるのに主要データがすべて0件の場合は、Streamlit Cloud再起動等による消失疑いとして止める。
+    key_tables = [SQLITE_TABLE_USERS, SQLITE_TABLE_HEALTH, SQLITE_TABLE_EXCRETION, SQLITE_TABLE_HANDOVER]
+    count_map = {}
+    for row in table_rows:
+        try:
+            if row.get("状態") == "OK":
+                count_map[row.get("テーブル")] = int(row.get("件数", 0))
+        except Exception:
+            pass
+    key_total = sum(count_map.get(t, 0) for t in key_tables)
+    if latest_backup and count_map and key_total == 0:
+        result["ok"] = False
+        result["severity"] = "empty_core_tables_with_backup"
+        result["messages"].append("バックアップが存在するのに主要データが0件です。データ消失の可能性があります。")
+
+    return result
+
+
+def restore_from_backup_path(backup_path: Path):
+    """サーバー内の既存バックアップZIPから復元する。管理者のみ。"""
+    if not is_admin_user():
+        return False, "管理者のみ復元できます。"
+    try:
+        backup_path = Path(backup_path)
+        ensure_security_dirs()
+        if not backup_path.exists():
+            return False, "指定されたバックアップファイルが見つかりません。"
+        # BACKUP_DIR配下のZIPだけ許可
+        try:
+            backup_path.resolve().relative_to(BACKUP_DIR.resolve())
+        except Exception:
+            return False, "安全のため、バックアップフォルダ内のZIPのみ復元できます。"
+
+        pre_backup, pre_err = create_backup_zip(kind="起動時復元前")
+        if pre_err:
+            return False, f"復元前バックアップに失敗しました：{pre_err}"
+
+        with zipfile.ZipFile(backup_path, "r") as zf:
+            names = zf.namelist()
+            if f"data/{HIDAMARI_DB_FILE.name}" not in names:
+                return False, "このZIPには hidamari_health.db が含まれていません。"
+
+            ensure_dirs()
+            HIDAMARI_DB_FILE.write_bytes(zf.read(f"data/{HIDAMARI_DB_FILE.name}"))
+
+            if "data/hidamari_life.db" in names:
+                (DATA_DIR / "hidamari_life.db").write_bytes(zf.read("data/hidamari_life.db"))
+
+            for folder in [BUSINESS_HANDOVER_PHOTO_DIR, BUSINESS_HANDOVER_EXCEL_DIR]:
+                for name in names:
+                    if name.startswith(str(folder)) and not name.endswith("/"):
+                        target = Path(name)
+                        target.parent.mkdir(parents=True, exist_ok=True)
+                        target.write_bytes(zf.read(name))
+
+        st.session_state.pop("startup_db_continue_without_restore", None)
+        add_audit_log("起動時データ復元", "restore", backup_path.name, "起動時異常検知後、最新バックアップZIPから復元")
+        record_backup_history("起動時復元", backup_path, "成功", "起動時異常検知後、最新バックアップZIPから復元")
+        return True, f"最新バックアップから復元しました：{backup_path.name} / 復元前バックアップ：{pre_backup.name if pre_backup else ''}"
+    except Exception as e:
+        try:
+            add_audit_log("起動時データ復元失敗", "restore", "", str(e))
+        except Exception:
+            pass
+        return False, f"復元に失敗しました：{e}"
+
+
+def show_startup_recovery_panel(check_result: dict):
+    """
+    起動時異常画面。
+    異常時は本体メニューを出さず、管理者にだけ復元ボタンを表示する。
+    """
+    st.error("起動時のデータ確認で異常を検知しました。")
+    st.caption("古いバックアップを誤って読み込まないため、自動復元は行いません。管理者が確認して復元します。")
+
+    messages = check_result.get("messages") or []
+    for msg in messages:
+        st.warning(msg)
+
+    rows = [
+        {"確認項目": "DB存在チェック", "状態": "OK" if check_result.get("db_exists") else "NG", "詳細": str(HIDAMARI_DB_FILE)},
+        {"確認項目": "SQLite整合性チェック", "状態": "OK" if check_result.get("quick_check_ok") else "NG", "詳細": check_result.get("quick_check_detail", "")},
+        {"確認項目": "検査日時", "状態": "情報", "詳細": check_result.get("checked_at", "")},
+    ]
+    st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True)
+
+    table_rows = check_result.get("table_rows") or []
+    if table_rows:
+        st.markdown("#### 主要テーブル件数チェック")
+        st.dataframe(pd.DataFrame(table_rows), use_container_width=True, hide_index=True)
+
+    latest_backup = check_result.get("latest_backup")
+    st.markdown("#### 復元候補")
+    if latest_backup:
+        try:
+            st.info(f"最新バックアップ：{latest_backup.name} / サイズ：{round(latest_backup.stat().st_size / 1024, 1)} KB")
+        except Exception:
+            st.info(f"最新バックアップ：{latest_backup.name}")
+    else:
+        st.warning("復元に使えるバックアップZIPが見つかりません。")
+
+    if not is_admin_user():
+        st.info("この画面は管理者確認が必要です。管理者でログインし直してください。")
+        return False
+
+    if latest_backup:
+        confirm = st.checkbox("最新バックアップから復元することを理解しました", key="startup_restore_confirm")
+        if st.button("最新バックアップから復元して起動する", type="primary", use_container_width=True):
+            if not confirm:
+                st.error("確認チェックを入れてください。")
+            else:
+                ok, msg = restore_from_backup_path(latest_backup)
+                if ok:
+                    st.success(msg)
+                    st.info("復元後に画面を再読み込みします。")
+                    st.rerun()
+                else:
+                    st.error(msg)
+
+    with st.expander("管理者用：復元せず新規DBとして続行", expanded=False):
+        st.warning("初回導入時など、バックアップが不要な場合だけ使います。既存データがあるはずの運用中は押さないでください。")
+        confirm_new = st.checkbox("復元せずに続行することを理解しました", key="startup_continue_confirm")
+        if st.button("復元せずに新規DBとして続行", use_container_width=True):
+            if not confirm_new:
+                st.error("確認チェックを入れてください。")
+            else:
+                st.session_state["startup_db_continue_without_restore"] = True
+                try:
+                    add_audit_log("起動時復元スキップ", "startup_check", "", "管理者が復元せず新規DBとして続行")
+                except Exception:
+                    pass
+                st.rerun()
+    return False
+
+
+def run_startup_database_guard():
+    """
+    ログイン後・本体初期化前に実行する。
+    Trueなら通常起動、Falseならst.stop()前提。
+    """
+    try:
+        check_result = check_startup_database_health()
+        st.session_state["startup_db_check_result"] = check_result
+        if check_result.get("ok", True):
+            return True
+        show_startup_recovery_panel(check_result)
+        return False
+    except Exception as e:
+        st.error(f"起動時データ確認に失敗しました：{e}")
+        if not is_admin_user():
+            st.info("管理者でログインし直してください。")
+            return False
+        st.warning("管理者のみ、初回起動として続行できます。")
+        if st.button("管理者として初回起動を続行", use_container_width=True):
+            st.session_state["startup_db_continue_without_restore"] = True
+            st.rerun()
+        return False
+
 def show_security_maintenance_menu():
     if not is_admin_user():
         st.warning("このメニューは管理者専用です。")
@@ -1429,7 +1874,13 @@ def show_security_maintenance_menu():
 
     with tab1:
         st.subheader("バックアップ")
-        st.write("SQLite DB、利用者マスタ、ログイン情報、写真・添付ファイルをZIPで保存します。")
+        st.write("SQLite DB、SQLite全テーブルExcel、Supabase主要4機能、写真・添付ファイルをZIPで保存します。")
+        st.markdown("#### バックアップ対象の検査")
+        try:
+            st.dataframe(get_backup_target_status_df(), use_container_width=True, hide_index=True)
+        except Exception as e:
+            st.warning(f"バックアップ対象の検査表示に失敗しました：{e}")
+
         if st.button("今すぐ手動バックアップを作成", type="primary", use_container_width=True):
             zip_path, err = create_backup_zip(kind="手動")
             if err:
@@ -9796,6 +10247,12 @@ def login_check():
 
     with col2:
         st.markdown('<h3 style="text-align:center;">ログイン</h3>', unsafe_allow_html=True)
+
+        # 終了ボタンから戻った直後の安心表示
+        end_msg = st.session_state.pop("hidamari_after_logout_message", "")
+        if end_msg:
+            st.success(end_msg)
+
         input_id = st.text_input("ID")
         input_password = st.text_input("パスワード", type="password")
 
@@ -9826,20 +10283,94 @@ def login_check():
     return False
 
 
+def clear_login_session():
+    """ログアウト時にログイン情報だけをクリアする。"""
+    st.session_state.logged_in = False
+    st.session_state.role = None
+    st.session_state.user_label = ""
+    st.session_state.username = ""
+    st.session_state.user_id = ""
+    st.session_state.login_user = ""
+    st.session_state.login_user_info = {}
+    st.session_state.force_password_change = False
+    st.session_state.pop("hidamari_login_message", None)
+
+
+def render_keep_alive_widget(interval_seconds: int = 240):
+    """
+    Streamlit Cloudのスリープ対策。
+    画面を開いている間、軽い通信を定期実行してセッションを維持する。
+    ※ブラウザや端末自体がスリープした場合は通信できないため、完全保証ではありません。
+    """
+    try:
+        interval_ms = max(60, int(interval_seconds)) * 1000
+        components.html(
+            f"""
+            <div style="font-size:12px;color:#6A5B52;padding:2px 0;">
+              接続維持中：{int(interval_seconds)}秒ごとに軽い確認通信を行います。
+            </div>
+            <script>
+            const hidamariKeepAliveInterval = {interval_ms};
+            async function hidamariKeepAlivePing() {{
+              try {{
+                await fetch(window.location.href, {{
+                  method: "GET",
+                  cache: "no-store",
+                  mode: "no-cors"
+                }});
+              }} catch (e) {{}}
+            }}
+            hidamariKeepAlivePing();
+            setInterval(hidamariKeepAlivePing, hidamariKeepAliveInterval);
+            </script>
+            """,
+            height=28,
+        )
+    except Exception:
+        pass
+
+
+def finish_work_backup_and_logout():
+    """
+    職員が最後に押すボタン用。
+    1) 一括バックアップ作成
+    2) 監査ログ記録
+    3) ログアウト
+    """
+    zip_path, err = create_backup_zip(kind="終了時")
+    if err:
+        add_audit_log("終了時バックアップ失敗", "backup_history", "", err)
+        return False, f"バックアップに失敗しました：{err}"
+
+    backup_name = zip_path.name if zip_path else ""
+    add_audit_log("保存して終了", "backup_history", backup_name, "職員終了ボタンから一括バックアップを作成してログアウト")
+    clear_login_session()
+    st.session_state["hidamari_after_logout_message"] = f"本日の入力を保存しました。終了時バックアップ：{backup_name}"
+    return True, st.session_state["hidamari_after_logout_message"]
+
+
 def logout_button():
     with st.sidebar:
         st.caption(f"ログイン中：{st.session_state.user_label}")
-        if st.button("ログアウト"):
-            st.session_state.logged_in = False
-            st.session_state.role = None
-            st.session_state.user_label = ""
-            st.session_state.username = ""
-            st.session_state.user_id = ""
-            st.session_state.login_user = ""
-            st.session_state.login_user_info = {}
-            st.session_state.force_password_change = False
-            st.session_state.pop("hidamari_login_message", None)
-            st.rerun()
+
+        st.markdown("### 終了操作")
+        st.caption("作業を終えるときは、下のボタンでバックアップを作成してから終了します。")
+        if st.button("本日の入力を保存して終了", type="primary", use_container_width=True):
+            ok, msg = finish_work_backup_and_logout()
+            if ok:
+                st.rerun()
+            else:
+                st.error(msg)
+
+        with st.expander("接続維持・手動操作", expanded=False):
+            st.caption("画面を開いている間は、アプリが眠りにくいように軽い通信を行います。")
+            if st.button("今すぐ接続確認", use_container_width=True):
+                add_audit_log("接続確認", "keep_alive", "", "手動の接続確認を実行")
+                st.success(f"接続確認OK：{format_now_jst('%Y-%m-%d %H:%M:%S')}")
+            st.caption("通常のログアウトだけ行う場合はこちら。バックアップは作成しません。")
+            if st.button("ログアウトのみ", use_container_width=True):
+                clear_login_session()
+                st.rerun()
 
 
 # =========================
@@ -10656,7 +11187,14 @@ apply_product_ui_ux()
 if not login_check():
     st.stop()
 
+# 画面を開いている間のスリープ対策
+render_keep_alive_widget(interval_seconds=240)
+
 logout_button()
+
+# 起動時DB安全チェック（異常時は管理者復元画面で停止）
+if not run_startup_database_guard():
+    st.stop()
 
 # SQLite・セキュリティテーブル初期化と1日1回自動バックアップ
 ensure_hidamari_db()
