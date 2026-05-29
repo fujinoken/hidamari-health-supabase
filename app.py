@@ -310,14 +310,55 @@ def _secret_get(container, key, default=""):
     return default
 
 
+def _normalize_supabase_url(url: str) -> str:
+    """
+    Supabase URLを安全に正規化する。
+
+    今回の事故防止ポイント：
+    - /rest/v1/ まで貼っても自動で Project URL に戻す
+    - .supabase.corest のような入力ミスを補正する
+    - huufblmiqvloudeqctjp と huufblmiqvloudeqctjp の c/q 入れ替わりを補正する
+    - 末尾スラッシュを削除する
+    """
+    if not url:
+        return ""
+
+    url = str(url).strip().strip('"').strip("'")
+    url = url.replace(" ", "").replace("\n", "").replace("\r", "").replace("\t", "")
+
+    # よくある誤入力: .co/rest が .corest になった場合
+    url = url.replace(".supabase.corest", ".supabase.co/rest")
+
+    # スキームがない場合の補完
+    if url and not url.startswith(("http://", "https://")):
+        url = "https://" + url
+
+    # Data API URLをそのまま貼った場合でもProject URLに戻す
+    if "/rest/v1" in url:
+        url = url.split("/rest/v1")[0]
+
+    url = url.rstrip("/")
+
+    # 今回確認済みの正しいProject Ref
+    correct_ref = "huufblmiqvloudeqctjp"
+    known_bad_refs = {
+        "huufblmiqvloudecqtjp": correct_ref,  # c と q の位置違い
+    }
+    for bad, good in known_bad_refs.items():
+        url = url.replace(bad, good)
+
+    return url
+
+
 def _supabase_config():
     """
     Streamlit Secretsを柔軟に読む。
+
     推奨：
         [supabase]
         enabled = true
-        url = "https://xxxxx.supabase.co"
-        key = "sb_publishable_xxxxx"
+        url = "https://huufblmiqvloudeqctjp.supabase.co"
+        key = "sb_secret_xxxxx"
 
     互換：
         SUPABASE_URL = "..."
@@ -343,21 +384,21 @@ def _supabase_config():
         return ""
 
     enabled_raw = pick("enabled", "SUPABASE_ENABLED")
-    url = pick("url", "SUPABASE_URL")
+    raw_url = pick("url", "SUPABASE_URL")
     key = pick("key", "service_role_key", "anon_key", "SUPABASE_KEY", "SUPABASE_SERVICE_ROLE_KEY", "SUPABASE_ANON_KEY")
 
-    # Data API の /rest/v1/ まで貼ってしまった場合でも自動補正する
-    url = url.strip()
-    if "/rest/v1" in url:
-        url = url.split("/rest/v1")[0]
-    url = url.rstrip("/")
+    url = _normalize_supabase_url(raw_url)
 
     enabled = str(enabled_raw).lower() in ["1", "true", "yes", "on", "有効"]
     if not enabled and url and key:
         enabled = True
 
-    return {"enabled": enabled, "url": url, "key": key}
-
+    return {
+        "enabled": enabled,
+        "url": url,
+        "key": key,
+        "raw_url": raw_url,
+    }
 
 def supabase_is_enabled():
     cfg = _supabase_config()
@@ -544,6 +585,8 @@ def get_supabase_diagnostic_rows():
         {"項目": "requests", "状態": "OK" if requests is not None else "NG", "詳細": "requests利用可能" if requests is not None else "requestsが利用できません"},
         {"項目": "enabled", "状態": "OK" if cfg.get("enabled") else "NG", "詳細": str(cfg.get("enabled"))},
         {"項目": "url", "状態": "OK" if cfg.get("url") else "NG", "詳細": cfg.get("url", "")},
+        {"項目": "raw_url", "状態": "参考", "詳細": cfg.get("raw_url", "")},
+        {"項目": "project_ref", "状態": "OK" if "huufblmiqvloudeqctjp" in cfg.get("url", "") else "確認", "詳細": "正：huufblmiqvloudeqctjp ／ 誤：huufblmiqvloudecqtjp"},
         {"項目": "key", "状態": "OK" if cfg.get("key") else "NG", "詳細": "設定済み" if cfg.get("key") else "未設定"},
     ]
     if supabase_is_enabled():
@@ -1301,8 +1344,8 @@ def show_security_maintenance_menu():
         st.markdown("#### Streamlit Secrets 設定例")
         st.code('''[supabase]
 enabled = true
-url = "https://xxxxxxxx.supabase.co"
-key = "sb_publishable_xxxxxxxxxxxxxxxxx"''', language="toml")
+url = "https://huufblmiqvloudeqctjp.supabase.co"
+key = "sb_secret_xxxxxxxxxxxxxxxxx"''', language="toml")
 
         st.markdown("#### Supabase SQL Editorで実行するSQL")
         st.code(get_supabase_create_table_sql() if "get_supabase_create_table_sql" in globals() else "", language="sql")
@@ -6927,15 +6970,13 @@ def show_business_handover_menu():
                 )
 
             st.markdown("#### 写真添付の更新")
-            current_photo_preview = clean_text(selected_row.get("写真1")) or clean_text(selected_row.get("写真2"))
-            if current_photo_preview:
-                show_business_handover_photo(current_photo_preview, "現在の添付写真")
-            update_photo1_file = st.file_uploader("写真を差し替える", type=["jpg", "jpeg", "png", "webp"], key="bh_update_photo1")
-            remove_photo1 = st.checkbox("添付写真を削除", key="bh_remove_photo1")
-            update_photo2_file = None  # 旧カラム互換用
-            remove_photo2 = False
-            if update_photo1_file is not None:
-                st.image(update_photo1_file, caption="差し替え予定の写真", use_container_width=True)
+            up1, up2 = st.columns(2)
+            with up1:
+                update_photo1_file = st.file_uploader("写真1を差し替える", type=["jpg", "jpeg", "png", "webp"], key="bh_update_photo1")
+                remove_photo1 = st.checkbox("写真1を削除", key="bh_remove_photo1")
+            with up2:
+                update_photo2_file = st.file_uploader("写真2を差し替える", type=["jpg", "jpeg", "png", "webp"], key="bh_update_photo2")
+                remove_photo2 = st.checkbox("写真2を削除", key="bh_remove_photo2")
 
             st.markdown("#### 入力Excelデータの更新")
             current_excel_path = clean_text(selected_row.get("入力Excelファイル"))
@@ -6990,12 +7031,16 @@ def show_business_handover_menu():
             df_update.loc[mask, "優先度"] = update_priority
             df_update.loc[mask, "対応状況"] = update_status
 
-            current_photo1 = clean_text(selected_row.get("写真1")) or clean_text(selected_row.get("写真2"))
-            current_photo2 = ""
+            current_photo1 = clean_text(selected_row.get("写真1"))
+            current_photo2 = clean_text(selected_row.get("写真2"))
             if remove_photo1:
                 current_photo1 = ""
             elif update_photo1_file is not None:
                 current_photo1 = save_business_handover_photo(update_photo1_file, selected_id, 1)
+            if remove_photo2:
+                current_photo2 = ""
+            elif update_photo2_file is not None:
+                current_photo2 = save_business_handover_photo(update_photo2_file, selected_id, 2)
 
             current_input_excel = clean_text(selected_row.get("入力Excelファイル"))
             current_input_excel_text = clean_text(selected_row.get("入力Excel表示情報"))
