@@ -639,6 +639,210 @@ create table if not exists public.handover_logs (
 );
 """.strip()
 
+
+# =========================
+# 共通削除関数（Ver4.2）
+# SQLite DELETE + Supabase DELETE + 監査ログ + 画面再読み込みのための共通基盤
+# upsert保存では既存行が消えないため、削除は必ずこの直接DELETE系を使う。
+# =========================
+def _sql_quote_identifier(name: str) -> str:
+    return '"' + str(name).replace('"', '""') + '"'
+
+
+def _normalize_delete_value(value, col_name=""):
+    if value is None:
+        return ""
+    try:
+        if pd.isna(value):
+            return ""
+    except Exception:
+        pass
+    if isinstance(value, (datetime, date)):
+        if col_name in ["記録日", "日付", "開始日", "終了予定日", "作成日"]:
+            return value.strftime("%Y-%m-%d")
+        return value.isoformat()
+    text = str(value).strip()
+    if col_name in ["記録日", "日付", "開始日", "終了予定日", "作成日"]:
+        dt = pd.to_datetime(text, errors="coerce")
+        if not pd.isna(dt):
+            return dt.strftime("%Y-%m-%d")
+    return text
+
+
+def sqlite_delete_records(table_name: str, where: dict) -> int:
+    """SQLiteから条件一致する行を直接DELETEする。whereはAND条件。"""
+    if not table_name or not where:
+        return 0
+    validate_sqlite_identifier(table_name)
+    clauses = []
+    params = []
+    date_cols = {"記録日", "日付", "開始日", "終了予定日", "作成日"}
+    for col, value in where.items():
+        col_name = str(col)
+        q_col = _sql_quote_identifier(col_name)
+        norm_value = _normalize_delete_value(value, col_name)
+        if col_name in date_cols:
+            clauses.append(f"date({q_col}) = date(?)")
+        else:
+            clauses.append(f"trim(CAST({q_col} AS TEXT)) = trim(CAST(? AS TEXT))")
+        params.append(norm_value)
+    sql = f"DELETE FROM {_sql_quote_identifier(table_name)} WHERE " + " AND ".join(clauses)
+    with hidamari_write_transaction() as conn:
+        cur = conn.execute(sql, params)
+        deleted = int(cur.rowcount or 0)
+    return deleted
+
+
+def supabase_delete_by_record_keys(table_name: str, record_keys) -> int:
+    """SupabaseのJSONB汎用テーブルからrecord_keyで直接DELETEする。"""
+    if not supabase_is_enabled() or table_name not in SUPABASE_CORE_TABLES:
+        return 0
+    if requests is None:
+        return 0
+    deleted = 0
+    keys = []
+    for key in record_keys or []:
+        key = clean_text(key) if "clean_text" in globals() else str(key).strip()
+        if key and key not in keys:
+            keys.append(key)
+    for key in keys:
+        try:
+            url = _supabase_endpoint(table_name, f"?record_key=eq.{requests.utils.quote(str(key), safe='')}")
+            res = requests.delete(url, headers=_supabase_headers(prefer="return=minimal"), timeout=20)
+            if res.status_code in [200, 202, 204]:
+                deleted += 1
+            else:
+                try:
+                    st.warning(f"Supabase削除注意：{table_name} / {key} / HTTP {res.status_code} / {res.text[:160]}")
+                except Exception:
+                    pass
+        except Exception as e:
+            try:
+                st.warning(f"Supabase削除に失敗しました：{table_name} / {key} / {e}")
+            except Exception:
+                pass
+    return deleted
+
+
+def _build_supabase_delete_key(table_name: str, row: dict, unique_cols=None) -> str:
+    try:
+        return _make_supabase_record_key(row, table_name, unique_cols=unique_cols)
+    except Exception:
+        return ""
+
+
+def delete_record_common(table_name: str, sqlite_where: dict, supabase_keys=None, operation="削除", target_key="", summary="") -> dict:
+    """削除共通関数。SQLiteとSupabaseの両方を直接DELETEし、監査ログを残す。"""
+    result = {"sqlite_deleted": 0, "supabase_deleted": 0, "ok": False, "error": ""}
+    try:
+        result["sqlite_deleted"] = sqlite_delete_records(table_name, sqlite_where)
+        result["supabase_deleted"] = supabase_delete_by_record_keys(table_name, supabase_keys or [])
+        result["ok"] = result["sqlite_deleted"] > 0 or result["supabase_deleted"] > 0
+        try:
+            add_audit_log(
+                operation,
+                table_name,
+                target_key,
+                f"{summary} / SQLite削除:{result['sqlite_deleted']} / Supabase削除:{result['supabase_deleted']}",
+            )
+        except Exception:
+            pass
+    except Exception as e:
+        result["error"] = str(e)
+        try:
+            add_audit_log(f"{operation}失敗", table_name, target_key, str(e))
+        except Exception:
+            pass
+    return result
+
+
+def delete_business_handover_record(record_id: str, source="") -> dict:
+    record_id = clean_text(record_id) if "clean_text" in globals() else str(record_id).strip()
+    return delete_record_common(
+        SQLITE_TABLE_HANDOVER,
+        {"記録ID": record_id},
+        supabase_keys=[record_id],
+        operation="申し送り削除",
+        target_key=record_id,
+        summary=source or "業務全体申し送りを削除",
+    )
+
+
+def delete_health_record(record_date, user_name, user_id="", source="") -> dict:
+    date_text = _normalize_delete_value(record_date, "記録日")
+    user_name = clean_text(user_name) if "clean_text" in globals() else str(user_name).strip()
+    user_id = ensure_user_id_value(user_id, user_name) if "ensure_user_id_value" in globals() else str(user_id or "").strip()
+    row = {"記録日": date_text, "利用者名": user_name, "user_id": user_id}
+    keys = [
+        _build_supabase_delete_key(SQLITE_TABLE_HEALTH, row, unique_cols=["記録日", "利用者名"]),
+        _build_supabase_delete_key(SQLITE_TABLE_HEALTH, row, unique_cols=["記録日", "user_id"]),
+    ]
+    return delete_record_common(
+        SQLITE_TABLE_HEALTH,
+        {"記録日": date_text, "利用者名": user_name},
+        supabase_keys=keys,
+        operation="健康チェック削除",
+        target_key=f"{date_text}_{user_name}",
+        summary=source or "健康チェックを削除",
+    )
+
+
+def delete_excretion_record(record_date, user_name, slot, user_id="", source="") -> dict:
+    date_text = _normalize_delete_value(record_date, "記録日")
+    user_name = clean_text(user_name) if "clean_text" in globals() else str(user_name).strip()
+    slot = clean_text(slot) if "clean_text" in globals() else str(slot).strip()
+    user_id = ensure_user_id_value(user_id, user_name) if "ensure_user_id_value" in globals() else str(user_id or "").strip()
+    row = {"記録日": date_text, "利用者名": user_name, "user_id": user_id, "時間帯": slot}
+    keys = [
+        _build_supabase_delete_key(SQLITE_TABLE_EXCRETION, row, unique_cols=["記録日", "利用者名", "時間帯"]),
+        _build_supabase_delete_key(SQLITE_TABLE_EXCRETION, row, unique_cols=["記録日", "user_id", "時間帯"]),
+    ]
+    return delete_record_common(
+        SQLITE_TABLE_EXCRETION,
+        {"記録日": date_text, "利用者名": user_name, "時間帯": slot},
+        supabase_keys=keys,
+        operation="排泄チェック削除",
+        target_key=f"{date_text}_{user_name}_{slot}",
+        summary=source or "排泄チェックを削除",
+    )
+
+
+def delete_short_goal_check_records(record_ids, source="") -> dict:
+    ids = []
+    for rid in record_ids or []:
+        rid = clean_text(rid) if "clean_text" in globals() else str(rid).strip()
+        if rid and rid not in ids:
+            ids.append(rid)
+    total_sqlite = 0
+    errors = []
+    for rid in ids:
+        try:
+            total_sqlite += sqlite_delete_records(SQLITE_TABLE_SHORT_GOAL_CHECKS, {"記録ID": rid})
+        except Exception as e:
+            errors.append(f"{rid}: {e}")
+    try:
+        add_audit_log(
+            "短期目標実施チェック削除",
+            SQLITE_TABLE_SHORT_GOAL_CHECKS,
+            ",".join(ids[:10]),
+            f"{source or '実施履歴を削除'} / SQLite削除:{total_sqlite} / 対象:{len(ids)}件",
+        )
+    except Exception:
+        pass
+    return {"sqlite_deleted": total_sqlite, "supabase_deleted": 0, "ok": total_sqlite > 0, "error": " / ".join(errors)}
+
+
+def show_delete_result_and_rerun(result: dict, success_message="削除しました。"):
+    if result.get("error"):
+        st.error(f"削除に失敗しました：{result.get('error')}")
+        return
+    if result.get("ok"):
+        st.success(success_message)
+        st.rerun()
+    else:
+        st.error("削除対象が見つかりません。")
+
+
 def initialize_sqlite_engine():
     return db_engine.initialize_sqlite_engine()
 
@@ -7473,9 +7677,8 @@ def show_business_handover_menu():
             if before_count == after_count:
                 st.error("削除対象の記録が見つかりません。")
             else:
-                save_business_handover_data(df_delete)
-                st.success("業務全体申し送りを削除しました。")
-                st.rerun()
+                result = delete_business_handover_record(selected_id, source="業務全体申し送り画面から削除")
+                show_delete_result_and_rerun(result, "業務全体申し送りを削除しました。")
 
     if handover_mode == "予定候補抽出・出力":
         show_handover_schedule_export_menu()
@@ -7883,12 +8086,15 @@ def show_goal_history():
                     if not confirm_delete:
                         st.error("削除する場合は、確認チェックを入れてください。")
                     else:
-                        before_count = len(df)
-                        new_df = df[~df["記録ID"].fillna("").astype(str).isin(preview_ids)].copy()
-                        deleted_count = before_count - len(new_df)
-                        save_short_goal_checks(new_df)
-                        st.success(f"実施履歴を{deleted_count}件削除しました。")
-                        st.rerun()
+                        result = delete_short_goal_check_records(preview_ids, source="短期目標実施履歴画面から削除")
+                        if result.get("error"):
+                            st.error(f"削除中に一部エラーがありました：{result.get('error')}")
+                        deleted_count = result.get("sqlite_deleted", 0)
+                        if deleted_count > 0:
+                            st.success(f"実施履歴を{deleted_count}件削除しました。")
+                            st.rerun()
+                        else:
+                            st.error("削除対象が見つかりません。")
     else:
         st.info("実施履歴の削除は管理者のみ可能です。")
 
@@ -11795,14 +12001,9 @@ elif menu == "過去データ管理":
                     if not delete_check:
                         st.error("削除する場合は確認チェックを入れてください。")
                     else:
-                        health_df = health_df.drop(index=idx).reset_index(drop=True)
-                        save_health_data(health_df)
-                        try:
-                            add_audit_log("健康チェック削除", SQLITE_TABLE_HEALTH, f"{key_date}_{key_user}", "過去データ管理から削除")
-                        except Exception:
-                            pass
-                        st.success("削除しました。")
-                        st.rerun()
+                        target_user_id = current.get("user_id", "") if isinstance(current, dict) else ""
+                        result = delete_health_record(key_date, key_user, user_id=target_user_id, source="過去データ管理から削除")
+                        show_delete_result_and_rerun(result, "削除しました。")
 
             st.divider()
             st.subheader("一覧検索")
@@ -12092,13 +12293,8 @@ elif menu == "過去データ管理":
                         if len(delete_df) == before_count:
                             st.error("削除対象が見つかりません。")
                         else:
-                            save_business_handover_data(delete_df)
-                            try:
-                                add_audit_log("申し送り削除", SQLITE_TABLE_HANDOVER, selected_id, "過去データ管理から削除")
-                            except Exception:
-                                pass
-                            st.success("申し送りを削除しました。")
-                            st.rerun()
+                            result = delete_business_handover_record(selected_id, source="過去データ管理から削除")
+                            show_delete_result_and_rerun(result, "申し送りを削除しました。")
 
 
 # =========================
@@ -12275,10 +12471,9 @@ elif menu == "排泄詳細管理":
                 ex_df = load_excretion_data()
                 idx = find_excretion_index(ex_df, key_date, key_user, key_slot)
                 if idx is not None:
-                    ex_df = ex_df.drop(index=idx).reset_index(drop=True)
-                    save_excretion_data(ex_df)
-                    st.success("削除しました。")
-                    st.rerun()
+                    target_user_id = current.get("user_id", "") if isinstance(current, dict) else ""
+                    result = delete_excretion_record(key_date, key_user, key_slot, user_id=target_user_id, source="排泄詳細管理から削除")
+                    show_delete_result_and_rerun(result, "削除しました。")
 
 
 # =========================
