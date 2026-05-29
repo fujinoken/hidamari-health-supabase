@@ -10297,19 +10297,31 @@ def clear_login_session():
     st.session_state.pop("hidamari_login_message", None)
 
 
-def render_keep_alive_widget(interval_seconds: int = 240):
+def render_keep_alive_widget(interval_seconds: int = 240, show_status: bool = False):
     """
     Streamlit Cloudのスリープ対策。
     画面を開いている間、軽い通信を定期実行してセッションを維持する。
     ※ブラウザや端末自体がスリープした場合は通信できないため、完全保証ではありません。
+
+    運用方針：
+    - 職員画面では余計な技術表示を出さない
+    - 管理者画面のみ、接続維持中の説明表示を出せる
     """
     try:
         interval_ms = max(60, int(interval_seconds)) * 1000
+        status_html = ""
+        height = 1
+        if show_status:
+            status_html = (
+                f'<div style="font-size:12px;color:#6A5B52;padding:2px 0;">'
+                f'接続維持中：{int(interval_seconds)}秒ごとに軽い確認通信を行います。'
+                f'</div>'
+            )
+            height = 28
+
         components.html(
             f"""
-            <div style="font-size:12px;color:#6A5B52;padding:2px 0;">
-              接続維持中：{int(interval_seconds)}秒ごとに軽い確認通信を行います。
-            </div>
+            {status_html}
             <script>
             const hidamariKeepAliveInterval = {interval_ms};
             async function hidamariKeepAlivePing() {{
@@ -10325,103 +10337,10 @@ def render_keep_alive_widget(interval_seconds: int = 240):
             setInterval(hidamariKeepAlivePing, hidamariKeepAliveInterval);
             </script>
             """,
-            height=28,
+            height=height,
         )
     except Exception:
         pass
-
-
-
-
-def render_auto_backup_download_from_session():
-    """
-    終了時バックアップ作成後、ログイン画面でZIPをPCへ保存させる。
-    まず自動ダウンロードを試み、失敗時のために手動ダウンロードボタンも表示する。
-    """
-    backup_name = st.session_state.get("hidamari_backup_download_name", "")
-    backup_bytes = st.session_state.get("hidamari_backup_download_bytes", None)
-    if not backup_name or not backup_bytes:
-        return
-
-    st.info("バックアップZIPをPCに保存します。自動で保存されない場合は、下のボタンを押してください。")
-
-    try:
-        if isinstance(backup_bytes, str):
-            backup_bytes_for_button = backup_bytes.encode("utf-8")
-        else:
-            backup_bytes_for_button = bytes(backup_bytes)
-
-        # 手動ダウンロードの保険
-        st.download_button(
-            "バックアップZIPをダウンロード",
-            data=backup_bytes_for_button,
-            file_name=backup_name,
-            mime="application/zip",
-            use_container_width=True,
-            key=f"download_backup_{backup_name}",
-        )
-
-        # 自動ダウンロードを試行
-        b64 = base64.b64encode(backup_bytes_for_button).decode("ascii")
-        safe_name = json.dumps(backup_name, ensure_ascii=False)
-        html = f'''
-        <script>
-        (function() {{
-            const storageKey = "hidamari_auto_download_" + {safe_name};
-            if (sessionStorage.getItem(storageKey) === "done") {{ return; }}
-            sessionStorage.setItem(storageKey, "done");
-            const b64 = "{b64}";
-            const byteCharacters = atob(b64);
-            const byteNumbers = new Array(byteCharacters.length);
-            for (let i = 0; i < byteCharacters.length; i++) {{
-                byteNumbers[i] = byteCharacters.charCodeAt(i);
-            }}
-            const byteArray = new Uint8Array(byteNumbers);
-            const blob = new Blob([byteArray], {{type: "application/zip"}});
-            const url = URL.createObjectURL(blob);
-            const a = document.createElement("a");
-            a.href = url;
-            a.download = {safe_name};
-            document.body.appendChild(a);
-            a.click();
-            setTimeout(function() {{
-                URL.revokeObjectURL(url);
-                a.remove();
-            }}, 1000);
-        }})();
-        </script>
-        '''
-        components.html(html, height=0)
-    except Exception as e:
-        st.warning(f"自動ダウンロードの準備に失敗しました：{e}")
-
-
-def finish_work_backup_and_logout():
-    """
-    職員が最後に押すボタン用。
-    1) 一括バックアップ作成
-    2) 監査ログ記録
-    3) ログアウト
-    """
-    zip_path, err = create_backup_zip(kind="終了時")
-    if err:
-        add_audit_log("終了時バックアップ失敗", "backup_history", "", err)
-        return False, f"バックアップに失敗しました：{err}"
-
-    backup_name = zip_path.name if zip_path else ""
-
-    # サーバー内保存だけでなく、ログアウト後にPCへ自動ダウンロードできるようセッションへ保持
-    try:
-        if zip_path and Path(zip_path).exists():
-            st.session_state["hidamari_backup_download_name"] = backup_name
-            st.session_state["hidamari_backup_download_bytes"] = Path(zip_path).read_bytes()
-    except Exception as e:
-        add_audit_log("終了時バックアップ読込失敗", "backup_history", backup_name, str(e))
-
-    add_audit_log("保存して終了", "backup_history", backup_name, "職員終了ボタンから一括バックアップを作成し、PCダウンロード用データを準備してログアウト")
-    clear_login_session()
-    st.session_state["hidamari_after_logout_message"] = f"本日の入力を保存しました。終了時バックアップ：{backup_name}"
-    return True, st.session_state["hidamari_after_logout_message"]
 
 
 def logout_button():
@@ -10437,15 +10356,18 @@ def logout_button():
             else:
                 st.error(msg)
 
-        with st.expander("接続維持・手動操作", expanded=False):
-            st.caption("画面を開いている間は、アプリが眠りにくいように軽い通信を行います。")
-            if st.button("今すぐ接続確認", use_container_width=True):
-                add_audit_log("接続確認", "keep_alive", "", "手動の接続確認を実行")
-                st.success(f"接続確認OK：{format_now_jst('%Y-%m-%d %H:%M:%S')}")
-            st.caption("通常のログアウトだけ行う場合はこちら。バックアップは作成しません。")
-            if st.button("ログアウトのみ", use_container_width=True):
-                clear_login_session()
-                st.rerun()
+        # 接続維持・手動操作は管理者だけに表示する。
+        # 職員画面では「本日の入力を保存して終了」に一本化し、迷いと誤操作を減らす。
+        if is_admin_user():
+            with st.expander("接続維持・手動操作", expanded=False):
+                st.caption("画面を開いている間は、アプリが眠りにくいように軽い通信を行います。")
+                if st.button("今すぐ接続確認", use_container_width=True):
+                    add_audit_log("接続確認", "keep_alive", "", "手動の接続確認を実行")
+                    st.success(f"接続確認OK：{format_now_jst('%Y-%m-%d %H:%M:%S')}")
+                st.caption("通常のログアウトだけ行う場合はこちら。バックアップは作成しません。")
+                if st.button("ログアウトのみ", use_container_width=True):
+                    clear_login_session()
+                    st.rerun()
 
 
 # =========================
@@ -11263,7 +11185,8 @@ if not login_check():
     st.stop()
 
 # 画面を開いている間のスリープ対策
-render_keep_alive_widget(interval_seconds=240)
+# 職員には技術的な接続維持表示を出さず、管理者だけ状態表示する。
+render_keep_alive_widget(interval_seconds=240, show_status=is_admin_user())
 
 logout_button()
 
