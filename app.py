@@ -1586,15 +1586,122 @@ def run_daily_auto_backup():
 
 
 
-def restore_from_backup_zip(uploaded_file):
-    """SQLite正本バックアップZIPからDB等を復元する。管理者のみ。"""
+def _restore_supabase_core_tables_from_backup(zf, names):
+    """
+    バックアップZIP内の exports/supabase_core_tables.json から、
+    Supabase主要4機能（利用者・健康・排泄・申し送り）へ復元する。
+    安全優先のため、現在のSupabase全削除は行わず、record_key単位のupsertで戻す。
+    """
+    result = {
+        "ok": False,
+        "restored_counts": {},
+        "messages": [],
+        "error": "",
+    }
+
+    if not ("supabase_is_enabled" in globals() and supabase_is_enabled()):
+        result["error"] = "Supabaseが未設定または接続できません。"
+        return result
+
+    if "exports/supabase_core_tables.json" not in names:
+        result["error"] = "このバックアップZIPには Supabase主要4機能データ（exports/supabase_core_tables.json）が含まれていません。"
+        return result
+
+    try:
+        raw = zf.read("exports/supabase_core_tables.json").decode("utf-8")
+        supabase_data = json.loads(raw) if raw.strip() else {}
+        if not isinstance(supabase_data, dict):
+            result["error"] = "Supabase復元データの形式が正しくありません。"
+            return result
+
+        targets = [
+            (SQLITE_TABLE_USERS, USER_COLUMNS if "USER_COLUMNS" in globals() else [], ["user_id"]),
+            (SQLITE_TABLE_HEALTH, HEALTH_COLUMNS if "HEALTH_COLUMNS" in globals() else [], ["記録日", "user_id"]),
+            (SQLITE_TABLE_EXCRETION, EXCRETION_COLUMNS if "EXCRETION_COLUMNS" in globals() else [], ["記録日", "user_id", "時間帯"]),
+            (SQLITE_TABLE_HANDOVER, BUSINESS_HANDOVER_COLUMNS if "BUSINESS_HANDOVER_COLUMNS" in globals() else [], ["記録ID"]),
+        ]
+
+        restored_any = False
+        for table_name, cols, unique_cols in targets:
+            records = supabase_data.get(table_name, [])
+            if not isinstance(records, list):
+                records = []
+
+            # backup_error行は復元対象から除外
+            clean_records = []
+            for item in records:
+                if isinstance(item, dict) and "backup_error" not in item:
+                    clean_records.append(item)
+
+            df = pd.DataFrame(clean_records)
+            if cols:
+                try:
+                    df = normalize_df_columns(df, cols)
+                except Exception:
+                    for col in cols:
+                        if col not in df.columns:
+                            df[col] = ""
+                    df = df[cols] if cols else df
+
+            if df.empty:
+                result["restored_counts"][table_name] = 0
+                continue
+
+            ok = supabase_upsert_table(df, table_name, columns=cols, unique_cols=unique_cols)
+            if ok:
+                restored_any = True
+                result["restored_counts"][table_name] = len(df)
+                result["messages"].append(f"{SUPABASE_CORE_LABELS.get(table_name, table_name)}：{len(df)}件")
+                # Supabase復元後、SQLiteミラーにも同じ内容を残す
+                try:
+                    _original_save_sqlite_table(
+                        df,
+                        table_name,
+                        cols,
+                        date_cols=["記録日"] if table_name in [SQLITE_TABLE_HEALTH, SQLITE_TABLE_EXCRETION] else (["日付"] if table_name == SQLITE_TABLE_HANDOVER else None),
+                        unique_cols=unique_cols,
+                    )
+                except Exception:
+                    pass
+            else:
+                result["restored_counts"][table_name] = 0
+                result["messages"].append(f"{SUPABASE_CORE_LABELS.get(table_name, table_name)}：復元失敗")
+
+        result["ok"] = restored_any
+        if not restored_any:
+            result["error"] = "Supabaseへ復元できるデータがありませんでした。"
+        return result
+
+    except Exception as e:
+        result["error"] = str(e)
+        return result
+
+
+def restore_from_backup_zip(uploaded_file, restore_sqlite=True, restore_files=True, restore_supabase=False):
+    """
+    バックアップZIPから復元する。管理者のみ。
+
+    復元対象を選択可能：
+    - SQLite DB本体
+    - 写真・添付ファイル
+    - Supabase主要4機能（利用者マスタ・健康チェック・排泄チェック・申し送り）
+
+    注意：
+    Supabase復元は安全優先でupsert方式です。
+    バックアップにあるデータを戻しますが、現在Supabaseに存在する別データを全削除しません。
+    """
     if not is_admin_user():
         return False, "管理者のみ復元できます。"
     ensure_security_dirs()
 
+    if not restore_sqlite and not restore_files and not restore_supabase:
+        return False, "復元対象を1つ以上選択してください。"
+
     pre_backup, pre_err = create_backup_zip(kind="復元前")
     if pre_err:
         return False, f"復元前バックアップに失敗しました：{pre_err}"
+
+    restore_summary = []
 
     try:
         filename = clean_text(getattr(uploaded_file, "name", "restore.zip"), "restore.zip")
@@ -1604,28 +1711,43 @@ def restore_from_backup_zip(uploaded_file):
 
         with zipfile.ZipFile(restore_zip_path, "r") as zf:
             names = zf.namelist()
-            if f"data/{HIDAMARI_DB_FILE.name}" not in names:
-                return False, "このZIPには hidamari_health.db が含まれていません。"
 
-            HIDAMARI_DB_FILE.write_bytes(zf.read(f"data/{HIDAMARI_DB_FILE.name}"))
+            if restore_sqlite:
+                if f"data/{HIDAMARI_DB_FILE.name}" not in names:
+                    return False, "SQLite復元を選択していますが、このZIPには hidamari_health.db が含まれていません。"
 
-            if "data/hidamari_life.db" in names:
-                (DATA_DIR / "hidamari_life.db").write_bytes(zf.read("data/hidamari_life.db"))
+                HIDAMARI_DB_FILE.write_bytes(zf.read(f"data/{HIDAMARI_DB_FILE.name}"))
+                restore_summary.append("SQLite DB本体")
 
-            for folder in [BUSINESS_HANDOVER_PHOTO_DIR, BUSINESS_HANDOVER_EXCEL_DIR]:
-                for name in names:
-                    if name.startswith(str(folder)) and not name.endswith("/"):
-                        target = Path(name)
-                        target.parent.mkdir(parents=True, exist_ok=True)
-                        target.write_bytes(zf.read(name))
+                if "data/hidamari_life.db" in names:
+                    (DATA_DIR / "hidamari_life.db").write_bytes(zf.read("data/hidamari_life.db"))
+                    restore_summary.append("hidamari_life.db")
 
-        add_audit_log("データ復元", "restore", restore_zip_path.name, "SQLite正本バックアップZIPから復元")
-        record_backup_history("復元", restore_zip_path, "成功", "SQLite正本バックアップZIPから復元")
-        return True, f"復元しました。復元前バックアップも作成済みです：{pre_backup.name if pre_backup else ''}"
+            if restore_files:
+                file_count = 0
+                for folder in [BUSINESS_HANDOVER_PHOTO_DIR, BUSINESS_HANDOVER_EXCEL_DIR]:
+                    for name in names:
+                        if name.startswith(str(folder)) and not name.endswith("/"):
+                            target = Path(name)
+                            target.parent.mkdir(parents=True, exist_ok=True)
+                            target.write_bytes(zf.read(name))
+                            file_count += 1
+                restore_summary.append(f"写真・添付ファイル {file_count}件")
+
+            if restore_supabase:
+                sb_result = _restore_supabase_core_tables_from_backup(zf, names)
+                if not sb_result.get("ok"):
+                    return False, f"Supabase主要4機能の復元に失敗しました：{sb_result.get('error')}"
+                sb_msg = " / ".join(sb_result.get("messages", []))
+                restore_summary.append(f"Supabase主要4機能（{sb_msg}）")
+
+        summary_text = "、".join(restore_summary) if restore_summary else "復元対象なし"
+        add_audit_log("データ復元", "restore", restore_zip_path.name, f"復元対象：{summary_text}")
+        record_backup_history("復元", restore_zip_path, "成功", f"復元対象：{summary_text}")
+        return True, f"復元しました。対象：{summary_text}。復元前バックアップも作成済みです：{pre_backup.name if pre_backup else ''}"
     except Exception as e:
         add_audit_log("データ復元失敗", "restore", "", str(e))
         return False, f"復元に失敗しました：{e}"
-
 
 # =========================
 # 起動時DB安全チェック・異常時復元（Ver4.8）
@@ -2035,19 +2157,57 @@ def show_security_maintenance_menu():
 
     with tab4:
         st.subheader("データ復元")
-        st.warning("復元すると現在のDBがバックアップ時点に戻ります。実行前に自動で『復元前バックアップ』を作成します。")
+        st.warning("復元すると選択した対象がバックアップ時点の内容で復元されます。実行前に自動で『復元前バックアップ』を作成します。")
+
         uploaded = st.file_uploader("復元するバックアップZIPを選択", type=["zip"])
-        confirm = st.checkbox("現在のデータが上書きされることを理解しました")
+
+        st.markdown("#### 復元対象を選択")
+        restore_sqlite = st.checkbox(
+            "SQLiteだけ復元（設定・監査ログ・バックアップ履歴など）",
+            value=True,
+            help="ローカルSQLite DB本体を復元します。Supabase正本のデータ表示には直接反映されない場合があります。",
+        )
+        restore_files = st.checkbox(
+            "写真・添付ファイルを復元",
+            value=True,
+            help="申し送り写真・添付Excel等を復元します。",
+        )
+        restore_supabase = st.checkbox(
+            "Supabase主要4機能も復元（利用者マスタ・健康チェック・排泄チェック・申し送り）",
+            value=False,
+            help="バックアップZIP内の Supabase退避データを使い、主要4機能をSupabaseへ戻します。安全優先のupsert方式です。",
+        )
+
+        if restore_supabase:
+            st.info("Supabase復元は、バックアップに含まれるデータを上書き・追加します。安全のため、現在Supabaseにある別データの全削除は行いません。")
+            supabase_confirm_text = st.text_input(
+                "Supabase復元を実行する場合は「SUPABASE復元」と入力",
+                key="supabase_restore_confirm_text",
+            )
+        else:
+            supabase_confirm_text = ""
+
+        confirm = st.checkbox("現在のデータが上書き・追加復元されることを理解しました")
+
         if st.button("選択したバックアップから復元", type="primary", use_container_width=True):
             if not uploaded:
                 st.error("復元するZIPを選択してください。")
             elif not confirm:
                 st.error("確認チェックを入れてください。")
+            elif restore_supabase and supabase_confirm_text.strip() != "SUPABASE復元":
+                st.error("Supabase主要4機能を復元する場合は、確認欄に「SUPABASE復元」と入力してください。")
+            elif not restore_sqlite and not restore_files and not restore_supabase:
+                st.error("復元対象を1つ以上選択してください。")
             else:
-                ok, msg = restore_from_backup_zip(uploaded)
+                ok, msg = restore_from_backup_zip(
+                    uploaded,
+                    restore_sqlite=restore_sqlite,
+                    restore_files=restore_files,
+                    restore_supabase=restore_supabase,
+                )
                 if ok:
                     st.success(msg)
-                    st.info("復元後はアプリを再読み込みしてください。")
+                    st.info("復元後はアプリを再読み込みしてください。Supabase復元を行った場合は、画面表示もSupabase側の復元内容に戻ります。")
                 else:
                     st.error(msg)
 
