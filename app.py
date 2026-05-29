@@ -12001,7 +12001,9 @@ elif menu == "過去データ管理":
                     if not delete_check:
                         st.error("削除する場合は確認チェックを入れてください。")
                     else:
-                        target_user_id = current.get("user_id", "") if isinstance(current, dict) else ""
+                        # 健康チェック画面では該当レコードを row に保持しているため、
+                        # 未定義の current ではなく row から user_id を取得する。
+                        target_user_id = row.get("user_id", "") if hasattr(row, "get") else ""
                         result = delete_health_record(key_date, key_user, user_id=target_user_id, source="過去データ管理から削除")
                         show_delete_result_and_rerun(result, "削除しました。")
 
