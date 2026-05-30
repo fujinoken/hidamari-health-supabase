@@ -224,6 +224,32 @@ DB_LAST_INTEGRITY_RESULT = db_engine.get_last_integrity_result()
 
 validate_sqlite_identifier = db_engine.validate_sqlite_identifier
 apply_sqlite_pragmas = db_engine.apply_sqlite_pragmas
+
+# =========================
+# SQLite PRAGMA互換ラッパー（Ver4.5.1）
+# db/database.py 側の apply_sqlite_pragmas が for_write 引数に未対応の環境でも、
+# LIFE用DB初期化で停止しないようにする。
+# =========================
+def safe_apply_sqlite_pragmas(conn, for_write=False):
+    try:
+        return apply_sqlite_pragmas(conn, for_write=for_write)
+    except TypeError:
+        # 旧版 db/database.py 互換
+        try:
+            result = apply_sqlite_pragmas(conn)
+        except Exception:
+            result = None
+        # 書込用途の最低限PRAGMAをアプリ側で補完
+        try:
+            conn.execute("PRAGMA foreign_keys = ON;")
+            conn.execute("PRAGMA busy_timeout = 30000;")
+            if for_write:
+                conn.execute("PRAGMA journal_mode = WAL;")
+                conn.execute("PRAGMA synchronous = NORMAL;")
+        except Exception:
+            pass
+        return result
+
 hidamari_db_connection = db_engine.hidamari_db_connection
 hidamari_write_transaction = db_engine.hidamari_write_transaction
 get_hidamari_conn = db_engine.get_hidamari_conn
@@ -11909,7 +11935,7 @@ LIFE_DB = DATA_DIR / "hidamari_life.db"
 def life_conn():
     ensure_dirs()
     conn = sqlite3.connect(LIFE_DB, timeout=DB_BUSY_TIMEOUT_MS / 1000, check_same_thread=False)
-    apply_sqlite_pragmas(conn, for_write=True)
+    safe_apply_sqlite_pragmas(conn, for_write=True)
     return conn
 
 def init_life_db():
