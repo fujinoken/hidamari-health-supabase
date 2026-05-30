@@ -8706,52 +8706,274 @@ def show_short_goal_top():
 
 def show_short_goal_master():
     st.header("短期目標マスタ")
-    st.caption("利用者ごとの短期目標を登録します。日々の実施チェックでは、ここで登録した有効な目標を選択します。")
+    st.caption("利用者ごとの短期目標を登録・検索・更新・削除します。日々の実施チェックでは、ここで登録した有効な目標を選択します。")
+
     users = get_active_user_names()
     df = load_short_goal_master()
+    df = normalize_df_columns(df, SHORT_GOAL_MASTER_COLUMNS)
+    df = attach_user_ids(df, name_col="利用者名", id_col="user_id")
 
-    with st.form("goal_master_form", clear_on_submit=True):
-        col1, col2, col3 = st.columns(3)
-        with col1:
-            user_name = st.selectbox("利用者名", users, key="goal_user")
-        with col2:
-            start_date = st.date_input("開始日", value=today_jst(), key="goal_start")
-        with col3:
-            end_date = st.date_input("終了予定日", value=today_jst(), key="goal_end")
-        short_goal = st.text_area("短期目標", placeholder="例：午前中に居室からリビングへ移動し、他利用者と過ごす時間を持つ")
-        support = st.text_area("支援内容", placeholder="例：声かけ、歩行時の見守り、必要時は手を添える")
-        col4, col5 = st.columns(2)
-        with col4:
-            status = st.selectbox("状態", ["有効", "終了", "一時停止"], index=0)
-        with col5:
-            memo = st.text_input("備考")
-        submitted = st.form_submit_button("短期目標を登録", use_container_width=True)
+    if not users:
+        st.warning("利用者マスタに表示中の利用者がありません。先に利用者登録を行ってください。")
+        return
 
-    if submitted:
-        if not clean_text(short_goal):
-            st.error("短期目標を入力してください。")
+    def _safe_date_value(value, fallback=None):
+        fallback = fallback or today_jst()
+        try:
+            dt = pd.to_datetime(value, errors="coerce")
+            if pd.isna(dt):
+                return fallback
+            return dt.date()
+        except Exception:
+            return fallback
+
+    tab_add, tab_search, tab_edit, tab_delete = st.tabs([
+        "新規登録",
+        "検索・一覧",
+        "更新",
+        "削除",
+    ])
+
+    # -------------------------
+    # 新規登録
+    # -------------------------
+    with tab_add:
+        st.subheader("短期目標を新規登録")
+        with st.form("goal_master_form", clear_on_submit=True):
+            col1, col2, col3 = st.columns(3)
+            with col1:
+                user_name = st.selectbox("利用者名", users, key="goal_user")
+            with col2:
+                start_date = st.date_input("開始日", value=today_jst(), key="goal_start")
+            with col3:
+                end_date = st.date_input("終了予定日", value=today_jst(), key="goal_end")
+
+            short_goal = st.text_area(
+                "短期目標",
+                placeholder="例：午前中に居室からリビングへ移動し、他利用者と過ごす時間を持つ",
+                key="goal_new_short_goal",
+            )
+            support = st.text_area(
+                "支援内容",
+                placeholder="例：声かけ、歩行時の見守り、必要時は手を添える",
+                key="goal_new_support",
+            )
+
+            col4, col5 = st.columns(2)
+            with col4:
+                status = st.selectbox("状態", ["有効", "終了", "一時停止"], index=0, key="goal_new_status")
+            with col5:
+                memo = st.text_input("備考", key="goal_new_memo")
+
+            submitted = st.form_submit_button("短期目標を登録", use_container_width=True)
+
+        if submitted:
+            if not clean_text(short_goal):
+                st.error("短期目標を入力してください。")
+            else:
+                uid = get_user_id_by_name(user_name) or ensure_user_id_value("", user_name)
+                new_row = {
+                    "目標ID": str(uuid.uuid4()),
+                    "利用者名": user_name,
+                    "user_id": uid,
+                    "短期目標": clean_text(short_goal),
+                    "支援内容": clean_text(support),
+                    "開始日": start_date.strftime("%Y-%m-%d"),
+                    "終了予定日": end_date.strftime("%Y-%m-%d"),
+                    "状態": status,
+                    "備考": clean_text(memo),
+                    "登録日時": format_now_jst("%Y-%m-%d %H:%M:%S"),
+                }
+                df2 = pd.concat([df, pd.DataFrame([new_row], columns=SHORT_GOAL_MASTER_COLUMNS)], ignore_index=True)
+                save_short_goal_master(df2)
+                try:
+                    add_audit_log("短期目標マスタ登録", SQLITE_TABLE_SHORT_GOAL_MASTER, new_row["目標ID"], f"{user_name} / {clean_text(short_goal)[:80]}")
+                except Exception:
+                    pass
+                st.success("短期目標を登録しました。")
+                st.rerun()
+
+    # -------------------------
+    # 検索・一覧
+    # -------------------------
+    with tab_search:
+        st.subheader("登録済み短期目標を検索")
+        if df.empty:
+            st.info("まだ短期目標が登録されていません。")
         else:
-            new_row = {
-                "目標ID": str(uuid.uuid4()),
-                "利用者名": user_name,
-                "短期目標": clean_text(short_goal),
-                "支援内容": clean_text(support),
-                "開始日": start_date.strftime("%Y-%m-%d"),
-                "終了予定日": end_date.strftime("%Y-%m-%d"),
-                "状態": status,
-                "備考": clean_text(memo),
-                "登録日時": format_now_jst("%Y-%m-%d %H:%M:%S"),
-            }
-            df = pd.concat([df, pd.DataFrame([new_row], columns=SHORT_GOAL_MASTER_COLUMNS)], ignore_index=True)
-            save_short_goal_master(df)
-            st.success("短期目標を登録しました。")
-            st.rerun()
+            c1, c2, c3 = st.columns([1.2, 1, 1.6])
+            with c1:
+                filter_user = st.selectbox("利用者で絞り込み", ["すべて"] + users, key="goal_filter_user")
+            with c2:
+                filter_status = st.selectbox("状態で絞り込み", ["すべて", "有効", "一時停止", "終了"], key="goal_filter_status")
+            with c3:
+                keyword = st.text_input("キーワード検索", placeholder="短期目標・支援内容・備考から検索", key="goal_filter_keyword")
 
-    st.subheader("登録済み短期目標")
-    if df.empty:
-        st.info("まだ短期目標が登録されていません。")
-    else:
-        st.dataframe(df.drop(columns=["目標ID"], errors="ignore"), use_container_width=True, hide_index=True)
+            result = df.copy()
+            if filter_user != "すべて":
+                result = result[result["利用者名"].astype(str) == str(filter_user)].copy()
+            if filter_status != "すべて":
+                result = result[result["状態"].astype(str) == str(filter_status)].copy()
+            if clean_text(keyword):
+                kw = clean_text(keyword)
+                mask = (
+                    result["短期目標"].astype(str).str.contains(kw, case=False, na=False)
+                    | result["支援内容"].astype(str).str.contains(kw, case=False, na=False)
+                    | result["備考"].astype(str).str.contains(kw, case=False, na=False)
+                )
+                result = result[mask].copy()
+
+            st.caption(f"検索結果：{len(result)}件")
+            display_cols = ["利用者名", "短期目標", "支援内容", "開始日", "終了予定日", "状態", "備考", "登録日時"]
+            st.dataframe(result[display_cols], use_container_width=True, hide_index=True)
+
+            if not result.empty:
+                download_df = result[SHORT_GOAL_MASTER_COLUMNS].copy()
+                buffer = BytesIO()
+                with pd.ExcelWriter(buffer, engine="openpyxl") as writer:
+                    download_df.to_excel(writer, sheet_name="短期目標マスタ", index=False)
+                buffer.seek(0)
+                st.download_button(
+                    "検索結果をExcelでダウンロード",
+                    data=buffer.getvalue(),
+                    file_name=f"短期目標マスタ検索結果_{today_jst().strftime('%Y-%m-%d')}.xlsx",
+                    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                    use_container_width=True,
+                )
+
+    # -------------------------
+    # 更新
+    # -------------------------
+    with tab_edit:
+        st.subheader("短期目標を更新")
+        if df.empty:
+            st.info("更新できる短期目標がありません。")
+        else:
+            label_map = {}
+            for _, row in df.iterrows():
+                goal_id = clean_text(row.get("目標ID"))
+                goal_text = clean_text(row.get("短期目標"))
+                if len(goal_text) > 45:
+                    goal_text = goal_text[:45] + "…"
+                label = f"{clean_text(row.get('利用者名'))}｜{clean_text(row.get('状態'))}｜{goal_text}｜{goal_id[:8]}"
+                if goal_id:
+                    label_map[label] = goal_id
+
+            selected_label = st.selectbox("更新する短期目標を選択", list(label_map.keys()), key="goal_edit_select")
+            selected_id = label_map.get(selected_label, "")
+            hit = df[df["目標ID"].astype(str) == str(selected_id)]
+
+            if hit.empty:
+                st.warning("選択した短期目標が見つかりません。")
+            else:
+                row = hit.iloc[-1]
+                current_user = clean_text(row.get("利用者名"))
+                user_index = users.index(current_user) if current_user in users else 0
+                status_options = ["有効", "終了", "一時停止"]
+                current_status = clean_text(row.get("状態"), "有効")
+                status_index = status_options.index(current_status) if current_status in status_options else 0
+
+                with st.form("goal_master_update_form"):
+                    col1, col2, col3 = st.columns(3)
+                    with col1:
+                        edit_user = st.selectbox("利用者名", users, index=user_index, key="goal_edit_user")
+                    with col2:
+                        edit_start = st.date_input("開始日", value=_safe_date_value(row.get("開始日")), key="goal_edit_start")
+                    with col3:
+                        edit_end = st.date_input("終了予定日", value=_safe_date_value(row.get("終了予定日")), key="goal_edit_end")
+
+                    edit_goal = st.text_area("短期目標", value=clean_text(row.get("短期目標")), key="goal_edit_goal")
+                    edit_support = st.text_area("支援内容", value=clean_text(row.get("支援内容")), key="goal_edit_support")
+
+                    col4, col5 = st.columns(2)
+                    with col4:
+                        edit_status = st.selectbox("状態", status_options, index=status_index, key="goal_edit_status")
+                    with col5:
+                        edit_memo = st.text_input("備考", value=clean_text(row.get("備考")), key="goal_edit_memo")
+
+                    update_submitted = st.form_submit_button("この内容で更新", use_container_width=True)
+
+                if update_submitted:
+                    if not clean_text(edit_goal):
+                        st.error("短期目標を入力してください。")
+                    else:
+                        idx_list = df.index[df["目標ID"].astype(str) == str(selected_id)].tolist()
+                        if not idx_list:
+                            st.error("更新対象が見つかりません。")
+                        else:
+                            idx = idx_list[-1]
+                            uid = get_user_id_by_name(edit_user) or ensure_user_id_value(clean_text(row.get("user_id")), edit_user)
+                            before_summary = f"{clean_text(row.get('利用者名'))} / {clean_text(row.get('短期目標'))[:80]}"
+                            df.at[idx, "利用者名"] = edit_user
+                            df.at[idx, "user_id"] = uid
+                            df.at[idx, "短期目標"] = clean_text(edit_goal)
+                            df.at[idx, "支援内容"] = clean_text(edit_support)
+                            df.at[idx, "開始日"] = edit_start.strftime("%Y-%m-%d")
+                            df.at[idx, "終了予定日"] = edit_end.strftime("%Y-%m-%d")
+                            df.at[idx, "状態"] = edit_status
+                            df.at[idx, "備考"] = clean_text(edit_memo)
+                            if not clean_text(df.at[idx, "登録日時"]):
+                                df.at[idx, "登録日時"] = format_now_jst("%Y-%m-%d %H:%M:%S")
+                            save_short_goal_master(df)
+                            try:
+                                add_audit_log(
+                                    "短期目標マスタ更新",
+                                    SQLITE_TABLE_SHORT_GOAL_MASTER,
+                                    selected_id,
+                                    f"{before_summary} → {edit_user} / {clean_text(edit_goal)[:80]}",
+                                )
+                            except Exception:
+                                pass
+                            st.success("短期目標を更新しました。")
+                            st.rerun()
+
+    # -------------------------
+    # 削除
+    # -------------------------
+    with tab_delete:
+        st.subheader("短期目標を削除")
+        st.warning("削除すると、短期目標マスタから消えます。既に登録済みの日々の実施チェック記録は原則そのまま残ります。")
+
+        if df.empty:
+            st.info("削除できる短期目標がありません。")
+        else:
+            delete_label_map = {}
+            for _, row in df.iterrows():
+                goal_id = clean_text(row.get("目標ID"))
+                goal_text = clean_text(row.get("短期目標"))
+                if len(goal_text) > 45:
+                    goal_text = goal_text[:45] + "…"
+                label = f"{clean_text(row.get('利用者名'))}｜{clean_text(row.get('状態'))}｜{goal_text}｜{goal_id[:8]}"
+                if goal_id:
+                    delete_label_map[label] = goal_id
+
+            selected_delete_labels = st.multiselect(
+                "削除する短期目標を選択",
+                list(delete_label_map.keys()),
+                key="goal_delete_select",
+            )
+            selected_delete_ids = [delete_label_map[x] for x in selected_delete_labels if x in delete_label_map]
+
+            if selected_delete_ids:
+                preview = df[df["目標ID"].astype(str).isin([str(x) for x in selected_delete_ids])].copy()
+                st.dataframe(
+                    preview[["利用者名", "短期目標", "支援内容", "開始日", "終了予定日", "状態", "備考"]],
+                    use_container_width=True,
+                    hide_index=True,
+                )
+
+                confirm = st.checkbox("選択した短期目標を削除することを確認しました", key="goal_delete_confirm")
+                if st.button("選択した短期目標を削除", type="primary", use_container_width=True, disabled=not confirm):
+                    result = delete_short_goal_master_records(selected_delete_ids, source="短期目標マスタ画面から削除")
+                    if result.get("error"):
+                        st.error(f"削除時に一部エラーがありました：{result.get('error')}")
+                    if result.get("ok"):
+                        st.success(f"削除しました。SQLite:{result.get('sqlite_deleted', 0)}件 / Supabase:{result.get('supabase_deleted', 0)}件")
+                        st.rerun()
+                    else:
+                        st.error("削除対象が見つかりませんでした。")
+            else:
+                st.info("削除する短期目標を選択してください。")
 
 
 def show_daily_goal_check():
