@@ -10501,9 +10501,19 @@ def text_contains_any(text, words):
     return any(w in text for w in words)
 
 
-def analyze_structured_insights(health_df, ex_df, handover_df, goal_df, user_name, end_day):
-    """OpenAIなしでも使える、記録ベースの管理者向け分析。診断はしない。"""
-    start_day = end_day - timedelta(days=6)
+def analyze_structured_insights(health_df, ex_df, handover_df, goal_df, user_name, end_day, start_day=None, period_label=""):
+    """OpenAIなしでも使える、記録ベースの管理者向け分析。診断はしない。
+
+    Ver4.6:
+    - 分析期間を「直近7日／直近14日／直近30日／期間指定」から選べるようにする。
+    - 既存呼び出し互換のため、start_day未指定時は従来どおり直近7日で動作する。
+    """
+    if start_day is None:
+        start_day = end_day - timedelta(days=6)
+    if start_day > end_day:
+        start_day, end_day = end_day, start_day
+    period_days = (end_day - start_day).days + 1
+    period_label = period_label or f"直近{period_days}日"
     h = filter_records_by_period(health_df, "記録日", start_day, end_day, user_name)
     e = filter_records_by_period(ex_df, "記録日", start_day, end_day, user_name)
     b = filter_records_by_period(handover_df, "日付", start_day, end_day, None)
@@ -10519,7 +10529,7 @@ def analyze_structured_insights(health_df, ex_df, handover_df, goal_df, user_nam
             if col in h.columns:
                 change_items += [clean_text(x) for x in h[col].dropna().tolist() if clean_text(x)]
         if change_items:
-            findings.append(f"直近7日で、気になる変化・共有メモが {len(change_items)} 件記録されています。")
+            findings.append(f"{period_label}で、気になる変化・共有メモが {len(change_items)} 件記録されています。")
             checks.append("気になる変化が、どの時間帯・どの場面で出ているかを職員間でそろえて確認すると整理しやすくなります。")
 
         joined = " ".join(h.fillna("").astype(str).agg(" ".join, axis=1).tolist())
@@ -10555,13 +10565,13 @@ def analyze_structured_insights(health_df, ex_df, handover_df, goal_df, user_nam
                     findings.append(f"{col}が確認目安にかかる記録が {cnt} 件あります。")
                     checks.append(f"{col}について、入力ミスではないか、普段値との差があるかを確認してください。")
     else:
-        findings.append("直近7日の健康チェック記録が確認できません。")
+        findings.append(f"{period_label}の健康チェック記録が確認できません。")
         checks.append("記録漏れか、入力日・利用者名の表記ゆれがないか確認してください。")
 
     if not e.empty:
         stool_df = e[e.get("便量", "").astype(str).fillna("なし") != "なし"] if "便量" in e.columns else pd.DataFrame()
         if stool_df.empty:
-            findings.append("直近7日の排便記録が確認できません。")
+            findings.append(f"{period_label}の排便記録が確認できません。")
             checks.append("排便記録の入力漏れか、実際に間隔が空いているのかを確認してください。")
         else:
             last_day = pd.to_datetime(stool_df["記録日"], errors="coerce").max()
@@ -10609,15 +10619,19 @@ def analyze_structured_insights(health_df, ex_df, handover_df, goal_df, user_nam
         checks.append("短期目標の実施記録がない場合は、ケアプランの短期目標と日々の記録がつながっているか確認してください。")
 
     if not findings:
-        findings.append("直近7日の記録上、大きな変化は目立っていません。")
+        findings.append(f"{period_label}の記録上、大きな変化は目立っていません。")
     if not checks:
         checks.append("現在の記録を継続し、気になる変化が出た場合は早めに共有してください。")
 
     return {"findings": findings, "checks": checks, "goal_summary": goal_summary, "start_day": start_day, "end_day": end_day}
 
 
-def build_ai_structured_context(health_df, ex_df, handover_df, goal_df, user_name, end_day, rule_result):
-    start_day = end_day - timedelta(days=6)
+def build_ai_structured_context(health_df, ex_df, handover_df, goal_df, user_name, end_day, rule_result, start_day=None, period_label=""):
+    if start_day is None:
+        start_day = end_day - timedelta(days=6)
+    if start_day > end_day:
+        start_day, end_day = end_day, start_day
+    period_label = period_label or f"直近{(end_day - start_day).days + 1}日"
     h = filter_records_by_period(health_df, "記録日", start_day, end_day, user_name)
     e = filter_records_by_period(ex_df, "記録日", start_day, end_day, user_name)
     b = filter_records_by_period(handover_df, "日付", start_day, end_day, None)
@@ -10641,7 +10655,7 @@ def build_ai_structured_context(health_df, ex_df, handover_df, goal_df, user_nam
 
 【分析対象】
 利用者：{user_name}
-対象期間：{start_day}〜{end_day}
+対象期間：{start_day}〜{end_day}（{period_label}）
 
 【ルールベース分析】
 {rules}
@@ -10711,18 +10725,58 @@ def show_structured_insight_menu():
     st.caption("健康チェック・排泄・申し送り・短期目標を合わせて、管理者が確認しやすい形に整理します。AIは診断せず、記録上の気づきと確認ポイントだけを出します。")
 
     users = get_active_user_names()
-    c1, c2 = st.columns([1, 1])
+    c1, c2, c3 = st.columns([1.2, 1, 1])
     with c1:
         user_name = st.selectbox("分析する利用者", users, key="structured_insight_user")
     with c2:
-        end_day = st.date_input("分析基準日", value=today_jst(), key="structured_insight_end_day")
+        period_mode = st.selectbox(
+            "分析期間",
+            ["直近7日", "直近14日", "直近30日", "期間指定"],
+            index=0,
+            key="structured_insight_period_mode",
+            help="体調変化は7日、短期目標や申し送り傾向は14〜30日を見ると整理しやすくなります。",
+        )
+    with c3:
+        end_day = st.date_input(
+            "分析基準日" if period_mode != "期間指定" else "終了日",
+            value=today_jst(),
+            key="structured_insight_end_day",
+        )
+
+    if period_mode == "期間指定":
+        default_start = end_day - timedelta(days=6)
+        start_day = st.date_input(
+            "開始日",
+            value=default_start,
+            key="structured_insight_start_day",
+        )
+        period_label = "期間指定"
+    else:
+        period_days_map = {"直近7日": 7, "直近14日": 14, "直近30日": 30}
+        period_days = period_days_map.get(period_mode, 7)
+        start_day = end_day - timedelta(days=period_days - 1)
+        period_label = period_mode
+        st.caption(f"対象期間：{start_day}〜{end_day}（{period_label}）")
+
+    if start_day > end_day:
+        st.warning("開始日が終了日より後になっています。日付を入れ替えて分析します。")
+        start_day, end_day = end_day, start_day
 
     health_df = load_health_data()
     ex_df = load_excretion_data()
     handover_df = load_business_handover_data() if 'load_business_handover_data' in globals() else read_excel_safe(HANDOVER_FILE, BUSINESS_HANDOVER_COLUMNS)
     goal_df = load_short_goal_checks()
 
-    result = analyze_structured_insights(health_df, ex_df, handover_df, goal_df, user_name, end_day)
+    result = analyze_structured_insights(
+        health_df,
+        ex_df,
+        handover_df,
+        goal_df,
+        user_name,
+        end_day,
+        start_day=start_day,
+        period_label=period_label,
+    )
 
     st.markdown("### ルールベース分析（APIなしでも使用可）")
     left, right = st.columns(2)
@@ -10740,8 +10794,7 @@ def show_structured_insight_menu():
         st.dataframe(pd.DataFrame({"短期目標分析": result["goal_summary"]}), use_container_width=True, hide_index=True)
 
     with st.expander("分析対象データを確認", expanded=False):
-        start_day = end_day - timedelta(days=6)
-        st.write(f"対象期間：{start_day}〜{end_day}")
+        st.write(f"対象期間：{start_day}〜{end_day}（{period_label}）")
         st.markdown("#### 健康チェック")
         st.dataframe(filter_records_by_period(health_df, "記録日", start_day, end_day, user_name), use_container_width=True, hide_index=True)
         st.markdown("#### 排泄")
@@ -10756,7 +10809,17 @@ def show_structured_insight_menu():
         st.code('OPENAI_API_KEY = "sk-xxxxxxxxxxxxxxxx"', language="toml")
     else:
         if st.button("AIで管理者向けアドバイスを生成", use_container_width=True):
-            context = build_ai_structured_context(health_df, ex_df, handover_df, goal_df, user_name, end_day, result)
+            context = build_ai_structured_context(
+                health_df,
+                ex_df,
+                handover_df,
+                goal_df,
+                user_name,
+                end_day,
+                result,
+                start_day=start_day,
+                period_label=period_label,
+            )
             with st.spinner("AIが記録を整理しています..."):
                 ai_text = generate_ai_structured_advice(context)
             st.subheader("AI分析結果")
@@ -10768,7 +10831,7 @@ def show_structured_insight_menu():
                 "作成日時": format_now_jst("%Y-%m-%d %H:%M:%S"),
                 "分析基準日": end_day,
                 "利用者名": user_name,
-                "対象期間": f"{end_day - timedelta(days=6)}〜{end_day}",
+                "対象期間": f"{start_day}〜{end_day}（{period_label}）",
                 "ルール分析": rule_text,
                 "AI分析結果": ai_text,
             }
