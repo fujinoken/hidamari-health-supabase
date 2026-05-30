@@ -237,7 +237,7 @@ db_read_dataframe = db_engine.db_read_dataframe
 # =========================
 # Supabase外部DB対応（Ver4.5）
 # 正式方針：
-#   Supabase正本：users／health_records／excretion_records／handover_logs
+#   Supabase正本：users／health_records／excretion_records／handover_logs／short_goal_checks
 #   SQLite補助：その他テーブル＋Supabase成功後のミラー
 #   保存方式：upsert（全削除→全保存は行わない）
 # =========================
@@ -246,6 +246,8 @@ SUPABASE_CORE_TABLES = {
     "health_records": ["記録日", "user_id"],
     "excretion_records": ["記録日", "user_id", "時間帯"],
     "handover_logs": ["記録ID"],
+    # 職員が日々入力するため、短期目標実施チェックもSupabaseを正本にする
+    "short_goal_checks": ["記録ID"],
 }
 
 SUPABASE_CORE_LABELS = {
@@ -253,6 +255,7 @@ SUPABASE_CORE_LABELS = {
     "health_records": "健康チェック",
     "excretion_records": "排泄チェック",
     "handover_logs": "業務全体申し送り",
+    "short_goal_checks": "短期目標実施チェック",
 }
 
 _original_save_sqlite_table = db_engine.save_sqlite_table
@@ -574,13 +577,13 @@ def get_supabase_storage_status():
         return "Supabase未有効：enabled=true を設定してください。"
     try:
         checks = []
-        for table_name in ["users", "health_records", "excretion_records", "handover_logs"]:
+        for table_name in ["users", "health_records", "excretion_records", "handover_logs", "short_goal_checks"]:
             url = _supabase_endpoint(table_name, "?select=record_key&limit=1")
             res = requests.get(url, headers=_supabase_headers(prefer=""), timeout=10)
             if res.status_code not in [200, 206]:
                 return f"Supabase接続注意：{table_name} / HTTP {res.status_code} / {res.text[:160]}"
             checks.append(f"{SUPABASE_CORE_LABELS.get(table_name, table_name)}OK")
-        return "Supabase接続OK：利用者マスタ・健康チェック・排泄チェック・申し送りは外部DB保存です。"
+        return "Supabase接続OK：利用者マスタ・健康チェック・排泄チェック・申し送り・短期目標実施チェックは外部DB保存です。"
     except Exception as e:
         return f"Supabase接続エラー：{e}"
 
@@ -597,7 +600,7 @@ def get_supabase_diagnostic_rows():
         {"項目": "key", "状態": "OK" if cfg.get("key") else "NG", "詳細": "設定済み" if cfg.get("key") else "未設定"},
     ]
     if supabase_is_enabled():
-        for table_name in ["users", "health_records", "excretion_records", "handover_logs"]:
+        for table_name in ["users", "health_records", "excretion_records", "handover_logs", "short_goal_checks"]:
             try:
                 url = _supabase_endpoint(table_name, "?select=record_key&limit=1")
                 res = requests.get(url, headers=_supabase_headers(prefer=""), timeout=10)
@@ -634,6 +637,12 @@ create table if not exists public.excretion_records (
 );
 
 create table if not exists public.handover_logs (
+  record_key text primary key,
+  data jsonb not null default '{}'::jsonb,
+  updated_at timestamptz default now()
+);
+
+create table if not exists public.short_goal_checks (
   record_key text primary key,
   data jsonb not null default '{}'::jsonb,
   updated_at timestamptz default now()
@@ -881,28 +890,40 @@ def delete_excretion_record(record_date, user_name, slot, user_id="", source="")
 
 
 def delete_short_goal_check_records(record_ids, source="") -> dict:
+    """短期目標実施チェックをSQLiteミラーとSupabase正本の両方から直接削除する。"""
     ids = []
     for rid in record_ids or []:
         rid = clean_text(rid) if "clean_text" in globals() else str(rid).strip()
         if rid and rid not in ids:
             ids.append(rid)
+
     total_sqlite = 0
+    total_supabase = 0
     errors = []
     for rid in ids:
         try:
             total_sqlite += sqlite_delete_records(SQLITE_TABLE_SHORT_GOAL_CHECKS, {"記録ID": rid})
         except Exception as e:
-            errors.append(f"{rid}: {e}")
+            errors.append(f"SQLite {rid}: {e}")
+        try:
+            keys = [rid]
+            for key in supabase_find_record_keys_by_data_field(SQLITE_TABLE_SHORT_GOAL_CHECKS, "記録ID", rid):
+                if key and key not in keys:
+                    keys.append(key)
+            total_supabase += supabase_delete_by_record_keys(SQLITE_TABLE_SHORT_GOAL_CHECKS, keys)
+        except Exception as e:
+            errors.append(f"Supabase {rid}: {e}")
+
     try:
         add_audit_log(
             "短期目標実施チェック削除",
             SQLITE_TABLE_SHORT_GOAL_CHECKS,
             ",".join(ids[:10]),
-            f"{source or '実施履歴を削除'} / SQLite削除:{total_sqlite} / 対象:{len(ids)}件",
+            f"{source or '実施履歴を削除'} / SQLite削除:{total_sqlite} / Supabase削除:{total_supabase} / 対象:{len(ids)}件",
         )
     except Exception:
         pass
-    return {"sqlite_deleted": total_sqlite, "supabase_deleted": 0, "ok": total_sqlite > 0, "error": " / ".join(errors)}
+    return {"sqlite_deleted": total_sqlite, "supabase_deleted": total_supabase, "ok": (total_sqlite > 0 or total_supabase > 0), "error": " / ".join(errors)}
 
 
 def show_delete_result_and_rerun(result: dict, success_message="削除しました。"):
@@ -1141,10 +1162,10 @@ def get_storage_unification_status():
     """商品版向け：保存先の簡易表示用。"""
     if "supabase_is_enabled" in globals() and supabase_is_enabled():
         return {
-            "正データ": "Supabase（利用者マスタ・健康チェック・排泄チェック・申し送り）／SQLite（その他）",
+            "正データ": "Supabase（利用者マスタ・健康チェック・排泄チェック・申し送り・短期目標実施チェック・短期目標実施チェック）／SQLite（その他）",
             "Excel保存": "廃止（ダウンロード出力のみ）",
             "JSON保存": "廃止（app_settingsテーブルへ統合）",
-            "バックアップ": "主要4機能はSupabase正本＋SQLiteミラー／その他はSQLite DB + 添付ファイル",
+            "バックアップ": "主要5機能はSupabase正本＋SQLiteミラー／その他はSQLite DB + 添付ファイル",
         }
     return {
         "正データ": "SQLite",
@@ -1431,7 +1452,7 @@ def _make_all_sqlite_tables_excel_bytes():
 
 
 def _read_supabase_core_tables_for_backup():
-    """Supabase主要4機能をJSON/Excel退避用に読み込む。"""
+    """Supabase主要5機能をJSON/Excel退避用に読み込む。"""
     result = {}
     if not ("supabase_is_enabled" in globals() and supabase_is_enabled()):
         return result
@@ -1440,6 +1461,7 @@ def _read_supabase_core_tables_for_backup():
         (SQLITE_TABLE_HEALTH, HEALTH_COLUMNS if "HEALTH_COLUMNS" in globals() else []),
         (SQLITE_TABLE_EXCRETION, EXCRETION_COLUMNS if "EXCRETION_COLUMNS" in globals() else []),
         (SQLITE_TABLE_HANDOVER, BUSINESS_HANDOVER_COLUMNS if "BUSINESS_HANDOVER_COLUMNS" in globals() else []),
+        (SQLITE_TABLE_SHORT_GOAL_CHECKS, SHORT_GOAL_CHECK_COLUMNS if "SHORT_GOAL_CHECK_COLUMNS" in globals() else []),
     ]:
         try:
             result[table_name] = supabase_read_table(table_name, columns=cols).to_dict(orient="records")
@@ -1475,9 +1497,9 @@ def get_backup_target_status_df():
         "詳細": f"{len(_list_sqlite_tables_for_backup())} テーブル",
     })
     rows.append({
-        "対象": "Supabase主要4機能JSON/Excel退避",
+        "対象": "Supabase主要5機能JSON/Excel退避",
         "状態": "OK" if ("supabase_is_enabled" in globals() and supabase_is_enabled()) else "未設定",
-        "詳細": "利用者マスタ・健康チェック・排泄チェック・申し送り",
+        "詳細": "利用者マスタ・健康チェック・排泄チェック・申し送り・短期目標実施チェック・短期目標実施チェック",
     })
     for folder in [BUSINESS_HANDOVER_PHOTO_DIR, BUSINESS_HANDOVER_EXCEL_DIR]:
         count = 0
@@ -1496,7 +1518,7 @@ def create_backup_zip(kind="手動"):
     一括バックアップを作成する。
     - SQLite DB本体
     - SQLite全テーブルExcel退避
-    - Supabase主要4機能 JSON/Excel退避
+    - Supabase主要5機能 JSON/Excel退避
     - 写真・添付ファイル
     - バックアップ情報
     """
@@ -1519,7 +1541,7 @@ def create_backup_zip(kind="手動"):
             "sqlite_db": str(HIDAMARI_DB_FILE),
             "supabase_enabled": bool("supabase_is_enabled" in globals() and supabase_is_enabled()),
             "sqlite_tables": _list_sqlite_tables_for_backup(),
-            "note": "SQLite本体に加えて、確認用ExcelとSupabase主要4機能の退避データを含みます。",
+            "note": "SQLite本体に加えて、確認用ExcelとSupabase主要5機能の退避データを含みます。",
         }
 
         with zipfile.ZipFile(zip_path, "w", zipfile.ZIP_DEFLATED) as zf:
@@ -1538,7 +1560,7 @@ def create_backup_zip(kind="手動"):
             except Exception as e:
                 zf.writestr("exports/sqlite_all_tables_error.txt", str(e))
 
-            # Supabase主要4機能退避
+            # Supabase主要5機能退避
             try:
                 zf.writestr(
                     "exports/supabase_core_tables.json",
@@ -1589,7 +1611,7 @@ def run_daily_auto_backup():
 def _restore_supabase_core_tables_from_backup(zf, names):
     """
     バックアップZIP内の exports/supabase_core_tables.json から、
-    Supabase主要4機能（利用者・健康・排泄・申し送り）へ復元する。
+    Supabase主要5機能（利用者・健康・排泄・申し送り・短期目標実施チェック）へ復元する。
     安全優先のため、現在のSupabase全削除は行わず、record_key単位のupsertで戻す。
     """
     result = {
@@ -1604,7 +1626,7 @@ def _restore_supabase_core_tables_from_backup(zf, names):
         return result
 
     if "exports/supabase_core_tables.json" not in names:
-        result["error"] = "このバックアップZIPには Supabase主要4機能データ（exports/supabase_core_tables.json）が含まれていません。"
+        result["error"] = "このバックアップZIPには Supabase主要5機能データ（exports/supabase_core_tables.json）が含まれていません。"
         return result
 
     try:
@@ -1619,6 +1641,7 @@ def _restore_supabase_core_tables_from_backup(zf, names):
             (SQLITE_TABLE_HEALTH, HEALTH_COLUMNS if "HEALTH_COLUMNS" in globals() else [], ["記録日", "user_id"]),
             (SQLITE_TABLE_EXCRETION, EXCRETION_COLUMNS if "EXCRETION_COLUMNS" in globals() else [], ["記録日", "user_id", "時間帯"]),
             (SQLITE_TABLE_HANDOVER, BUSINESS_HANDOVER_COLUMNS if "BUSINESS_HANDOVER_COLUMNS" in globals() else [], ["記録ID"]),
+            (SQLITE_TABLE_SHORT_GOAL_CHECKS, SHORT_GOAL_CHECK_COLUMNS if "SHORT_GOAL_CHECK_COLUMNS" in globals() else [], ["記録ID"]),
         ]
 
         restored_any = False
@@ -1658,7 +1681,7 @@ def _restore_supabase_core_tables_from_backup(zf, names):
                         df,
                         table_name,
                         cols,
-                        date_cols=["記録日"] if table_name in [SQLITE_TABLE_HEALTH, SQLITE_TABLE_EXCRETION] else (["日付"] if table_name == SQLITE_TABLE_HANDOVER else None),
+                        date_cols=["記録日"] if table_name in [SQLITE_TABLE_HEALTH, SQLITE_TABLE_EXCRETION] else (["日付"] if table_name in [SQLITE_TABLE_HANDOVER, SQLITE_TABLE_SHORT_GOAL_CHECKS] else None),
                         unique_cols=unique_cols,
                     )
                 except Exception:
@@ -1684,7 +1707,7 @@ def restore_from_backup_zip(uploaded_file, restore_sqlite=True, restore_files=Tr
     復元対象を選択可能：
     - SQLite DB本体
     - 写真・添付ファイル
-    - Supabase主要4機能（利用者マスタ・健康チェック・排泄チェック・申し送り）
+    - Supabase主要5機能（利用者マスタ・健康チェック・排泄チェック・申し送り・短期目標実施チェック）
 
     注意：
     Supabase復元は安全優先でupsert方式です。
@@ -1737,9 +1760,9 @@ def restore_from_backup_zip(uploaded_file, restore_sqlite=True, restore_files=Tr
             if restore_supabase:
                 sb_result = _restore_supabase_core_tables_from_backup(zf, names)
                 if not sb_result.get("ok"):
-                    return False, f"Supabase主要4機能の復元に失敗しました：{sb_result.get('error')}"
+                    return False, f"Supabase主要5機能の復元に失敗しました：{sb_result.get('error')}"
                 sb_msg = " / ".join(sb_result.get("messages", []))
-                restore_summary.append(f"Supabase主要4機能（{sb_msg}）")
+                restore_summary.append(f"Supabase主要5機能（{sb_msg}）")
 
         summary_text = "、".join(restore_summary) if restore_summary else "復元対象なし"
         add_audit_log("データ復元", "restore", restore_zip_path.name, f"復元対象：{summary_text}")
@@ -2068,7 +2091,7 @@ def show_security_maintenance_menu():
 
     with tab1:
         st.subheader("バックアップ")
-        st.write("SQLite DB、SQLite全テーブルExcel、Supabase主要4機能、写真・添付ファイルをZIPで保存します。")
+        st.write("SQLite DB、SQLite全テーブルExcel、Supabase主要5機能、写真・添付ファイルをZIPで保存します。")
         st.markdown("#### バックアップ対象の検査")
         try:
             st.dataframe(get_backup_target_status_df(), use_container_width=True, hide_index=True)
@@ -2173,9 +2196,9 @@ def show_security_maintenance_menu():
             help="申し送り写真・添付Excel等を復元します。",
         )
         restore_supabase = st.checkbox(
-            "Supabase主要4機能も復元（利用者マスタ・健康チェック・排泄チェック・申し送り）",
+            "Supabase主要5機能も復元（利用者マスタ・健康チェック・排泄チェック・申し送り・短期目標実施チェック）",
             value=False,
-            help="バックアップZIP内の Supabase退避データを使い、主要4機能をSupabaseへ戻します。安全優先のupsert方式です。",
+            help="バックアップZIP内の Supabase退避データを使い、主要5機能をSupabaseへ戻します。安全優先のupsert方式です。",
         )
 
         if restore_supabase:
@@ -2195,7 +2218,7 @@ def show_security_maintenance_menu():
             elif not confirm:
                 st.error("確認チェックを入れてください。")
             elif restore_supabase and supabase_confirm_text.strip() != "SUPABASE復元":
-                st.error("Supabase主要4機能を復元する場合は、確認欄に「SUPABASE復元」と入力してください。")
+                st.error("Supabase主要5機能を復元する場合は、確認欄に「SUPABASE復元」と入力してください。")
             elif not restore_sqlite and not restore_files and not restore_supabase:
                 st.error("復元対象を1つ以上選択してください。")
             else:
@@ -2231,7 +2254,7 @@ def show_security_maintenance_menu():
 
     with tab6:
         st.subheader("Supabase設定")
-        st.caption("利用者マスタ・健康チェック・排泄チェック・業務全体申し送りの4機能をSupabaseへ保存します。その他の機能は従来通りSQLite＋バックアップ方式です。")
+        st.caption("利用者マスタ・健康チェック・排泄チェック・業務全体申し送り・短期目標実施チェックの5機能をSupabaseへ保存します。短期目標マスタなどその他の機能は従来通りSQLite＋バックアップ方式です。")
         status = get_supabase_storage_status() if "get_supabase_storage_status" in globals() else "Supabase設定関数が見つかりません。"
         if "接続OK" in status:
             st.success(status)
@@ -2261,8 +2284,8 @@ key = "sb_secret_xxxxxxxxxxxxxxxxx"''', language="toml")
         st.write(get_storage_unification_status() if "get_storage_unification_status" in globals() else {})
 
         st.markdown("#### 既存SQLiteデータの移行")
-        st.caption("手元や旧環境のSQLiteに残っている主要4機能データを、Supabaseへ初回移行するためのボタンです。")
-        if st.button("ローカルSQLiteから主要4機能をSupabaseへ移行", use_container_width=True):
+        st.caption("手元や旧環境のSQLiteに残っている主要5機能データを、Supabaseへ初回移行するためのボタンです。")
+        if st.button("ローカルSQLiteから主要5機能をSupabaseへ移行", use_container_width=True):
             if not supabase_is_enabled():
                 st.error("Supabaseが未設定または接続できません。Secretsとテーブル作成を確認してください。")
             else:
@@ -2272,6 +2295,7 @@ key = "sb_secret_xxxxxxxxxxxxxxxxx"''', language="toml")
                     (SQLITE_TABLE_HEALTH, HEALTH_COLUMNS, ["記録日", "user_id"]),
                     (SQLITE_TABLE_EXCRETION, EXCRETION_COLUMNS, ["記録日", "user_id", "時間帯"]),
                     (SQLITE_TABLE_HANDOVER, BUSINESS_HANDOVER_COLUMNS, ["記録ID"]),
+                    (SQLITE_TABLE_SHORT_GOAL_CHECKS, SHORT_GOAL_CHECK_COLUMNS, ["記録ID"]),
                 ]
                 for table_name, cols, keys in targets:
                     local_df = _original_load_sqlite_table(table_name, cols)
