@@ -9494,68 +9494,352 @@ def show_short_goal_master():
                 st.info("削除する短期目標を選択してください。")
 
 
+
 def show_daily_goal_check():
     st.header("日々の短期目標 実施チェック")
+    st.caption("日々の実施チェックを登録するだけでなく、登録済み記録の検索・更新もできます。")
+
     users = get_active_user_names()
     goal_df = load_short_goal_master()
     check_df = load_short_goal_checks()
+    check_df = normalize_df_columns(check_df, SHORT_GOAL_CHECK_COLUMNS)
+    check_df = attach_user_ids(check_df)
 
-    col1, col2 = st.columns(2)
-    with col1:
-        check_date = st.date_input("日付", value=today_jst(), key="daily_goal_date")
-    with col2:
-        user_name = st.selectbox("利用者名", users, key="daily_goal_user")
-
-    user_goals = goal_df[(goal_df["利用者名"].astype(str) == str(user_name)) & (goal_df["状態"].astype(str) == "有効")]
-    if user_goals.empty:
-        st.warning("この利用者の有効な短期目標が登録されていません。先に『短期目標マスタ』で登録してください。")
+    if not users:
+        st.warning("利用者マスタに表示中の利用者がありません。先に利用者登録を行ってください。")
         return
 
-    goal_label_map = {}
-    for _, row in user_goals.iterrows():
-        label = clean_text(row.get("短期目標"))
-        if label:
-            goal_label_map[label] = row
+    def _safe_date_value(value, fallback=None):
+        fallback = fallback or today_jst()
+        try:
+            dt = pd.to_datetime(value, errors="coerce")
+            if pd.isna(dt):
+                return fallback
+            return dt.date()
+        except Exception:
+            return fallback
 
-    selected_goal_label = st.selectbox("短期目標", list(goal_label_map.keys()), key="daily_goal_select")
-    selected_goal = goal_label_map[selected_goal_label]
+    def _goal_label(row):
+        goal_text = clean_text(row.get("短期目標"))
+        goal_id = clean_text(row.get("目標ID"))
+        if len(goal_text) > 50:
+            goal_text = goal_text[:50] + "…"
+        return f"{goal_text}｜{goal_id[:8]}" if goal_id else goal_text
 
-    st.markdown("#### 支援内容")
-    st.info(clean_text(selected_goal.get("支援内容"), "支援内容の記載はありません。"))
+    def _build_goal_options(user_name):
+        user_goals = goal_df[
+            (goal_df["利用者名"].astype(str) == str(user_name))
+            & (goal_df["状態"].astype(str) == "有効")
+        ].copy()
+        goal_label_map = {}
+        for _, row in user_goals.iterrows():
+            label = _goal_label(row)
+            if label:
+                goal_label_map[label] = row
+        return goal_label_map
 
-    with st.form("check_form", clear_on_submit=True):
-        col1, col2, col3 = st.columns(3)
+    def _build_check_label(row):
+        record_id = clean_text(row.get("記録ID"))
+        d = pd.to_datetime(row.get("日付"), errors="coerce")
+        day_text = d.strftime("%Y-%m-%d") if pd.notna(d) else clean_text(row.get("日付"))
+        goal_text = clean_text(row.get("短期目標"))
+        if len(goal_text) > 35:
+            goal_text = goal_text[:35] + "…"
+        return (
+            f"{day_text}｜{clean_text(row.get('利用者名'))}｜"
+            f"{clean_text(row.get('実施状況'))}｜{goal_text}｜"
+            f"入力:{clean_text(row.get('入力職員'))}｜ID:{record_id[:8]}"
+        )
+
+    tab_add, tab_search, tab_edit = st.tabs([
+        "新規登録",
+        "検索・一覧",
+        "更新",
+    ])
+
+    # -------------------------
+    # 新規登録
+    # -------------------------
+    with tab_add:
+        st.subheader("実施チェックを新規登録")
+
+        col1, col2 = st.columns(2)
         with col1:
-            result = st.selectbox("実施状況", ["実施", "一部実施", "未実施"])
+            check_date = st.date_input("日付", value=today_jst(), key="daily_goal_date")
         with col2:
-            mood = st.selectbox("本人の様子", ["穏やか", "普段通り", "不安あり", "拒否あり", "疲労あり", "痛み訴えあり", "その他"])
-        with col3:
-            reflect = st.selectbox("モニタリング反映", ["反映する", "反映しない"])
-        reason = st.text_input("未実施理由・一部実施の理由", placeholder="例：眠気が強く、声かけのみ実施")
-        staff_memo = st.text_area("職員メモ", placeholder="例：リビングへの移動はできたが、10分ほどで居室へ戻られた")
-        staff_name = st.text_input("入力職員", placeholder="例：藤野")
-        submitted = st.form_submit_button("実施チェックを保存", use_container_width=True)
+            user_name = st.selectbox("利用者名", users, key="daily_goal_user")
 
-    if submitted:
-        new_row = {
-            "記録ID": str(uuid.uuid4()),
-            "日付": check_date.strftime("%Y-%m-%d"),
-            "利用者名": user_name,
-            "目標ID": selected_goal["目標ID"],
-            "短期目標": selected_goal["短期目標"],
-            "実施状況": result,
-            "本人の様子": mood,
-            "未実施理由": clean_text(reason),
-            "職員メモ": clean_text(staff_memo),
-            "入力職員": clean_text(staff_name),
-            "モニタリング反映": reflect,
-            "登録日時": format_now_jst("%Y-%m-%d %H:%M:%S"),
-        }
-        check_df = pd.concat([check_df, pd.DataFrame([new_row], columns=SHORT_GOAL_CHECK_COLUMNS)], ignore_index=True)
-        save_short_goal_checks(check_df)
-        st.success("実施チェックを保存しました。")
-        st.rerun()
+        goal_label_map = _build_goal_options(user_name)
+        if not goal_label_map:
+            st.warning("この利用者の有効な短期目標が登録されていません。先に『短期目標マスタ』で登録してください。")
+            return
 
+        selected_goal_label = st.selectbox("短期目標", list(goal_label_map.keys()), key="daily_goal_select")
+        selected_goal = goal_label_map[selected_goal_label]
+
+        st.markdown("#### 支援内容")
+        st.info(clean_text(selected_goal.get("支援内容"), "支援内容の記載はありません。"))
+
+        with st.form("check_form", clear_on_submit=True):
+            col1, col2, col3 = st.columns(3)
+            with col1:
+                result = st.selectbox("実施状況", ["実施", "一部実施", "未実施"], key="daily_new_result")
+            with col2:
+                mood = st.selectbox("本人の様子", ["穏やか", "普段通り", "不安あり", "拒否あり", "疲労あり", "痛み訴えあり", "その他"], key="daily_new_mood")
+            with col3:
+                reflect = st.selectbox("モニタリング反映", ["反映する", "反映しない"], key="daily_new_reflect")
+            reason = st.text_input("未実施理由・一部実施の理由", placeholder="例：眠気が強く、声かけのみ実施", key="daily_new_reason")
+            staff_memo = st.text_area("職員メモ", placeholder="例：リビングへの移動はできたが、10分ほどで居室へ戻られた", key="daily_new_staff_memo")
+            staff_name = st.text_input("入力職員", placeholder="例：藤野", key="daily_new_staff_name")
+            submitted = st.form_submit_button("実施チェックを保存", use_container_width=True)
+
+        if submitted:
+            uid = get_user_id_by_name(user_name) or ensure_user_id_value(clean_text(selected_goal.get("user_id")), user_name)
+            new_row = {
+                "記録ID": str(uuid.uuid4()),
+                "日付": check_date.strftime("%Y-%m-%d"),
+                "利用者名": user_name,
+                "user_id": uid,
+                "目標ID": clean_text(selected_goal.get("目標ID")),
+                "短期目標": clean_text(selected_goal.get("短期目標")),
+                "実施状況": result,
+                "本人の様子": mood,
+                "未実施理由": clean_text(reason),
+                "職員メモ": clean_text(staff_memo),
+                "入力職員": clean_text(staff_name),
+                "モニタリング反映": reflect,
+                "登録日時": format_now_jst("%Y-%m-%d %H:%M:%S"),
+            }
+            check_df2 = pd.concat([check_df, pd.DataFrame([new_row], columns=SHORT_GOAL_CHECK_COLUMNS)], ignore_index=True)
+            save_short_goal_checks(check_df2)
+            try:
+                add_audit_log("短期目標実施チェック登録", SQLITE_TABLE_SHORT_GOAL_CHECKS, new_row["記録ID"], f"{user_name} / {result} / {clean_text(selected_goal.get('短期目標'))[:80]}")
+            except Exception:
+                pass
+            st.success("実施チェックを保存しました。")
+            st.rerun()
+
+    # -------------------------
+    # 検索・一覧
+    # -------------------------
+    with tab_search:
+        st.subheader("登録済み実施チェックを検索")
+        if check_df.empty:
+            st.info("まだ実施チェック記録がありません。")
+        else:
+            c1, c2, c3, c4 = st.columns([1.1, 1, 1, 1.6])
+            with c1:
+                filter_user = st.selectbox("利用者で絞り込み", ["全員"] + users, key="daily_check_search_user")
+            with c2:
+                start_date = st.date_input("開始日", value=date(today_jst().year, today_jst().month, 1), key="daily_check_search_start")
+            with c3:
+                end_date = st.date_input("終了日", value=today_jst(), key="daily_check_search_end")
+            with c4:
+                keyword = st.text_input("キーワード検索", placeholder="短期目標・理由・職員メモ・入力職員から検索", key="daily_check_search_keyword")
+
+            c5, c6 = st.columns(2)
+            with c5:
+                filter_result = st.selectbox("実施状況で絞り込み", ["すべて", "実施", "一部実施", "未実施"], key="daily_check_search_result")
+            with c6:
+                filter_reflect = st.selectbox("モニタリング反映", ["すべて", "反映する", "反映しない"], key="daily_check_search_reflect")
+
+            result_df = check_df.copy()
+            result_df["日付_dt"] = pd.to_datetime(result_df["日付"], errors="coerce")
+            result_df = result_df[
+                (result_df["日付_dt"] >= pd.to_datetime(start_date))
+                & (result_df["日付_dt"] <= pd.to_datetime(end_date))
+            ].copy()
+
+            if filter_user != "全員":
+                result_df = result_df[result_df["利用者名"].astype(str) == str(filter_user)].copy()
+            if filter_result != "すべて":
+                result_df = result_df[result_df["実施状況"].astype(str) == str(filter_result)].copy()
+            if filter_reflect != "すべて":
+                result_df = result_df[result_df["モニタリング反映"].astype(str) == str(filter_reflect)].copy()
+            if clean_text(keyword):
+                kw = clean_text(keyword)
+                mask = (
+                    result_df["短期目標"].astype(str).str.contains(kw, case=False, na=False)
+                    | result_df["未実施理由"].astype(str).str.contains(kw, case=False, na=False)
+                    | result_df["職員メモ"].astype(str).str.contains(kw, case=False, na=False)
+                    | result_df["入力職員"].astype(str).str.contains(kw, case=False, na=False)
+                )
+                result_df = result_df[mask].copy()
+
+            st.caption(f"検索結果：{len(result_df)}件")
+            show_cols = ["日付", "利用者名", "短期目標", "実施状況", "本人の様子", "未実施理由", "職員メモ", "入力職員", "モニタリング反映", "登録日時"]
+            for col in show_cols:
+                if col not in result_df.columns:
+                    result_df[col] = ""
+            if not result_df.empty:
+                result_df = result_df.sort_values("日付_dt", ascending=False)
+            st.dataframe(result_df[show_cols], use_container_width=True, hide_index=True)
+
+            if not result_df.empty:
+                download_df = result_df.drop(columns=["日付_dt"], errors="ignore")
+                st.download_button(
+                    "検索結果をExcelでダウンロード",
+                    data=to_excel_download(download_df),
+                    file_name=f"短期目標実施チェック検索結果_{today_jst().strftime('%Y-%m-%d')}.xlsx",
+                    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                    use_container_width=True,
+                    key="daily_check_search_download",
+                )
+
+    # -------------------------
+    # 更新
+    # -------------------------
+    with tab_edit:
+        st.subheader("登録済み実施チェックを更新")
+        if check_df.empty:
+            st.info("更新できる実施チェック記録がありません。")
+        else:
+            c1, c2, c3 = st.columns(3)
+            with c1:
+                edit_filter_user = st.selectbox("利用者で絞り込み", ["全員"] + users, key="daily_check_edit_filter_user")
+            with c2:
+                edit_start = st.date_input("開始日", value=date(today_jst().year, today_jst().month, 1), key="daily_check_edit_start")
+            with c3:
+                edit_end = st.date_input("終了日", value=today_jst(), key="daily_check_edit_end")
+
+            edit_candidates = check_df.copy()
+            edit_candidates["記録ID"] = edit_candidates["記録ID"].fillna("").astype(str)
+            edit_candidates = edit_candidates[edit_candidates["記録ID"] != ""].copy()
+            edit_candidates["日付_dt"] = pd.to_datetime(edit_candidates["日付"], errors="coerce")
+            edit_candidates = edit_candidates[
+                (edit_candidates["日付_dt"] >= pd.to_datetime(edit_start))
+                & (edit_candidates["日付_dt"] <= pd.to_datetime(edit_end))
+            ].copy()
+            if edit_filter_user != "全員":
+                edit_candidates = edit_candidates[edit_candidates["利用者名"].astype(str) == str(edit_filter_user)].copy()
+
+            if edit_candidates.empty:
+                st.info("条件に該当する更新対象がありません。")
+            else:
+                label_to_id = {}
+                for _, row in edit_candidates.sort_values("日付_dt", ascending=False).iterrows():
+                    label = _build_check_label(row)
+                    record_id = clean_text(row.get("記録ID"))
+                    if record_id:
+                        label_to_id[label] = record_id
+
+                selected_label = st.selectbox("更新する実施チェックを選択", list(label_to_id.keys()), key="daily_check_edit_select")
+                selected_record_id = label_to_id.get(selected_label, "")
+                hit = check_df[check_df["記録ID"].astype(str) == str(selected_record_id)]
+
+                if hit.empty:
+                    st.warning("選択した実施チェック記録が見つかりません。")
+                else:
+                    row = hit.iloc[-1]
+                    edit_key = clean_text(selected_record_id)[:12] or str(abs(hash(selected_label)))
+
+                    current_user = clean_text(row.get("利用者名"))
+                    user_index = users.index(current_user) if current_user in users else 0
+
+                    current_goal_id = clean_text(row.get("目標ID"))
+                    current_goal_text = clean_text(row.get("短期目標"))
+
+                    selected_user_for_goals = st.selectbox(
+                        "利用者名",
+                        users,
+                        index=user_index,
+                        key=f"daily_check_edit_user_outside_{edit_key}",
+                    )
+                    goal_label_map = _build_goal_options(selected_user_for_goals)
+
+                    if not goal_label_map:
+                        st.warning("この利用者には有効な短期目標がありません。短期目標マスタを確認してください。")
+                    else:
+                        goal_labels = list(goal_label_map.keys())
+                        default_goal_index = 0
+                        for i, label in enumerate(goal_labels):
+                            goal_row = goal_label_map[label]
+                            if clean_text(goal_row.get("目標ID")) == current_goal_id or clean_text(goal_row.get("短期目標")) == current_goal_text:
+                                default_goal_index = i
+                                break
+
+                        result_options = ["実施", "一部実施", "未実施"]
+                        mood_options = ["穏やか", "普段通り", "不安あり", "拒否あり", "疲労あり", "痛み訴えあり", "その他"]
+                        reflect_options = ["反映する", "反映しない"]
+
+                        current_result = clean_text(row.get("実施状況"), "実施")
+                        current_mood = clean_text(row.get("本人の様子"), "普段通り")
+                        current_reflect = clean_text(row.get("モニタリング反映"), "反映する")
+
+                        result_index = result_options.index(current_result) if current_result in result_options else 0
+                        mood_index = mood_options.index(current_mood) if current_mood in mood_options else 1
+                        reflect_index = reflect_options.index(current_reflect) if current_reflect in reflect_options else 0
+
+                        with st.form(f"daily_check_update_form_{edit_key}"):
+                            col1, col2 = st.columns(2)
+                            with col1:
+                                update_date = st.date_input("日付", value=_safe_date_value(row.get("日付")), key=f"daily_check_edit_date_{edit_key}")
+                            with col2:
+                                update_goal_label = st.selectbox("短期目標", goal_labels, index=default_goal_index, key=f"daily_check_edit_goal_{edit_key}")
+
+                            selected_goal_for_update = goal_label_map[update_goal_label]
+                            st.markdown("#### 支援内容")
+                            st.info(clean_text(selected_goal_for_update.get("支援内容"), "支援内容の記載はありません。"))
+
+                            col3, col4, col5 = st.columns(3)
+                            with col3:
+                                update_result = st.selectbox("実施状況", result_options, index=result_index, key=f"daily_check_edit_result_{edit_key}")
+                            with col4:
+                                update_mood = st.selectbox("本人の様子", mood_options, index=mood_index, key=f"daily_check_edit_mood_{edit_key}")
+                            with col5:
+                                update_reflect = st.selectbox("モニタリング反映", reflect_options, index=reflect_index, key=f"daily_check_edit_reflect_{edit_key}")
+
+                            update_reason = st.text_input(
+                                "未実施理由・一部実施の理由",
+                                value=clean_text(row.get("未実施理由")),
+                                key=f"daily_check_edit_reason_{edit_key}",
+                            )
+                            update_staff_memo = st.text_area(
+                                "職員メモ",
+                                value=clean_text(row.get("職員メモ")),
+                                key=f"daily_check_edit_staff_memo_{edit_key}",
+                            )
+                            update_staff_name = st.text_input(
+                                "入力職員",
+                                value=clean_text(row.get("入力職員")),
+                                key=f"daily_check_edit_staff_name_{edit_key}",
+                            )
+
+                            update_submitted = st.form_submit_button("この内容で更新", use_container_width=True)
+
+                        if update_submitted:
+                            idx_list = check_df.index[check_df["記録ID"].astype(str) == str(selected_record_id)].tolist()
+                            if not idx_list:
+                                st.error("更新対象が見つかりません。")
+                            else:
+                                idx = idx_list[-1]
+                                uid = get_user_id_by_name(selected_user_for_goals) or ensure_user_id_value(clean_text(row.get("user_id")), selected_user_for_goals)
+                                before_summary = f"{clean_text(row.get('日付'))} / {clean_text(row.get('利用者名'))} / {clean_text(row.get('実施状況'))}"
+                                check_df.at[idx, "日付"] = update_date.strftime("%Y-%m-%d")
+                                check_df.at[idx, "利用者名"] = selected_user_for_goals
+                                check_df.at[idx, "user_id"] = uid
+                                check_df.at[idx, "目標ID"] = clean_text(selected_goal_for_update.get("目標ID"))
+                                check_df.at[idx, "短期目標"] = clean_text(selected_goal_for_update.get("短期目標"))
+                                check_df.at[idx, "実施状況"] = update_result
+                                check_df.at[idx, "本人の様子"] = update_mood
+                                check_df.at[idx, "未実施理由"] = clean_text(update_reason)
+                                check_df.at[idx, "職員メモ"] = clean_text(update_staff_memo)
+                                check_df.at[idx, "入力職員"] = clean_text(update_staff_name)
+                                check_df.at[idx, "モニタリング反映"] = update_reflect
+                                if not clean_text(check_df.at[idx, "登録日時"]):
+                                    check_df.at[idx, "登録日時"] = format_now_jst("%Y-%m-%d %H:%M:%S")
+                                save_short_goal_checks(check_df)
+                                try:
+                                    add_audit_log(
+                                        "短期目標実施チェック更新",
+                                        SQLITE_TABLE_SHORT_GOAL_CHECKS,
+                                        selected_record_id,
+                                        f"{before_summary} → {update_date.strftime('%Y-%m-%d')} / {selected_user_for_goals} / {update_result}",
+                                    )
+                                except Exception:
+                                    pass
+                                st.success("実施チェックを更新しました。")
+                                st.rerun()
 
 def show_goal_history():
     st.header("実施履歴一覧")
