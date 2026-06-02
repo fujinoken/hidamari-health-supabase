@@ -120,10 +120,22 @@ ADMIN_ONLY_MENUS = [
     "利用者名ゆれ紐づけマスタ",
 ]
 
+# =========================
+# 非表示メニュー制御
+# =========================
+# 「介護計画モニタリング下書き作成」は機能本体を残したまま、
+# サイドバーのメニューからは表示しない。
+# 既存のメニューカテゴリ設定に残っていても表示されないよう、
+# サイドバー生成時と設定読込時の両方で除外する。
+HIDDEN_MENUS = [
+    "モニタリング下書き作成",
+]
+
 def filter_admin_menus(menu_list):
+    hidden = set(HIDDEN_MENUS)
     if is_admin_user():
-        return menu_list
-    return [m for m in menu_list if m not in ADMIN_ONLY_MENUS]
+        return [m for m in menu_list if m not in hidden]
+    return [m for m in menu_list if m not in ADMIN_ONLY_MENUS and m not in hidden]
 
 
 
@@ -11521,7 +11533,7 @@ MENU_GROUPS_ADMIN = {
     "朝の確認": ["自分専用ダッシュボード", "管理者ダッシュボード", "業務全体申し送り", "管理者支援"],
     "日々の入力": ["健康チェック入力", "写真から半自動入力", "排泄チェック入力", "日々の実施チェック"],
     "記録確認": ["過去データ管理", "排泄詳細管理", "実施履歴一覧", "短期目標データ管理"],
-    "短期目標・LIFE": ["短期目標・モニタリング", "短期目標マスタ", "モニタリング下書き作成", "LIFE入力標準化", "管理者LIFE入力", "LIFE不足チェック", "LIFE CSV出力", "LIFE登録一覧", "加算シミュレーション"],
+    "短期目標・LIFE": ["短期目標・モニタリング", "短期目標マスタ", "LIFE入力標準化", "管理者LIFE入力", "LIFE不足チェック", "LIFE CSV出力", "LIFE登録一覧", "加算シミュレーション"],
     "帳票・共有": ["家族向けレポート作成", "ひだまりレポートPDF", "データダウンロード"],
     "設定・保守": ["利用者マスタ管理", "ログイン・職員ID管理", "セキュリティ・保守管理", "利用者ID移行チェック", "利用者名ゆれ紐づけマスタ", "自分専用ダッシュボード設定", "メニューカテゴリ設定", "システム設定", "現場の気づき構造化・AI管理者支援"],
 }
@@ -11573,7 +11585,14 @@ def normalize_menu_category_df(df):
     work["メニュー"] = work["メニュー"].map(lambda x: clean_text(x))
     work["並び順"] = pd.to_numeric(work["並び順"], errors="coerce").fillna(9999)
     work["備考"] = work["備考"].map(lambda x: clean_text(x))
-    work = work[work["メニュー"] != ""].drop_duplicates(subset=["メニュー"], keep="last")
+    work = work[work["メニュー"] != ""].copy()
+    # 非表示メニューは、過去の保存設定に残っていても設定一覧・サイドバーへ出さない。
+    try:
+        hidden = set(HIDDEN_MENUS)
+        work = work[~work["メニュー"].astype(str).isin(hidden)].copy()
+    except Exception:
+        pass
+    work = work.drop_duplicates(subset=["メニュー"], keep="last")
     return work.sort_values(["カテゴリ", "並び順", "メニュー"]).reset_index(drop=True)
 
 
@@ -11663,6 +11682,8 @@ def build_menu_groups_from_settings(role="admin"):
         category = clean_text(row.get("カテゴリ"), "その他")
         menu_name = clean_text(row.get("メニュー"))
         if not menu_name:
+            continue
+        if menu_name in HIDDEN_MENUS:
             continue
         groups.setdefault(category, [])
         if menu_name not in groups[category]:
