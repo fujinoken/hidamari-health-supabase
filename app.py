@@ -8704,6 +8704,224 @@ def get_active_user_names():
     return users if users else DEFAULT_USERS
 
 
+def _short_goal_text_join(values, limit=6):
+    """短期目標サマリー用に、空欄を除いて重複をまとめる。"""
+    items = []
+    try:
+        iterable = list(values)
+    except Exception:
+        iterable = []
+    for value in iterable:
+        text = clean_text(value) if "clean_text" in globals() else str(value or "").strip()
+        if not text or text.lower() in ["nan", "none", "nat"]:
+            continue
+        if text not in items:
+            items.append(text)
+    return "\n".join([f"・{x}" for x in items[:limit]]) if items else "記録なし"
+
+
+def _build_short_goal_rule_summary(view_df: pd.DataFrame) -> dict:
+    """AI未設定時でも止まらない、記録ベースの要約。"""
+    if view_df is None or view_df.empty:
+        return {
+            "理由要約": "対象期間の記録がないため、未実施・一部実施の理由は確認できません。",
+            "職員メモ要約": "対象期間の職員メモはありません。",
+        }
+
+    reasons = []
+    for _, row in view_df.iterrows():
+        status = clean_text(row.get("実施状況"))
+        reason = clean_text(row.get("未実施理由"))
+        if status in ["未実施", "一部実施"] and reason:
+            reasons.append(f"{status}：{reason}")
+
+    memos = []
+    for _, row in view_df.iterrows():
+        memo = clean_text(row.get("職員メモ"))
+        if memo:
+            day = clean_text(row.get("日付"))
+            status = clean_text(row.get("実施状況"))
+            memos.append(f"{day}（{status}）：{memo}")
+
+    return {
+        "理由要約": _short_goal_text_join(reasons, limit=8) if reasons else "未実施・一部実施の理由は記録されていません。",
+        "職員メモ要約": _short_goal_text_join(memos, limit=8) if memos else "職員メモは記録されていません。",
+    }
+
+
+def generate_ai_short_goal_summary(user_name, goal_text, start_date, end_date, view_df: pd.DataFrame):
+    """短期目標の実施記録をAIで短く要約する。API未設定時は通常要約を返す。"""
+    fallback = _build_short_goal_rule_summary(view_df)
+    api_key = get_openai_api_key("") if "get_openai_api_key" in globals() else ""
+    if not api_key:
+        return fallback, "OpenAI APIキー未設定のため、通常要約を表示しています。"
+    try:
+        from openai import OpenAI
+    except Exception:
+        return fallback, "openaiライブラリが未インストールのため、通常要約を表示しています。"
+
+    try:
+        source_cols = ["日付", "利用者名", "短期目標", "実施状況", "本人の様子", "未実施理由", "職員メモ", "入力職員"]
+        work = view_df.copy()
+        for col in source_cols:
+            if col not in work.columns:
+                work[col] = ""
+        records = work[source_cols].fillna("").astype(str).to_dict(orient="records")
+        prompt = f"""
+あなたは介護施設の短期目標モニタリング記録の文章整理係です。
+医療判断・診断・治療効果の断定は禁止です。
+記録に基づき、未実施理由・一部実施理由と職員メモを、管理者が確認しやすい短い文章に整理してください。
+推測で事実を追加しないでください。
+出力はJSONのみです。
+
+【対象】
+利用者：{user_name}
+短期目標：{goal_text}
+期間：{start_date}〜{end_date}
+
+【記録】
+{records}
+
+JSON形式：
+{{
+  "理由要約": "未実施・一部実施の理由を2〜4文で整理。理由がなければ、記録なしと書く。",
+  "職員メモ要約": "職員メモから本人の様子や支援上の注意点を2〜4文で整理。記録がなければ、記録なしと書く。"
+}}
+"""
+        client = OpenAI(api_key=api_key)
+        res = client.chat.completions.create(
+            model="gpt-4o-mini",
+            messages=[
+                {"role": "system", "content": "介護記録を断定せず、記録に基づいて短く整理します。"},
+                {"role": "user", "content": prompt},
+            ],
+            temperature=0.2,
+            response_format={"type": "json_object"},
+        )
+        data = json.loads(res.choices[0].message.content or "{}")
+        return {
+            "理由要約": clean_text(data.get("理由要約"), fallback["理由要約"]),
+            "職員メモ要約": clean_text(data.get("職員メモ要約"), fallback["職員メモ要約"]),
+        }, "AI要約を表示しています。"
+    except Exception as e:
+        return fallback, f"AI要約中にエラーが出たため、通常要約を表示しています：{e}"
+
+
+def show_short_goal_selected_summary(goals: pd.DataFrame, checks: pd.DataFrame):
+    """利用者・短期目標を選択して、実施状況率と理由・職員メモ要約を表示する。"""
+    st.markdown("### 利用者・短期目標別の実施状況")
+    st.caption("利用者と短期目標を選択し、期間内の実施率、未実施理由・一部実施理由、職員メモ要約を確認できます。")
+
+    if goals is None or goals.empty:
+        st.info("短期目標がまだ登録されていません。")
+        return
+
+    goals = normalize_df_columns(goals, SHORT_GOAL_MASTER_COLUMNS)
+    checks = normalize_df_columns(checks, SHORT_GOAL_CHECK_COLUMNS) if checks is not None else pd.DataFrame(columns=SHORT_GOAL_CHECK_COLUMNS)
+
+    users = sorted([u for u in goals["利用者名"].dropna().astype(str).unique().tolist() if clean_text(u)])
+    if not users:
+        st.info("短期目標に利用者名が登録されていません。")
+        return
+
+    c1, c2, c3 = st.columns([1.2, 1, 1])
+    with c1:
+        selected_user = st.selectbox("利用者", users, key="short_goal_summary_user")
+    with c2:
+        start_date = st.date_input("開始日", value=date(today_jst().year, today_jst().month, 1), key="short_goal_summary_start")
+    with c3:
+        end_date = st.date_input("終了日", value=today_jst(), key="short_goal_summary_end")
+
+    user_goals = goals[goals["利用者名"].astype(str) == str(selected_user)].copy()
+    if user_goals.empty:
+        st.info("この利用者の短期目標は登録されていません。")
+        return
+
+    goal_label_map = {}
+    for _, row in user_goals.iterrows():
+        gid = clean_text(row.get("目標ID"))
+        goal_text = clean_text(row.get("短期目標"))
+        status = clean_text(row.get("状態"))
+        if not gid or not goal_text:
+            continue
+        label_goal = goal_text if len(goal_text) <= 55 else goal_text[:55] + "…"
+        goal_label_map[f"{label_goal}｜{status}｜{gid[:8]}"] = gid
+
+    if not goal_label_map:
+        st.info("選択できる短期目標がありません。")
+        return
+
+    selected_goal_label = st.selectbox("短期目標", list(goal_label_map.keys()), key="short_goal_summary_goal")
+    selected_goal_id = goal_label_map.get(selected_goal_label, "")
+    selected_goal_row = user_goals[user_goals["目標ID"].astype(str) == str(selected_goal_id)].iloc[0]
+    selected_goal_text = clean_text(selected_goal_row.get("短期目標"))
+
+    st.markdown("#### 支援内容")
+    st.info(clean_text(selected_goal_row.get("支援内容"), "支援内容の記載はありません。"))
+
+    if checks.empty:
+        st.info("実施チェック記録がまだありません。")
+        return
+
+    work = checks.copy()
+    work["日付_dt"] = pd.to_datetime(work["日付"], errors="coerce")
+    work = work[
+        (work["利用者名"].astype(str) == str(selected_user))
+        & (work["目標ID"].astype(str) == str(selected_goal_id))
+        & (work["日付_dt"] >= pd.to_datetime(start_date))
+        & (work["日付_dt"] <= pd.to_datetime(end_date))
+    ].copy()
+
+    if work.empty:
+        st.warning("この条件に該当する実施チェック記録はありません。")
+        return
+
+    total = len(work)
+    done = int((work["実施状況"].astype(str) == "実施").sum())
+    partial = int((work["実施状況"].astype(str) == "一部実施").sum())
+    not_done = int((work["実施状況"].astype(str) == "未実施").sum())
+    rate = round(((done + partial * 0.5) / total) * 100, 1) if total else 0
+    done_only_rate = round((done / total) * 100, 1) if total else 0
+
+    m1, m2, m3, m4, m5 = st.columns(5)
+    m1.metric("実施状況率", f"{rate}%")
+    m2.metric("実施のみ率", f"{done_only_rate}%")
+    m3.metric("実施", done)
+    m4.metric("一部実施", partial)
+    m5.metric("未実施", not_done)
+    st.caption("※ 実施状況率は、実施=1点・一部実施=0.5点・未実施=0点として計算しています。")
+
+    if st.button("AI要約を更新", use_container_width=True, key="short_goal_summary_ai_button"):
+        summary, note = generate_ai_short_goal_summary(selected_user, selected_goal_text, start_date, end_date, work)
+        st.session_state["short_goal_summary_result"] = summary
+        st.session_state["short_goal_summary_note"] = note
+    elif "short_goal_summary_result" not in st.session_state:
+        summary, note = generate_ai_short_goal_summary(selected_user, selected_goal_text, start_date, end_date, work)
+        st.session_state["short_goal_summary_result"] = summary
+        st.session_state["short_goal_summary_note"] = note
+    else:
+        summary = st.session_state.get("short_goal_summary_result", _build_short_goal_rule_summary(work))
+        note = st.session_state.get("short_goal_summary_note", "")
+
+    if note:
+        st.caption(note)
+
+    c_reason, c_memo = st.columns(2)
+    with c_reason:
+        st.markdown("#### 未実施理由・一部実施の理由")
+        st.info(summary.get("理由要約", "記録なし"))
+    with c_memo:
+        st.markdown("#### 職員メモ要約")
+        st.info(summary.get("職員メモ要約", "記録なし"))
+
+    with st.expander("対象期間の実施チェック記録を確認", expanded=False):
+        show_cols = ["日付", "利用者名", "短期目標", "実施状況", "本人の様子", "未実施理由", "職員メモ", "入力職員", "登録日時"]
+        for col in show_cols:
+            if col not in work.columns:
+                work[col] = ""
+        st.dataframe(work.sort_values("日付_dt", ascending=False)[show_cols], use_container_width=True, hide_index=True)
+
+
 def show_short_goal_top():
     if not is_admin_user():
         st.warning("このメニューは管理者専用です。")
@@ -8723,11 +8941,14 @@ def show_short_goal_top():
         ① 短期目標を登録<br>
         ② 職員が日々「実施／一部実施／未実施」を入力<br>
         ③ 利用者別・月別に履歴を確認<br>
-        ④ 月末や会議前にモニタリング下書きを作成
+        ④ 月末や会議前にモニタリング下書きを作成<br>
+        ⑤ 利用者・短期目標ごとの実施率と理由・職員メモ要約を確認
         </div>
         """,
         unsafe_allow_html=True,
     )
+    st.divider()
+    show_short_goal_selected_summary(goals, checks)
 
 
 def show_short_goal_master():
