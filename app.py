@@ -8990,16 +8990,67 @@ def show_short_goal_selected_summary(goals: pd.DataFrame, checks: pd.DataFrame):
         & (work["日付_dt"] <= pd.to_datetime(end_date))
     ].copy()
 
-    if work.empty:
-        st.warning("この条件に該当する実施チェック記録はありません。")
+    # =========================
+    # 未入力日を未実施扱いにする集計（Ver4.1+）
+    # =========================
+    # これまで：入力された実施チェック記録だけを分母にしていた。
+    # 変更後：対象期間の全日数を分母にし、記録がない日は「未入力のため未実施扱い」として自動補完する。
+    period_dates = pd.date_range(pd.to_datetime(start_date), pd.to_datetime(end_date), freq="D")
+    if len(period_dates) == 0:
+        st.warning("開始日と終了日を確認してください。")
         return
 
-    total = len(work)
+    for col in SHORT_GOAL_CHECK_COLUMNS:
+        if col not in work.columns:
+            work[col] = ""
+
+    # 同じ日に複数記録がある場合は、登録日時が新しいものをその日の代表記録にする。
+    # 登録日時が空の環境でも止まらないよう、日付で補完する。
+    if not work.empty:
+        work["日付_only"] = work["日付_dt"].dt.date
+        work["_sort_dt"] = pd.to_datetime(work.get("登録日時", ""), errors="coerce")
+        work["_sort_dt"] = work["_sort_dt"].fillna(work["日付_dt"])
+        work = work.sort_values("_sort_dt").drop_duplicates("日付_only", keep="last").copy()
+    else:
+        work["日付_only"] = pd.NaT
+        work["_sort_dt"] = pd.NaT
+
+    recorded_dates = set([d for d in work["日付_only"].dropna().tolist()]) if "日付_only" in work.columns else set()
+    missing_rows = []
+    for d in period_dates:
+        d_date = d.date()
+        if d_date in recorded_dates:
+            continue
+        missing_rows.append({
+            "記録ID": f"AUTO-NOTDONE-{selected_goal_id}-{d.strftime('%Y%m%d')}",
+            "日付": d.strftime("%Y-%m-%d"),
+            "利用者名": selected_user,
+            "user_id": clean_text(selected_goal_row.get("user_id", "")) if "clean_text" in globals() else "",
+            "目標ID": selected_goal_id,
+            "短期目標": selected_goal_text,
+            "実施状況": "未実施",
+            "本人の様子": "",
+            "未実施理由": "未入力のため未実施扱い",
+            "職員メモ": "記録なし。未入力日のため自動的に未実施として集計。",
+            "入力職員": "自動判定",
+            "登録日時": "",
+        })
+
+    if missing_rows:
+        work = pd.concat([work, pd.DataFrame(missing_rows)], ignore_index=True)
+
+    work["日付_dt"] = pd.to_datetime(work["日付"], errors="coerce")
+    work = work.sort_values("日付_dt", ascending=True).copy()
+    if "日付_only" in work.columns:
+        work = work.drop(columns=[c for c in ["日付_only", "_sort_dt"] if c in work.columns])
+
+    total = len(period_dates)
     done = int((work["実施状況"].astype(str) == "実施").sum())
     partial = int((work["実施状況"].astype(str) == "一部実施").sum())
     not_done = int((work["実施状況"].astype(str) == "未実施").sum())
     rate = round(((done + partial * 0.5) / total) * 100, 1) if total else 0
     done_only_rate = round((done / total) * 100, 1) if total else 0
+    auto_not_done = len(missing_rows)
 
     m1, m2, m3, m4, m5 = st.columns(5)
     m1.metric("実施状況率", f"{rate}%")
@@ -9008,8 +9059,9 @@ def show_short_goal_selected_summary(goals: pd.DataFrame, checks: pd.DataFrame):
     m4.metric("一部実施", partial)
     m5.metric("未実施", not_done)
     st.caption("※ 実施状況率は、実施=1点・一部実施=0.5点・未実施=0点として計算しています。")
+    st.caption(f"※ 分母は対象期間の全日数（{total}日）です。記録がない日は未実施として自動集計しています（未入力による未実施扱い：{auto_not_done}日）。")
 
-    signature = f"{selected_user}|{selected_goal_id}|{start_date}|{end_date}|{len(work)}"
+    signature = f"{selected_user}|{selected_goal_id}|{start_date}|{end_date}|{total}|{done}|{partial}|{not_done}|{auto_not_done}"
     if st.session_state.get("short_goal_summary_signature") != signature:
         summary, note = generate_ai_short_goal_summary(selected_user, selected_goal_text, start_date, end_date, work)
         st.session_state["short_goal_summary_signature"] = signature
