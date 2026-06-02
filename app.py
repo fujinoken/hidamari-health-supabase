@@ -13929,43 +13929,84 @@ elif menu == "管理者支援":
 
     with tab3:
         st.subheader("気になる変化（日付別一覧）")
-        st.caption("健康チェック入力の『気になる変化』を、利用者・年月で絞り込み、日付ごとに確認できます。")
+        st.caption("健康チェック入力の『気になる変化』を、利用者・日付で絞り込み、日付ごとに確認できます。")
 
         if health_df.empty:
             st.info("健康チェックデータがありません。")
         else:
+            # Ver4.6追加：利用者に「全員」を追加し、年月だけではなく日付範囲で絞り込めるようにする。
+            user_options_for_change = ["全員"] + [u for u in all_users if clean_text(u) and clean_text(u) != "全員"]
+
+            default_end_date = today_jst()
+            default_start_date = default_end_date.replace(day=1)
+
             col1, col2, col3 = st.columns(3)
             with col1:
-                change_user = st.selectbox("利用者", all_users, key="change_user")
+                change_user = st.selectbox("利用者", user_options_for_change, key="change_user")
             with col2:
-                change_year = st.number_input("年", min_value=2024, max_value=2035, value=today_jst().year, step=1, key="change_year")
+                change_start_date = st.date_input("開始日", value=default_start_date, key="change_start_date")
             with col3:
-                change_month = st.number_input("月", min_value=1, max_value=12, value=today_jst().month, step=1, key="change_month")
+                change_end_date = st.date_input("終了日", value=default_end_date, key="change_end_date")
 
-            change_target = get_month_health_data(health_df, change_user, change_year, change_month)
+            if change_start_date > change_end_date:
+                st.error("開始日は終了日以前にしてください。")
+                st.stop()
+
+            change_target = health_df.copy()
+            if "記録日" not in change_target.columns:
+                st.error("健康チェックデータに『記録日』列がありません。")
+                st.stop()
+
+            change_target["記録日_dt"] = pd.to_datetime(change_target["記録日"], errors="coerce")
+            start_dt = pd.to_datetime(change_start_date)
+            end_dt = pd.to_datetime(change_end_date)
+            change_target = change_target[
+                (change_target["記録日_dt"] >= start_dt)
+                & (change_target["記録日_dt"] <= end_dt)
+            ].copy()
+
+            if change_user != "全員" and "利用者名" in change_target.columns:
+                change_target = change_target[
+                    change_target["利用者名"].fillna("").astype(str).str.strip() == clean_text(change_user)
+                ].copy()
+
+            period_label = f"{change_start_date.strftime('%Y/%m/%d')}〜{change_end_date.strftime('%Y/%m/%d')}"
+            user_label = "全利用者" if change_user == "全員" else change_user
 
             if change_target.empty:
-                st.warning("対象月の健康チェックデータがありません。")
+                st.warning(f"{user_label} の {period_label} に、健康チェックデータがありません。")
             else:
                 change_rows = change_target.copy()
+                if "気になる変化" not in change_rows.columns:
+                    st.error("健康チェックデータに『気になる変化』列がありません。")
+                    st.stop()
+
                 change_rows["気になる変化"] = change_rows["気になる変化"].fillna("").astype(str).str.strip()
                 change_rows = change_rows[change_rows["気になる変化"] != ""]
 
                 if change_rows.empty:
-                    st.success("対象月に『気になる変化』の記録はありません。")
+                    st.success(f"{user_label} の {period_label} に『気になる変化』の記録はありません。")
                 else:
-                    change_rows = change_rows.sort_values("記録日")
-                    display_df = change_rows[["記録日", "利用者名", "気になる変化", "家族共有メモ", "入力者", "登録日時"]].copy()
+                    change_rows = change_rows.sort_values(["記録日_dt", "利用者名"] if "利用者名" in change_rows.columns else ["記録日_dt"])
+
+                    display_cols = []
+                    for col in ["記録日", "利用者名", "気になる変化", "家族共有メモ", "入力者", "登録日時"]:
+                        if col not in change_rows.columns:
+                            change_rows[col] = ""
+                        display_cols.append(col)
+
+                    display_df = change_rows[display_cols].copy()
                     display_df["日付"] = pd.to_datetime(display_df["記録日"], errors="coerce").dt.strftime("%Y/%m/%d")
                     display_df = display_df[["日付", "利用者名", "気になる変化", "家族共有メモ", "入力者", "登録日時"]]
 
-                    st.warning(f"{change_user} の {int(change_year)}年{int(change_month)}月に、気になる変化が {len(display_df)} 件あります。")
+                    st.warning(f"{user_label} の {period_label} に、気になる変化が {len(display_df)} 件あります。")
                     st.dataframe(display_df, use_container_width=True, hide_index=True)
 
                     st.markdown("#### 日付ごとの確認メモ")
                     memo_lines = []
                     for _, row in display_df.iterrows():
                         date_label = clean_text(row.get("日付", ""))
+                        row_user = clean_text(row.get("利用者名", ""))
                         change_text = clean_text(row.get("気になる変化", ""))
                         family_text = clean_text(row.get("家族共有メモ", ""))
                         staff_text = clean_text(row.get("入力者", ""))
@@ -13973,7 +14014,7 @@ elif menu == "管理者支援":
                         st.markdown(
                             f"""
                             <div style='background:#FFF8E8; border:1px solid #E5C782; border-radius:14px; padding:12px 14px; margin:8px 0;'>
-                                <b>{date_label}</b><br>
+                                <b>{date_label}　{row_user}</b><br>
                                 <span style='color:#7A4A00;'>気になる変化：</span>{change_text}<br>
                                 <span style='color:#666;'>家族共有メモ：</span>{family_text if family_text else '記録なし'}<br>
                                 <span style='color:#888; font-size:0.9rem;'>入力者：{staff_text if staff_text else '未入力'}</span>
@@ -13983,18 +14024,19 @@ elif menu == "管理者支援":
                         )
 
                         memo_lines.append(
-                            f"{date_label}\n"
+                            f"{date_label}　{row_user}\n"
                             f"気になる変化：{change_text}\n"
                             f"家族共有メモ：{family_text if family_text else '記録なし'}\n"
                             f"入力者：{staff_text if staff_text else '未入力'}"
                         )
 
-                    export_text = f"{change_user}　{int(change_year)}年{int(change_month)}月　気になる変化一覧\n\n" + "\n\n".join(memo_lines)
+                    safe_user_label = re.sub(r"[\\/:*?\"<>|\s]+", "_", user_label)
+                    export_text = f"{user_label}　{period_label}　気になる変化一覧\n\n" + "\n\n".join(memo_lines)
                     st.text_area("コピー用テキスト", value=export_text, height=260)
                     st.download_button(
                         "気になる変化一覧をテキストでダウンロード",
                         data=export_text.encode("utf-8-sig"),
-                        file_name=f"気になる変化一覧_{change_user}_{int(change_year)}年{int(change_month)}月.txt",
+                        file_name=f"気になる変化一覧_{safe_user_label}_{change_start_date.strftime('%Y%m%d')}_{change_end_date.strftime('%Y%m%d')}.txt",
                         mime="text/plain",
                         use_container_width=True,
                     )
