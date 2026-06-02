@@ -8726,6 +8726,7 @@ def _build_short_goal_rule_summary(view_df: pd.DataFrame) -> dict:
         return {
             "理由要約": "対象期間の記録がないため、未実施・一部実施の理由は確認できません。",
             "職員メモ要約": "対象期間の職員メモはありません。",
+            "総括コメント": "対象期間の記録がないため、総括コメントは作成できません。",
         }
 
     reasons = []
@@ -8733,7 +8734,8 @@ def _build_short_goal_rule_summary(view_df: pd.DataFrame) -> dict:
         status = clean_text(row.get("実施状況"))
         reason = clean_text(row.get("未実施理由"))
         if status in ["未実施", "一部実施"] and reason:
-            reasons.append(f"{status}：{reason}")
+            day = clean_text(row.get("日付"))
+            reasons.append(f"{day}（{status}）：{reason}")
 
     memos = []
     for _, row in view_df.iterrows():
@@ -8743,9 +8745,25 @@ def _build_short_goal_rule_summary(view_df: pd.DataFrame) -> dict:
             status = clean_text(row.get("実施状況"))
             memos.append(f"{day}（{status}）：{memo}")
 
+    total = len(view_df)
+    done = int((view_df.get("実施状況", pd.Series(dtype=str)).astype(str) == "実施").sum()) if "実施状況" in view_df.columns else 0
+    partial = int((view_df.get("実施状況", pd.Series(dtype=str)).astype(str) == "一部実施").sum()) if "実施状況" in view_df.columns else 0
+    not_done = int((view_df.get("実施状況", pd.Series(dtype=str)).astype(str) == "未実施").sum()) if "実施状況" in view_df.columns else 0
+    rate = round(((done + partial * 0.5) / total) * 100, 1) if total else 0
+
+    if total:
+        general = f"対象期間は{total}件の記録があり、実施{done}件、一部実施{partial}件、未実施{not_done}件、実施状況率は{rate}%です。"
+        if not_done or partial:
+            general += " 未実施・一部実施の理由と職員メモを確認し、次回の声かけや支援方法の調整に活用してください。"
+        else:
+            general += " 大きな未実施理由は目立たず、現在の支援の流れを継続しながら観察できます。"
+    else:
+        general = "対象期間の記録がないため、総括コメントは作成できません。"
+
     return {
         "理由要約": _short_goal_text_join(reasons, limit=8) if reasons else "未実施・一部実施の理由は記録されていません。",
         "職員メモ要約": _short_goal_text_join(memos, limit=8) if memos else "職員メモは記録されていません。",
+        "総括コメント": general,
     }
 
 
@@ -8785,7 +8803,8 @@ def generate_ai_short_goal_summary(user_name, goal_text, start_date, end_date, v
 JSON形式：
 {{
   "理由要約": "未実施・一部実施の理由を2〜4文で整理。理由がなければ、記録なしと書く。",
-  "職員メモ要約": "職員メモから本人の様子や支援上の注意点を2〜4文で整理。記録がなければ、記録なしと書く。"
+  "職員メモ要約": "職員メモから本人の様子や支援上の注意点を2〜4文で整理。記録がなければ、記録なしと書く。",
+  "総括コメント": "実施状況率と記録の傾向を踏まえ、次の確認につながる総括を2〜4文で整理。断定や診断はしない。"
 }}
 """
         client = OpenAI(api_key=api_key)
@@ -8802,15 +8821,101 @@ JSON形式：
         return {
             "理由要約": clean_text(data.get("理由要約"), fallback["理由要約"]),
             "職員メモ要約": clean_text(data.get("職員メモ要約"), fallback["職員メモ要約"]),
+            "総括コメント": clean_text(data.get("総括コメント"), fallback.get("総括コメント", "")),
         }, "AI要約を表示しています。"
     except Exception as e:
         return fallback, f"AI要約中にエラーが出たため、通常要約を表示しています：{e}"
 
 
+def make_short_goal_summary_excel_bytes(
+    selected_user,
+    selected_goal_text,
+    selected_support_text,
+    start_date,
+    end_date,
+    total,
+    done,
+    partial,
+    not_done,
+    rate,
+    done_only_rate,
+    summary: dict,
+    work: pd.DataFrame,
+):
+    """選択した利用者・短期目標の実施状況とAI要約をExcel化する。"""
+    output = BytesIO()
+    reason_summary = clean_text(summary.get("理由要約"), "記録なし") if isinstance(summary, dict) else "記録なし"
+    memo_summary = clean_text(summary.get("職員メモ要約"), "記録なし") if isinstance(summary, dict) else "記録なし"
+    general_summary = clean_text(summary.get("総括コメント"), "記録なし") if isinstance(summary, dict) else "記録なし"
+
+    summary_rows = [
+        {"項目": "利用者名", "内容": selected_user},
+        {"項目": "短期目標", "内容": selected_goal_text},
+        {"項目": "支援内容", "内容": selected_support_text},
+        {"項目": "集計期間", "内容": f"{start_date}〜{end_date}"},
+        {"項目": "記録件数", "内容": total},
+        {"項目": "実施状況率", "内容": f"{rate}%"},
+        {"項目": "実施のみ率", "内容": f"{done_only_rate}%"},
+        {"項目": "実施回数", "内容": done},
+        {"項目": "一部実施回数", "内容": partial},
+        {"項目": "未実施回数", "内容": not_done},
+        {"項目": "未実施理由・一部実施の理由（AI要約）", "内容": reason_summary},
+        {"項目": "職員メモ（AI要約）", "内容": memo_summary},
+        {"項目": "総括コメント", "内容": general_summary},
+        {"項目": "出力日時", "内容": format_now_jst("%Y-%m-%d %H:%M:%S") if "format_now_jst" in globals() else datetime.now().strftime("%Y-%m-%d %H:%M:%S")},
+    ]
+    summary_df = pd.DataFrame(summary_rows)
+
+    detail = work.copy() if work is not None else pd.DataFrame()
+    detail_cols = ["日付", "利用者名", "短期目標", "実施状況", "本人の様子", "未実施理由", "職員メモ", "入力職員", "登録日時"]
+    for col in detail_cols:
+        if col not in detail.columns:
+            detail[col] = ""
+    if "日付_dt" in detail.columns:
+        detail = detail.sort_values("日付_dt", ascending=True)
+    detail_df = detail[detail_cols].fillna("")
+
+    status_df = pd.DataFrame([
+        {"実施状況": "実施", "件数": done},
+        {"実施状況": "一部実施", "件数": partial},
+        {"実施状況": "未実施", "件数": not_done},
+    ])
+
+    with pd.ExcelWriter(output, engine="openpyxl") as writer:
+        summary_df.to_excel(writer, sheet_name="要約", index=False)
+        status_df.to_excel(writer, sheet_name="実施状況", index=False)
+        detail_df.to_excel(writer, sheet_name="詳細記録", index=False)
+
+        try:
+            from openpyxl.styles import Alignment, Font, PatternFill
+            wb = writer.book
+            for ws in wb.worksheets:
+                for row in ws.iter_rows():
+                    for cell in row:
+                        cell.alignment = Alignment(wrap_text=True, vertical="top")
+                for cell in ws[1]:
+                    cell.font = Font(bold=True)
+                    cell.fill = PatternFill("solid", fgColor="EAF4EF")
+                for col in ws.columns:
+                    max_len = 8
+                    col_letter = col[0].column_letter
+                    for cell in col:
+                        value = str(cell.value or "")
+                        max_len = max(max_len, min(len(value) + 2, 60))
+                    ws.column_dimensions[col_letter].width = max_len
+            wb["要約"].column_dimensions["A"].width = 32
+            wb["要約"].column_dimensions["B"].width = 80
+        except Exception:
+            pass
+
+    output.seek(0)
+    return output.getvalue()
+
+
 def show_short_goal_selected_summary(goals: pd.DataFrame, checks: pd.DataFrame):
-    """利用者・短期目標を選択して、実施状況率と理由・職員メモ要約を表示する。"""
+    """利用者・短期目標を選択して、実施状況率と理由・職員メモ要約を表示し、Excel出力する。"""
     st.markdown("### 利用者・短期目標別の実施状況")
-    st.caption("利用者と短期目標を選択し、期間内の実施率、未実施理由・一部実施理由、職員メモ要約を確認できます。")
+    st.caption("利用者と短期目標を選択し、期間内の実施率、未実施理由・一部実施理由、職員メモ要約を確認し、Excel形式で出力できます。")
 
     if goals is None or goals.empty:
         st.info("短期目標がまだ登録されていません。")
@@ -8855,9 +8960,10 @@ def show_short_goal_selected_summary(goals: pd.DataFrame, checks: pd.DataFrame):
     selected_goal_id = goal_label_map.get(selected_goal_label, "")
     selected_goal_row = user_goals[user_goals["目標ID"].astype(str) == str(selected_goal_id)].iloc[0]
     selected_goal_text = clean_text(selected_goal_row.get("短期目標"))
+    selected_support_text = clean_text(selected_goal_row.get("支援内容"), "支援内容の記載はありません。")
 
     st.markdown("#### 支援内容")
-    st.info(clean_text(selected_goal_row.get("支援内容"), "支援内容の記載はありません。"))
+    st.info(selected_support_text)
 
     if checks.empty:
         st.info("実施チェック記録がまだありません。")
@@ -8891,12 +8997,15 @@ def show_short_goal_selected_summary(goals: pd.DataFrame, checks: pd.DataFrame):
     m5.metric("未実施", not_done)
     st.caption("※ 実施状況率は、実施=1点・一部実施=0.5点・未実施=0点として計算しています。")
 
-    if st.button("AI要約を更新", use_container_width=True, key="short_goal_summary_ai_button"):
+    signature = f"{selected_user}|{selected_goal_id}|{start_date}|{end_date}|{len(work)}"
+    if st.session_state.get("short_goal_summary_signature") != signature:
         summary, note = generate_ai_short_goal_summary(selected_user, selected_goal_text, start_date, end_date, work)
+        st.session_state["short_goal_summary_signature"] = signature
         st.session_state["short_goal_summary_result"] = summary
         st.session_state["short_goal_summary_note"] = note
-    elif "short_goal_summary_result" not in st.session_state:
+    elif st.button("AI要約を更新", use_container_width=True, key="short_goal_summary_ai_button"):
         summary, note = generate_ai_short_goal_summary(selected_user, selected_goal_text, start_date, end_date, work)
+        st.session_state["short_goal_summary_signature"] = signature
         st.session_state["short_goal_summary_result"] = summary
         st.session_state["short_goal_summary_note"] = note
     else:
@@ -8913,6 +9022,35 @@ def show_short_goal_selected_summary(goals: pd.DataFrame, checks: pd.DataFrame):
     with c_memo:
         st.markdown("#### 職員メモ要約")
         st.info(summary.get("職員メモ要約", "記録なし"))
+
+    st.markdown("#### 総括コメント")
+    st.info(summary.get("総括コメント", "記録なし"))
+
+    excel_bytes = make_short_goal_summary_excel_bytes(
+        selected_user=selected_user,
+        selected_goal_text=selected_goal_text,
+        selected_support_text=selected_support_text,
+        start_date=start_date,
+        end_date=end_date,
+        total=total,
+        done=done,
+        partial=partial,
+        not_done=not_done,
+        rate=rate,
+        done_only_rate=done_only_rate,
+        summary=summary,
+        work=work,
+    )
+    safe_user = re.sub(r"[\\/:*?\"<>|\s]+", "_", str(selected_user)).strip("_") or "利用者"
+    safe_goal = re.sub(r"[\\/:*?\"<>|\s]+", "_", str(selected_goal_text[:24])).strip("_") or "短期目標"
+    st.download_button(
+        "📥 実施状況・AI要約をExcelでダウンロード",
+        data=excel_bytes,
+        file_name=f"{safe_user}_{safe_goal}_短期目標モニタリング_{start_date}_{end_date}.xlsx",
+        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        use_container_width=True,
+        key="short_goal_summary_excel_download",
+    )
 
     with st.expander("対象期間の実施チェック記録を確認", expanded=False):
         show_cols = ["日付", "利用者名", "短期目標", "実施状況", "本人の様子", "未実施理由", "職員メモ", "入力職員", "登録日時"]
