@@ -8885,6 +8885,10 @@ def show_short_goal_master():
                 if goal_id:
                     label_map[label] = goal_id
 
+            if not label_map:
+                st.warning("更新対象の短期目標IDが見つかりません。登録データを確認してください。")
+                return
+
             selected_label = st.selectbox("更新する短期目標を選択", list(label_map.keys()), key="goal_edit_select")
             selected_id = label_map.get(selected_label, "")
             hit = df[df["目標ID"].astype(str) == str(selected_id)]
@@ -8892,30 +8896,34 @@ def show_short_goal_master():
             if hit.empty:
                 st.warning("選択した短期目標が見つかりません。")
             else:
+                # 重要：Streamlitは同じkeyのウィジェット値を保持するため、
+                # 更新対象を切り替えても text_area / date_input の中身が前回選択のまま残ることがある。
+                # 目標IDごとにフォーム・各入力欄のkeyを分け、選択した短期目標・支援内容を正しく表示する。
                 row = hit.iloc[-1]
+                edit_key = clean_text(selected_id)[:12] or str(abs(hash(selected_label)))
                 current_user = clean_text(row.get("利用者名"))
                 user_index = users.index(current_user) if current_user in users else 0
                 status_options = ["有効", "終了", "一時停止"]
                 current_status = clean_text(row.get("状態"), "有効")
                 status_index = status_options.index(current_status) if current_status in status_options else 0
 
-                with st.form("goal_master_update_form"):
+                with st.form(f"goal_master_update_form_{edit_key}"):
                     col1, col2, col3 = st.columns(3)
                     with col1:
-                        edit_user = st.selectbox("利用者名", users, index=user_index, key="goal_edit_user")
+                        edit_user = st.selectbox("利用者名", users, index=user_index, key=f"goal_edit_user_{edit_key}")
                     with col2:
-                        edit_start = st.date_input("開始日", value=_safe_date_value(row.get("開始日")), key="goal_edit_start")
+                        edit_start = st.date_input("開始日", value=_safe_date_value(row.get("開始日")), key=f"goal_edit_start_{edit_key}")
                     with col3:
-                        edit_end = st.date_input("終了予定日", value=_safe_date_value(row.get("終了予定日")), key="goal_edit_end")
+                        edit_end = st.date_input("終了予定日", value=_safe_date_value(row.get("終了予定日")), key=f"goal_edit_end_{edit_key}")
 
-                    edit_goal = st.text_area("短期目標", value=clean_text(row.get("短期目標")), key="goal_edit_goal")
-                    edit_support = st.text_area("支援内容", value=clean_text(row.get("支援内容")), key="goal_edit_support")
+                    edit_goal = st.text_area("短期目標", value=clean_text(row.get("短期目標")), key=f"goal_edit_goal_{edit_key}")
+                    edit_support = st.text_area("支援内容", value=clean_text(row.get("支援内容")), key=f"goal_edit_support_{edit_key}")
 
                     col4, col5 = st.columns(2)
                     with col4:
-                        edit_status = st.selectbox("状態", status_options, index=status_index, key="goal_edit_status")
+                        edit_status = st.selectbox("状態", status_options, index=status_index, key=f"goal_edit_status_{edit_key}")
                     with col5:
-                        edit_memo = st.text_input("備考", value=clean_text(row.get("備考")), key="goal_edit_memo")
+                        edit_memo = st.text_input("備考", value=clean_text(row.get("備考")), key=f"goal_edit_memo_{edit_key}")
 
                     update_submitted = st.form_submit_button("この内容で更新", use_container_width=True)
 
