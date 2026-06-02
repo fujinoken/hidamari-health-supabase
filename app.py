@@ -9497,7 +9497,7 @@ def show_short_goal_master():
 
 def show_daily_goal_check():
     st.header("日々の短期目標 実施チェック")
-    st.caption("日々の実施チェックを登録するだけでなく、登録済み記録の検索・更新もできます。")
+    st.caption("日々の実施チェックを登録するだけでなく、登録済み記録の検索・更新・削除もできます。")
 
     users = get_active_user_names()
     goal_df = load_short_goal_master()
@@ -9551,10 +9551,11 @@ def show_daily_goal_check():
             f"入力:{clean_text(row.get('入力職員'))}｜ID:{record_id[:8]}"
         )
 
-    tab_add, tab_search, tab_edit = st.tabs([
+    tab_add, tab_search, tab_edit, tab_delete = st.tabs([
         "新規登録",
         "検索・一覧",
         "更新",
+        "削除",
     ])
 
     # -------------------------
@@ -9840,6 +9841,84 @@ def show_daily_goal_check():
                                     pass
                                 st.success("実施チェックを更新しました。")
                                 st.rerun()
+
+    # -------------------------
+    # 削除
+    # -------------------------
+    with tab_delete:
+        st.subheader("登録済み実施チェックを削除")
+        st.caption("誤登録した実施チェックを選択して削除できます。削除はSQLiteとSupabaseの両方に反映します。")
+
+        if check_df.empty:
+            st.info("削除できる実施チェック記録がありません。")
+        else:
+            c1, c2, c3 = st.columns(3)
+            with c1:
+                delete_filter_user = st.selectbox("利用者で絞り込み", ["全員"] + users, key="daily_check_delete_filter_user")
+            with c2:
+                delete_start = st.date_input("開始日", value=date(today_jst().year, today_jst().month, 1), key="daily_check_delete_start")
+            with c3:
+                delete_end = st.date_input("終了日", value=today_jst(), key="daily_check_delete_end")
+
+            delete_candidates = check_df.copy()
+            delete_candidates["記録ID"] = delete_candidates["記録ID"].fillna("").astype(str)
+            delete_candidates = delete_candidates[delete_candidates["記録ID"] != ""].copy()
+            delete_candidates["日付_dt"] = pd.to_datetime(delete_candidates["日付"], errors="coerce")
+            delete_candidates = delete_candidates[
+                (delete_candidates["日付_dt"] >= pd.to_datetime(delete_start))
+                & (delete_candidates["日付_dt"] <= pd.to_datetime(delete_end))
+            ].copy()
+            if delete_filter_user != "全員":
+                delete_candidates = delete_candidates[delete_candidates["利用者名"].astype(str) == str(delete_filter_user)].copy()
+
+            if delete_candidates.empty:
+                st.info("条件に該当する削除対象がありません。")
+            else:
+                delete_label_to_id = {}
+                for _, row in delete_candidates.sort_values("日付_dt", ascending=False).iterrows():
+                    label = _build_check_label(row)
+                    record_id = clean_text(row.get("記録ID"))
+                    if record_id:
+                        delete_label_to_id[label] = record_id
+
+                selected_delete_label = st.selectbox(
+                    "削除する実施チェックを選択",
+                    list(delete_label_to_id.keys()),
+                    key="daily_check_delete_select",
+                )
+                selected_delete_id = delete_label_to_id.get(selected_delete_label, "")
+                delete_hit = check_df[check_df["記録ID"].astype(str) == str(selected_delete_id)].copy()
+
+                if delete_hit.empty:
+                    st.warning("選択した実施チェック記録が見つかりません。")
+                else:
+                    preview_cols = ["日付", "利用者名", "短期目標", "実施状況", "本人の様子", "未実施理由", "職員メモ", "入力職員", "モニタリング反映", "登録日時"]
+                    for col in preview_cols:
+                        if col not in delete_hit.columns:
+                            delete_hit[col] = ""
+                    st.markdown("#### 削除対象の確認")
+                    st.dataframe(delete_hit[preview_cols], use_container_width=True, hide_index=True)
+                    st.warning("この操作は元に戻せません。必要な場合は、削除前にバックアップを作成してください。")
+
+                    confirm_delete = st.checkbox(
+                        "この実施チェックを削除することを確認しました",
+                        key=f"daily_check_delete_confirm_{clean_text(selected_delete_id)[:12]}",
+                    )
+                    if st.button(
+                        "選択した実施チェックを削除",
+                        type="primary",
+                        use_container_width=True,
+                        disabled=not confirm_delete,
+                        key=f"daily_check_delete_button_{clean_text(selected_delete_id)[:12]}",
+                    ):
+                        result = delete_short_goal_check_records([selected_delete_id], source="日々の実施チェック画面から削除")
+                        if result.get("error"):
+                            st.error(f"削除時に一部エラーがありました：{result.get('error')}")
+                        if result.get("ok"):
+                            st.success(f"削除しました。SQLite:{result.get('sqlite_deleted', 0)}件 / Supabase:{result.get('supabase_deleted', 0)}件")
+                            st.rerun()
+                        else:
+                            st.error("削除対象が見つかりませんでした。")
 
 def show_goal_history():
     st.header("実施履歴一覧")
