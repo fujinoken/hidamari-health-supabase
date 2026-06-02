@@ -12342,6 +12342,7 @@ DASHBOARD_SETTINGS_FILE = DATA_DIR / "dashboard_settings.json"
 
 DASHBOARD_ITEMS = {
     "前日の申し送り": "前日の業務全体申し送りを表示",
+    "前日の気になる変化（全員）": "前日の健康チェックに入力された『気になる変化』を全利用者分表示",
     "未対応・至急申し送り": "未対応・至急の申し送りを表示",
     "排便3日なし": "確認日までに排便が3日間ない利用者を表示",
     "注意利用者": "発熱・SpO2低下・食事低下・気になる変化などを表示",
@@ -12492,6 +12493,91 @@ def show_my_dashboard_blocks(target_date=None):
                     render_business_handover_card(row)
         except Exception as e:
             st.warning(f"前日の申し送りを表示できませんでした: {e}")
+
+    if "前日の気になる変化（全員）" in enabled:
+        st.subheader("前日の気になる変化（全員）")
+        st.caption("確認日の前日に、健康チェックへ入力された『気になる変化』を全利用者分まとめて表示します。")
+        try:
+            prev_day = target_date - timedelta(days=1)
+            change_df = health_df.copy()
+
+            if change_df.empty:
+                st.info("健康チェックデータがありません。")
+            elif "記録日" not in change_df.columns:
+                st.warning("健康チェックデータに『記録日』列がありません。")
+            elif "気になる変化" not in change_df.columns:
+                st.warning("健康チェックデータに『気になる変化』列がありません。")
+            else:
+                change_df["記録日_dt"] = pd.to_datetime(change_df["記録日"], errors="coerce")
+                change_df["気になる変化"] = change_df["気になる変化"].fillna("").astype(str).str.strip()
+                prev_changes = change_df[
+                    (change_df["記録日_dt"].dt.date == prev_day)
+                    & (change_df["気になる変化"] != "")
+                ].copy()
+
+                if prev_changes.empty:
+                    st.success(f"{prev_day.strftime('%Y/%m/%d')} の気になる変化はありません。")
+                else:
+                    prev_changes = prev_changes.sort_values(
+                        ["利用者名", "登録日時"] if "登録日時" in prev_changes.columns else ["利用者名", "記録日_dt"]
+                    )
+
+                    for col in ["記録日", "利用者名", "気になる変化", "家族共有メモ", "入力者", "登録日時"]:
+                        if col not in prev_changes.columns:
+                            prev_changes[col] = ""
+
+                    display_df = prev_changes[["記録日", "利用者名", "気になる変化", "家族共有メモ", "入力者", "登録日時"]].copy()
+                    display_df["日付"] = pd.to_datetime(display_df["記録日"], errors="coerce").dt.strftime("%Y/%m/%d")
+                    display_df = display_df[["日付", "利用者名", "気になる変化", "家族共有メモ", "入力者", "登録日時"]]
+
+                    st.warning(f"{prev_day.strftime('%Y/%m/%d')} に、気になる変化が {len(display_df)} 件あります。")
+                    st.dataframe(display_df, use_container_width=True, hide_index=True)
+
+                    memo_lines = []
+                    st.markdown("#### 確認メモ")
+                    for _, row in display_df.iterrows():
+                        date_label = clean_text(row.get("日付", ""))
+                        row_user = clean_text(row.get("利用者名", ""))
+                        change_text = clean_text(row.get("気になる変化", ""))
+                        family_text = clean_text(row.get("家族共有メモ", ""))
+                        staff_text = clean_text(row.get("入力者", ""))
+
+                        st.markdown(
+                            f"""
+                            <div style='background:#FFF8E8; border:1px solid #E5C782; border-radius:14px; padding:12px 14px; margin:8px 0;'>
+                                <b>{date_label}　{row_user}</b><br>
+                                <span style='color:#7A4A00;'>気になる変化：</span>{change_text}<br>
+                                <span style='color:#666;'>家族共有メモ：</span>{family_text if family_text else '記録なし'}<br>
+                                <span style='color:#888; font-size:0.9rem;'>入力者：{staff_text if staff_text else '未入力'}</span>
+                            </div>
+                            """,
+                            unsafe_allow_html=True,
+                        )
+
+                        memo_lines.append(
+                            f"{date_label}　{row_user}\n"
+                            f"気になる変化：{change_text}\n"
+                            f"家族共有メモ：{family_text if family_text else '記録なし'}\n"
+                            f"入力者：{staff_text if staff_text else '未入力'}"
+                        )
+
+                    export_text = f"前日の気になる変化（全員）　{prev_day.strftime('%Y/%m/%d')}\n\n" + "\n\n".join(memo_lines)
+                    st.text_area(
+                        "コピー用テキスト",
+                        value=export_text,
+                        height=220,
+                        key=f"prev_day_changes_all_text_{prev_day.strftime('%Y%m%d')}",
+                    )
+                    st.download_button(
+                        "前日の気になる変化（全員）をテキストでダウンロード",
+                        data=export_text.encode("utf-8-sig"),
+                        file_name=f"前日の気になる変化_全員_{prev_day.strftime('%Y%m%d')}.txt",
+                        mime="text/plain",
+                        use_container_width=True,
+                        key=f"prev_day_changes_all_download_{prev_day.strftime('%Y%m%d')}",
+                    )
+        except Exception as e:
+            st.warning(f"前日の気になる変化（全員）を表示できませんでした: {e}")
 
     if "未対応・至急申し送り" in enabled:
         st.subheader("未対応・至急申し送り")
