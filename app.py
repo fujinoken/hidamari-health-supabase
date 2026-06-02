@@ -8972,6 +8972,214 @@ def make_short_goal_summary_excel_bytes(
     return output.getvalue()
 
 
+
+def _short_goal_pdf_text(value, default="記録なし"):
+    """PDF出力用に空欄・NaNを安全な文字列へ整える。"""
+    try:
+        text = clean_text(value, default) if "clean_text" in globals() else str(value or "").strip()
+    except Exception:
+        text = str(value or "").strip()
+    if not text or text.lower() in ["nan", "none", "nat"]:
+        return default
+    return text
+
+
+def _short_goal_join_for_pdf(values, limit=5):
+    """PDFの1ページに収めるため、本人の様子などを短く整理する。"""
+    items = []
+    try:
+        iterable = list(values)
+    except Exception:
+        iterable = []
+    for value in iterable:
+        text = _short_goal_pdf_text(value, "")
+        if not text:
+            continue
+        if text not in items:
+            items.append(text)
+    if not items:
+        return "記録なし"
+    return "\n".join([f"・{x}" for x in items[:limit]])
+
+
+def make_short_goal_monitoring_pdf_bytes(
+    selected_user,
+    selected_goal_text,
+    selected_support_text,
+    start_date,
+    end_date,
+    total,
+    done,
+    partial,
+    not_done,
+    rate,
+    done_only_rate,
+    summary: dict,
+    work: pd.DataFrame,
+    staff_name="",
+):
+    """介護計画モニタリング票風の1ページPDFを作成する。"""
+    if colors is None:
+        raise RuntimeError("reportlab が利用できないためPDFを作成できません。")
+
+    output = BytesIO()
+
+    # 日本語フォント。ReportLab標準CIDフォントなので追加フォントファイル不要。
+    try:
+        pdfmetrics.registerFont(UnicodeCIDFont("HeiseiKakuGo-W5"))
+        base_font = "HeiseiKakuGo-W5"
+    except Exception:
+        try:
+            pdfmetrics.registerFont(UnicodeCIDFont("HeiseiMin-W3"))
+            base_font = "HeiseiMin-W3"
+        except Exception:
+            base_font = "Helvetica"
+
+    doc = SimpleDocTemplate(
+        output,
+        pagesize=A4,
+        rightMargin=14 * mm,
+        leftMargin=14 * mm,
+        topMargin=12 * mm,
+        bottomMargin=12 * mm,
+    )
+
+    styles = getSampleStyleSheet()
+    title_style = ParagraphStyle(
+        "MonitoringTitle",
+        parent=styles["Title"],
+        fontName=base_font,
+        fontSize=15,
+        leading=18,
+        alignment=1,
+        spaceAfter=7,
+    )
+    normal_style = ParagraphStyle(
+        "MonitoringNormal",
+        parent=styles["Normal"],
+        fontName=base_font,
+        fontSize=8.5,
+        leading=11,
+        wordWrap="CJK",
+    )
+    small_style = ParagraphStyle(
+        "MonitoringSmall",
+        parent=styles["Normal"],
+        fontName=base_font,
+        fontSize=7.5,
+        leading=9.5,
+        wordWrap="CJK",
+        textColor=colors.HexColor("#555555"),
+    )
+
+    def P(value, style=normal_style):
+        text = _short_goal_pdf_text(value, "")
+        text = text.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+        text = text.replace("\n", "<br/>")
+        return Paragraph(text, style)
+
+    detail = work.copy() if work is not None else pd.DataFrame()
+    for col in ["本人の様子", "未実施理由", "職員メモ", "入力職員", "実施状況"]:
+        if col not in detail.columns:
+            detail[col] = ""
+
+    person_notes = _short_goal_join_for_pdf(detail.get("本人の様子", []), limit=4)
+    reason_summary = _short_goal_pdf_text(summary.get("理由要約") if isinstance(summary, dict) else "", "記録なし")
+    memo_summary = _short_goal_pdf_text(summary.get("職員メモ要約") if isinstance(summary, dict) else "", "記録なし")
+    general_summary = _short_goal_pdf_text(summary.get("総括コメント") if isinstance(summary, dict) else "", "記録なし")
+
+    achievement = (
+        f"実施状況率：{rate}%（実施のみ率：{done_only_rate}%）\n"
+        f"対象期間：{total}日／実施：{done}件／一部実施：{partial}件／未実施：{not_done}件"
+    )
+
+    if rate >= 80:
+        eval_label = "概ね実施できている。"
+    elif rate >= 50:
+        eval_label = "一部実施があり、支援方法や声かけの継続確認が必要。"
+    else:
+        eval_label = "未実施日が多く、実施を妨げている要因の確認が必要。"
+
+    evaluation = f"{eval_label}\n{general_summary}"
+    future_policy = (
+        f"現在の支援内容：{_short_goal_pdf_text(selected_support_text, '記載なし')}\n"
+        f"今後は、本人の様子と未実施・一部実施の理由を確認しながら、無理のない範囲で支援を継続する。"
+    )
+    if reason_summary and reason_summary != "記録なし":
+        future_policy += f"\n確認事項：{reason_summary}"
+
+    staff_text = _short_goal_pdf_text(staff_name, current_login_user() if "current_login_user" in globals() else "管理者")
+    created_text = format_now_jst("%Y-%m-%d %H:%M") if "format_now_jst" in globals() else datetime.now().strftime("%Y-%m-%d %H:%M")
+
+    elements = []
+    elements.append(Paragraph("介護計画モニタリング票", title_style))
+    elements.append(Paragraph("※この帳票は、日々の短期目標実施チェック記録をもとに作成した下書きです。最終確認は管理者が行ってください。", small_style))
+    elements.append(Spacer(1, 4))
+
+    meta_data = [
+        [P("利用者名"), P(selected_user), P("担当者"), P(staff_text)],
+        [P("期間"), P(f"{start_date} 〜 {end_date}"), P("作成日時"), P(created_text)],
+    ]
+    meta_table = Table(meta_data, colWidths=[25*mm, 65*mm, 25*mm, 60*mm])
+    meta_table.setStyle(TableStyle([
+        ("FONTNAME", (0, 0), (-1, -1), base_font),
+        ("GRID", (0, 0), (-1, -1), 0.5, colors.HexColor("#B7CFC4")),
+        ("BACKGROUND", (0, 0), (0, -1), colors.HexColor("#EAF4EF")),
+        ("BACKGROUND", (2, 0), (2, -1), colors.HexColor("#EAF4EF")),
+        ("VALIGN", (0, 0), (-1, -1), "TOP"),
+        ("LEFTPADDING", (0, 0), (-1, -1), 5),
+        ("RIGHTPADDING", (0, 0), (-1, -1), 5),
+        ("TOPPADDING", (0, 0), (-1, -1), 4),
+        ("BOTTOMPADDING", (0, 0), (-1, -1), 4),
+    ]))
+    elements.append(meta_table)
+    elements.append(Spacer(1, 6))
+
+    body_rows = [
+        [P("短期目標"), P(selected_goal_text)],
+        [P("実施率"), P(achievement)],
+        [P("本人の様子"), P(person_notes)],
+        [P("達成状況"), P(achievement)],
+        [P("評価"), P(evaluation)],
+        [P("今後の支援方針"), P(future_policy)],
+        [P("職員メモ要約"), P(memo_summary)],
+    ]
+    body_table = Table(body_rows, colWidths=[34*mm, 141*mm], repeatRows=0)
+    body_table.setStyle(TableStyle([
+        ("FONTNAME", (0, 0), (-1, -1), base_font),
+        ("GRID", (0, 0), (-1, -1), 0.5, colors.HexColor("#B7CFC4")),
+        ("BACKGROUND", (0, 0), (0, -1), colors.HexColor("#EAF4EF")),
+        ("VALIGN", (0, 0), (-1, -1), "TOP"),
+        ("LEFTPADDING", (0, 0), (-1, -1), 5),
+        ("RIGHTPADDING", (0, 0), (-1, -1), 5),
+        ("TOPPADDING", (0, 0), (-1, -1), 4),
+        ("BOTTOMPADDING", (0, 0), (-1, -1), 4),
+    ]))
+    elements.append(body_table)
+    elements.append(Spacer(1, 6))
+
+    sign_rows = [
+        [P("管理者確認"), P("□ 確認済　　□ 修正あり"), P("確認日"), P("　　　年　　　月　　　日")],
+    ]
+    sign_table = Table(sign_rows, colWidths=[28*mm, 67*mm, 25*mm, 55*mm])
+    sign_table.setStyle(TableStyle([
+        ("FONTNAME", (0, 0), (-1, -1), base_font),
+        ("GRID", (0, 0), (-1, -1), 0.5, colors.HexColor("#B7CFC4")),
+        ("BACKGROUND", (0, 0), (0, -1), colors.HexColor("#EAF4EF")),
+        ("BACKGROUND", (2, 0), (2, -1), colors.HexColor("#EAF4EF")),
+        ("VALIGN", (0, 0), (-1, -1), "MIDDLE"),
+        ("LEFTPADDING", (0, 0), (-1, -1), 5),
+        ("RIGHTPADDING", (0, 0), (-1, -1), 5),
+        ("TOPPADDING", (0, 0), (-1, -1), 5),
+        ("BOTTOMPADDING", (0, 0), (-1, -1), 5),
+    ]))
+    elements.append(sign_table)
+
+    doc.build(elements)
+    output.seek(0)
+    return output.getvalue()
+
+
 def show_short_goal_selected_summary(goals: pd.DataFrame, checks: pd.DataFrame):
     """利用者・短期目標を選択して、実施状況率と理由・職員メモ要約を表示し、Excel出力する。"""
     st.markdown("### 利用者・短期目標別の実施状況")
@@ -9176,6 +9384,44 @@ def show_short_goal_selected_summary(goals: pd.DataFrame, checks: pd.DataFrame):
         use_container_width=True,
         key="short_goal_summary_excel_download",
     )
+
+    # =========================
+    # 介護計画モニタリング票 1ページPDF出力
+    # =========================
+    staff_default = current_login_user() if "current_login_user" in globals() else "管理者"
+    staff_name_for_pdf = st.text_input(
+        "PDF担当者名",
+        value=staff_default,
+        key="short_goal_monitoring_pdf_staff",
+        help="モニタリング票の担当者欄に表示します。",
+    )
+    try:
+        pdf_bytes = make_short_goal_monitoring_pdf_bytes(
+            selected_user=selected_user,
+            selected_goal_text=selected_goal_text,
+            selected_support_text=selected_support_text,
+            start_date=start_date,
+            end_date=end_date,
+            total=total,
+            done=done,
+            partial=partial,
+            not_done=not_done,
+            rate=rate,
+            done_only_rate=done_only_rate,
+            summary=summary,
+            work=work,
+            staff_name=staff_name_for_pdf,
+        )
+        st.download_button(
+            "📄 介護計画モニタリング票PDFをダウンロード",
+            data=pdf_bytes,
+            file_name=f"{safe_user}_{safe_goal}_介護計画モニタリング票_{start_date}_{end_date}.pdf",
+            mime="application/pdf",
+            use_container_width=True,
+            key="short_goal_monitoring_pdf_download",
+        )
+    except Exception as e:
+        st.warning(f"PDF出力を作成できませんでした：{e}")
 
     with st.expander("対象期間の実施チェック記録を確認", expanded=False):
         show_cols = ["日付", "利用者名", "短期目標", "実施状況", "本人の様子", "未実施理由", "職員メモ", "入力職員", "登録日時"]
