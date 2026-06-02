@@ -8839,6 +8839,54 @@ JSON形式：
         return fallback, f"AI要約中にエラーが出たため、通常要約を表示しています：{e}"
 
 
+# =========================
+# 短期目標AI要約保存（ボタン実行方式）
+# =========================
+def make_short_goal_ai_summary_setting_key(signature: str) -> str:
+    """利用者・目標・期間・件数などの条件から、保存済みAI要約のキーを作る。"""
+    raw = clean_text(signature) if "clean_text" in globals() else str(signature or "").strip()
+    digest = hashlib.sha256(raw.encode("utf-8")).hexdigest()[:24]
+    return f"short_goal_ai_summary::{digest}"
+
+
+def load_saved_short_goal_ai_summary(signature: str):
+    """保存済みの短期目標AI要約をapp_settingsから取得する。"""
+    try:
+        key = make_short_goal_ai_summary_setting_key(signature)
+        data = get_app_setting(key, None) if "get_app_setting" in globals() else None
+        if not isinstance(data, dict):
+            return None
+        summary = data.get("summary")
+        if not isinstance(summary, dict):
+            return None
+        return data
+    except Exception:
+        return None
+
+
+def save_short_goal_ai_summary(signature: str, summary: dict, note: str = ""):
+    """短期目標AI要約を保存する。次回同条件ではAIを再実行せず保存済みを表示する。"""
+    try:
+        key = make_short_goal_ai_summary_setting_key(signature)
+        data = {
+            "signature": signature,
+            "summary": summary if isinstance(summary, dict) else {},
+            "note": clean_text(note) if "clean_text" in globals() else str(note or ""),
+            "saved_at": format_now_jst("%Y-%m-%d %H:%M:%S") if "format_now_jst" in globals() else datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+            "saved_by": current_login_user() if "current_login_user" in globals() else "",
+        }
+        if "set_app_setting" in globals():
+            set_app_setting(
+                key,
+                data,
+                category="短期目標AI要約",
+                description="短期目標モニタリング画面の保存済みAI要約",
+            )
+        return data
+    except Exception:
+        return None
+
+
 def make_short_goal_summary_excel_bytes(
     selected_user,
     selected_goal_text,
@@ -9062,19 +9110,32 @@ def show_short_goal_selected_summary(goals: pd.DataFrame, checks: pd.DataFrame):
     st.caption(f"※ 分母は対象期間の全日数（{total}日）です。記録がない日は未実施として自動集計しています（未入力による未実施扱い：{auto_not_done}日）。")
 
     signature = f"{selected_user}|{selected_goal_id}|{start_date}|{end_date}|{total}|{done}|{partial}|{not_done}|{auto_not_done}"
-    if st.session_state.get("short_goal_summary_signature") != signature:
-        summary, note = generate_ai_short_goal_summary(selected_user, selected_goal_text, start_date, end_date, work)
-        st.session_state["short_goal_summary_signature"] = signature
-        st.session_state["short_goal_summary_result"] = summary
-        st.session_state["short_goal_summary_note"] = note
-    elif st.button("AI要約を更新", use_container_width=True, key="short_goal_summary_ai_button"):
-        summary, note = generate_ai_short_goal_summary(selected_user, selected_goal_text, start_date, end_date, work)
-        st.session_state["short_goal_summary_signature"] = signature
-        st.session_state["short_goal_summary_result"] = summary
-        st.session_state["short_goal_summary_note"] = note
+
+    # =========================
+    # AI要約は自動実行しない（ボタン実行＋保存方式）
+    # =========================
+    # 画面を開いたり、利用者・期間・短期目標を変更しただけではOpenAI APIを呼ばない。
+    # 同じ条件の保存済みAI要約があればそれを表示し、なければ通常要約を表示する。
+    saved_ai = load_saved_short_goal_ai_summary(signature)
+    if saved_ai:
+        summary = saved_ai.get("summary", _build_short_goal_rule_summary(work))
+        saved_at = clean_text(saved_ai.get("saved_at", "")) if "clean_text" in globals() else str(saved_ai.get("saved_at", ""))
+        saved_by = clean_text(saved_ai.get("saved_by", "")) if "clean_text" in globals() else str(saved_ai.get("saved_by", ""))
+        note = f"保存済みAI要約を表示しています。保存日時：{saved_at}" + (f"／作成者：{saved_by}" if saved_by else "")
     else:
-        summary = st.session_state.get("short_goal_summary_result", _build_short_goal_rule_summary(work))
-        note = st.session_state.get("short_goal_summary_note", "")
+        summary = _build_short_goal_rule_summary(work)
+        note = "AI要約は未作成です。必要な場合のみ下のボタンで作成・保存してください。"
+
+    if st.button("🤖 AI要約を作成・保存", use_container_width=True, key="short_goal_summary_ai_create_save_button"):
+        with st.spinner("AI要約を作成しています..."):
+            ai_summary, ai_note = generate_ai_short_goal_summary(selected_user, selected_goal_text, start_date, end_date, work)
+            saved = save_short_goal_ai_summary(signature, ai_summary, ai_note)
+        if saved:
+            st.success("AI要約を作成して保存しました。")
+            st.rerun()
+        else:
+            summary = ai_summary
+            note = "AI要約は作成しましたが、保存に失敗しました。画面上には一時表示しています。"
 
     if note:
         st.caption(note)
