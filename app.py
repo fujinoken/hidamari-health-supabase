@@ -11586,6 +11586,203 @@ def save_ai_insight_logs(df):
     df = normalize_df_columns(df, AI_INSIGHT_LOG_COLUMNS)
     save_sqlite_table(df, SQLITE_TABLE_AI_INSIGHT_LOGS, AI_INSIGHT_LOG_COLUMNS, sort_cols=["作成日時"])
 
+
+
+def _pdf_safe_text(value):
+    """ReportLab Paragraph向けに文字列を安全化する。"""
+    try:
+        if pd.isna(value):
+            return ""
+    except Exception:
+        pass
+    text = str(value)
+    text = text.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+    text = text.replace("\r\n", "\n").replace("\r", "\n")
+    return text
+
+
+def _paragraph_lines(text, style):
+    """複数行テキストをPDF用Paragraphのリストへ変換する。"""
+    safe = _pdf_safe_text(text)
+    if not safe.strip():
+        return [Paragraph("記録なし", style)]
+    parts = []
+    for line in safe.split("\n"):
+        line = line.strip()
+        if not line:
+            parts.append(Spacer(1, 2 * mm))
+        else:
+            parts.append(Paragraph(line, style))
+    return parts
+
+
+def build_ai_insight_pdf_report(row, report_title="AI管理者向け分析レポート"):
+    """
+    AI分析ログ1件を、管理者確認用PDFとして出力する。
+    診断・医療判断ではなく、記録整理と確認ポイントのレポートとして扱う。
+    """
+    if colors is None:
+        raise RuntimeError("ReportLabが利用できません。requirements.txt に reportlab を追加してください。")
+
+    try:
+        pdfmetrics.registerFont(UnicodeCIDFont("HeiseiKakuGo-W5"))
+        pdfmetrics.registerFont(UnicodeCIDFont("HeiseiMin-W3"))
+        gothic = "HeiseiKakuGo-W5"
+        mincho = "HeiseiMin-W3"
+    except Exception:
+        gothic = "Helvetica"
+        mincho = "Helvetica"
+
+    buffer = BytesIO()
+    doc = SimpleDocTemplate(
+        buffer,
+        pagesize=A4,
+        rightMargin=14 * mm,
+        leftMargin=14 * mm,
+        topMargin=14 * mm,
+        bottomMargin=14 * mm,
+    )
+
+    styles = getSampleStyleSheet()
+    title_style = ParagraphStyle(
+        "AiReportTitle",
+        parent=styles["Title"],
+        fontName=gothic,
+        fontSize=16,
+        leading=22,
+        alignment=1,
+        spaceAfter=8 * mm,
+    )
+    section_style = ParagraphStyle(
+        "AiReportSection",
+        parent=styles["Heading2"],
+        fontName=gothic,
+        fontSize=12,
+        leading=16,
+        textColor=colors.HexColor("#2F6F5E"),
+        spaceBefore=5 * mm,
+        spaceAfter=3 * mm,
+    )
+    body_style = ParagraphStyle(
+        "AiReportBody",
+        parent=styles["BodyText"],
+        fontName=mincho,
+        fontSize=9.5,
+        leading=14,
+        spaceAfter=2 * mm,
+    )
+    small_style = ParagraphStyle(
+        "AiReportSmall",
+        parent=styles["BodyText"],
+        fontName=mincho,
+        fontSize=8,
+        leading=11,
+        textColor=colors.HexColor("#555555"),
+    )
+    table_style = ParagraphStyle(
+        "AiReportTable",
+        parent=styles["BodyText"],
+        fontName=mincho,
+        fontSize=8.5,
+        leading=12,
+    )
+
+    def cell(v):
+        return Paragraph(_pdf_safe_text(v).replace("\n", "<br/>"), table_style)
+
+    created_at = row.get("作成日時", "") if isinstance(row, dict) else ""
+    base_day = row.get("分析基準日", "") if isinstance(row, dict) else ""
+    user_name = row.get("利用者名", "") if isinstance(row, dict) else ""
+    period = row.get("対象期間", "") if isinstance(row, dict) else ""
+    rule_text = row.get("ルール分析", "") if isinstance(row, dict) else ""
+    ai_text = row.get("AI分析結果", "") if isinstance(row, dict) else ""
+
+    story = []
+    story.append(Paragraph(report_title, title_style))
+    story.append(Paragraph("このPDFは、健康チェック・排泄・申し送り・短期目標の記録を管理者が確認しやすい形に整理したものです。医療判断・診断・受診判断を行うものではありません。", small_style))
+    story.append(Spacer(1, 4 * mm))
+
+    meta_data = [
+        [cell("作成日時"), cell(created_at), cell("分析基準日"), cell(base_day)],
+        [cell("利用者名"), cell(user_name), cell("対象期間"), cell(period)],
+    ]
+    meta_table = Table(meta_data, colWidths=[26 * mm, 56 * mm, 28 * mm, 62 * mm])
+    meta_table.setStyle(TableStyle([
+        ("FONTNAME", (0, 0), (-1, -1), mincho),
+        ("BACKGROUND", (0, 0), (0, -1), colors.HexColor("#F3F7F5")),
+        ("BACKGROUND", (2, 0), (2, -1), colors.HexColor("#F3F7F5")),
+        ("GRID", (0, 0), (-1, -1), 0.25, colors.HexColor("#CCCCCC")),
+        ("VALIGN", (0, 0), (-1, -1), "TOP"),
+        ("LEFTPADDING", (0, 0), (-1, -1), 6),
+        ("RIGHTPADDING", (0, 0), (-1, -1), 6),
+        ("TOPPADDING", (0, 0), (-1, -1), 5),
+        ("BOTTOMPADDING", (0, 0), (-1, -1), 5),
+    ]))
+    story.append(meta_table)
+
+    story.append(Paragraph("1. ルールベース分析", section_style))
+    story.extend(_paragraph_lines(rule_text, body_style))
+
+    story.append(Paragraph("2. AI管理者アドバイス", section_style))
+    story.extend(_paragraph_lines(ai_text, body_style))
+
+    story.append(Spacer(1, 5 * mm))
+    story.append(Paragraph("確認メモ：必要に応じて、記録原本・申し送り・職員間共有内容と照合してください。AIの文章は判断の代替ではなく、管理者確認の補助として扱ってください。", small_style))
+
+    doc.build(story)
+    buffer.seek(0)
+    return buffer.getvalue()
+
+
+def build_ai_insight_log_summary_pdf(logs_df):
+    """AI分析ログ一覧をPDFで出力する。"""
+    if colors is None:
+        raise RuntimeError("ReportLabが利用できません。requirements.txt に reportlab を追加してください。")
+    try:
+        pdfmetrics.registerFont(UnicodeCIDFont("HeiseiKakuGo-W5"))
+        pdfmetrics.registerFont(UnicodeCIDFont("HeiseiMin-W3"))
+        gothic = "HeiseiKakuGo-W5"
+        mincho = "HeiseiMin-W3"
+    except Exception:
+        gothic = "Helvetica"
+        mincho = "Helvetica"
+
+    buffer = BytesIO()
+    doc = SimpleDocTemplate(buffer, pagesize=A4, rightMargin=10 * mm, leftMargin=10 * mm, topMargin=12 * mm, bottomMargin=12 * mm)
+    styles = getSampleStyleSheet()
+    title_style = ParagraphStyle("AiLogTitle", parent=styles["Title"], fontName=gothic, fontSize=15, leading=20, alignment=1)
+    small_style = ParagraphStyle("AiLogSmall", parent=styles["BodyText"], fontName=mincho, fontSize=7.5, leading=10)
+    story = [Paragraph("AI分析ログ一覧", title_style), Spacer(1, 5 * mm)]
+
+    if logs_df is None or logs_df.empty:
+        story.append(Paragraph("AI分析ログはまだありません。", small_style))
+    else:
+        show = logs_df.tail(30).copy()
+        data = [[Paragraph("作成日時", small_style), Paragraph("利用者名", small_style), Paragraph("対象期間", small_style), Paragraph("AI分析結果（冒頭）", small_style)]]
+        for _, r in show.iterrows():
+            ai_short = _pdf_safe_text(r.get("AI分析結果", ""))[:180]
+            data.append([
+                Paragraph(_pdf_safe_text(r.get("作成日時", "")), small_style),
+                Paragraph(_pdf_safe_text(r.get("利用者名", "")), small_style),
+                Paragraph(_pdf_safe_text(r.get("対象期間", "")), small_style),
+                Paragraph(ai_short, small_style),
+            ])
+        table = Table(data, colWidths=[32 * mm, 24 * mm, 42 * mm, 90 * mm], repeatRows=1)
+        table.setStyle(TableStyle([
+            ("FONTNAME", (0, 0), (-1, -1), mincho),
+            ("BACKGROUND", (0, 0), (-1, 0), colors.HexColor("#F3F7F5")),
+            ("GRID", (0, 0), (-1, -1), 0.25, colors.HexColor("#CCCCCC")),
+            ("VALIGN", (0, 0), (-1, -1), "TOP"),
+            ("LEFTPADDING", (0, 0), (-1, -1), 4),
+            ("RIGHTPADDING", (0, 0), (-1, -1), 4),
+            ("TOPPADDING", (0, 0), (-1, -1), 4),
+            ("BOTTOMPADDING", (0, 0), (-1, -1), 4),
+        ]))
+        story.append(table)
+    doc.build(story)
+    buffer.seek(0)
+    return buffer.getvalue()
+
 def filter_records_by_period(df, date_col, start_day, end_day, user_name=None):
     if df is None or df.empty or date_col not in df.columns:
         return pd.DataFrame(columns=df.columns if df is not None else [])
@@ -11945,7 +12142,45 @@ def show_structured_insight_menu():
     if logs.empty:
         st.info("AI分析ログはまだありません。")
     else:
-        st.dataframe(logs.tail(20), use_container_width=True, hide_index=True)
+        show_logs = logs.tail(20).reset_index(drop=True)
+        st.dataframe(show_logs, use_container_width=True, hide_index=True)
+
+        st.markdown("#### 管理者向けPDFレポート")
+        st.caption("AI分析ログを、会議・確認・保管用のPDFとして出力できます。")
+        pdf_col1, pdf_col2 = st.columns([1, 1])
+        with pdf_col1:
+            selected_idx = st.selectbox(
+                "PDFにするログ",
+                list(range(len(show_logs))),
+                format_func=lambda i: f"{show_logs.iloc[i].get('作成日時', '')}／{show_logs.iloc[i].get('利用者名', '')}／{show_logs.iloc[i].get('対象期間', '')}",
+                key="ai_insight_pdf_selected_idx",
+            )
+            selected_row = show_logs.iloc[selected_idx].to_dict()
+            try:
+                pdf_bytes = build_ai_insight_pdf_report(selected_row)
+                safe_user = re.sub(r"[^0-9A-Za-z一-龥ぁ-んァ-ンー_-]", "_", str(selected_row.get("利用者名", "user")))
+                safe_dt = re.sub(r"[^0-9]", "", str(selected_row.get("作成日時", "")))[:14] or format_now_jst("%Y%m%d%H%M%S")
+                st.download_button(
+                    "選択したAI分析ログをPDFダウンロード",
+                    data=pdf_bytes,
+                    file_name=f"ai_admin_report_{safe_user}_{safe_dt}.pdf",
+                    mime="application/pdf",
+                    use_container_width=True,
+                )
+            except Exception as e:
+                st.error(f"PDF作成に失敗しました：{e}")
+        with pdf_col2:
+            try:
+                summary_pdf = build_ai_insight_log_summary_pdf(logs)
+                st.download_button(
+                    "AI分析ログ一覧PDFをダウンロード",
+                    data=summary_pdf,
+                    file_name=f"ai_insight_log_summary_{format_now_jst('%Y%m%d_%H%M%S')}.pdf",
+                    mime="application/pdf",
+                    use_container_width=True,
+                )
+            except Exception as e:
+                st.error(f"一覧PDF作成に失敗しました：{e}")
 
 
 # =========================
