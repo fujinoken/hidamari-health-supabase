@@ -620,6 +620,32 @@ def load_sqlite_table(table_name, columns, date_cols=None):
     return _original_load_sqlite_table(table_name, columns, date_cols=date_cols)
 
 
+# =========================
+# 安全キャッシュ化（速度改善より、壊さない改善）
+# =========================
+# 方針：
+# - 入力・削除・Supabase/SQLite同期・写真・AI分析には触れない
+# - 変化が少ない「読むだけのマスタ系」だけを短時間キャッシュする
+# - 保存・削除後はキャッシュを全消去して、古い表示を残しにくくする
+SAFE_READ_CACHE_TTL_SEC = 300
+
+def clear_hidamari_read_cache(reason=""):
+    """保存・削除・マスタ更新後に、表示用キャッシュを安全にクリアする。"""
+    try:
+        st.cache_data.clear()
+    except Exception:
+        pass
+
+def cache_safe_master_read(ttl=SAFE_READ_CACHE_TTL_SEC):
+    """st.cache_data が使えない環境でもアプリを止めない安全デコレータ。"""
+    def _decorator(func):
+        try:
+            return st.cache_data(ttl=ttl, show_spinner=False)(func)
+        except Exception:
+            return func
+    return _decorator
+
+
 def get_supabase_storage_status():
     cfg = _supabase_config()
     if requests is None:
@@ -1025,6 +1051,8 @@ def delete_short_goal_master_records(goal_ids, source="") -> dict:
         )
     except Exception:
         pass
+    if total_sqlite > 0 or total_supabase > 0:
+        clear_hidamari_read_cache("短期目標マスタ削除")
     return {"sqlite_deleted": total_sqlite, "supabase_deleted": total_supabase, "ok": (total_sqlite > 0 or total_supabase > 0), "error": " / ".join(errors)}
 
 
@@ -4104,6 +4132,7 @@ def ensure_user_file():
     df = pd.DataFrame(default_user_rows(), columns=USER_COLUMNS)
     save_sqlite_table(df, SQLITE_TABLE_USERS, USER_COLUMNS, unique_cols=["user_id"])
 
+@cache_safe_master_read(ttl=SAFE_READ_CACHE_TTL_SEC)
 def load_users(include_hidden=False):
     ensure_user_file()
     df = load_sqlite_table(SQLITE_TABLE_USERS, USER_COLUMNS)
@@ -4118,6 +4147,7 @@ def load_users(include_hidden=False):
 def save_users(df):
     work = normalize_users_df(df)
     save_sqlite_table(work, SQLITE_TABLE_USERS, USER_COLUMNS, unique_cols=["user_id"])
+    clear_hidamari_read_cache("利用者マスタ保存")
 
 
 def export_user_master_excel_bytes():
@@ -8632,6 +8662,7 @@ def save_excel_safe(df: pd.DataFrame, path: Path, columns: list, sheet_name: str
     """
     return normalize_df_columns(df, columns)
 
+@cache_safe_master_read(ttl=SAFE_READ_CACHE_TTL_SEC)
 def load_short_goal_master():
     ensure_short_goal_files()
     df = load_sqlite_table(
@@ -8652,6 +8683,7 @@ def save_short_goal_master(df):
         date_cols=["開始日", "終了予定日"],
         unique_cols=["目標ID"],
     )
+    clear_hidamari_read_cache("短期目標マスタ保存")
     add_audit_log("保存", SQLITE_TABLE_SHORT_GOAL_MASTER, "", "短期目標マスタを保存しました")
 
 
