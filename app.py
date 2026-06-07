@@ -4527,6 +4527,39 @@ def get_month_excretion_data(df, user_name, year, month):
     ].sort_values(["記録日", "時間帯"])
 
 
+def is_present_excretion_value(value, none_words=None):
+    """排尿・排便の有無判定を共通化する。
+
+    空欄や「なし」「無」「0」などは未実施・記録なしとして扱う。
+    これにより、便量が空欄の行を「排便あり」と誤判定しない。
+    """
+    none_words = none_words or {
+        "", "なし", "無し", "無", "ない", "ナシ", "未", "未記録", "未入力",
+        "0", "０", "nan", "none", "nat", "null", "-", "ー", "―", "－",
+    }
+    try:
+        if pd.isna(value):
+            return False
+    except Exception:
+        pass
+    text = str(value).strip()
+    return text.lower() not in {str(v).lower() for v in none_words}
+
+
+def count_stool_records(df):
+    """便量をもとに、実際に排便ありとみなせる行数を数える。"""
+    if df is None or df.empty or "便量" not in df.columns:
+        return 0
+    return int(df["便量"].apply(is_present_excretion_value).sum())
+
+
+def count_urine_records(df):
+    """尿量をもとに、実際に排尿ありとみなせる行数を数える。"""
+    if df is None or df.empty or "尿量" not in df.columns:
+        return 0
+    return int(df["尿量"].apply(is_present_excretion_value).sum())
+
+
 def summarize_excretion(df):
     if df.empty:
         return {
@@ -4538,13 +4571,16 @@ def summarize_excretion(df):
             "排便なし枠": 0,
         }
 
+    stool_count = count_stool_records(df)
+    urine_count = count_urine_records(df)
+
     return {
-        "排尿回数": int((df["尿量"].fillna("なし") != "なし").sum()),
-        "排便回数": int((df["便量"].fillna("なし") != "なし").sum()),
-        "濃縮尿": int((df["尿性状"].fillna("") == "濃縮尿").sum()),
-        "下痢便": int((df["便性状"].fillna("") == "下痢便").sum()),
-        "水様便": int((df["便性状"].fillna("") == "水様便").sum()),
-        "排便なし枠": int((df["便量"].fillna("なし") == "なし").sum()),
+        "排尿回数": urine_count,
+        "排便回数": stool_count,
+        "濃縮尿": int((df["尿性状"].fillna("") == "濃縮尿").sum()) if "尿性状" in df.columns else 0,
+        "下痢便": int((df["便性状"].fillna("") == "下痢便").sum()) if "便性状" in df.columns else 0,
+        "水様便": int((df["便性状"].fillna("") == "水様便").sum()) if "便性状" in df.columns else 0,
+        "排便なし枠": int(len(df) - stool_count),
     }
 
 
@@ -4836,7 +4872,13 @@ def build_attention_users(health_df, ex_df, target_date):
 
 
 def build_no_stool_3days_users(ex_df, target_date):
-    """確認日までの直近3日間で排便記録がない利用者を一覧化する。"""
+    """確認日までの暦日ベース直近3日間で排便記録がない利用者を一覧化する。
+
+    修正点：
+    - 「排泄記録がある日」ではなく、確認日を含む暦日3日間で判定する。
+    - 便量が空欄・なし・無・0などの場合は排便なしとして扱う。
+    - 便量が空欄の排泄行を排便ありと誤判定しない。
+    """
     rows = []
 
     target = pd.to_datetime(target_date, errors="coerce")
@@ -4845,27 +4887,32 @@ def build_no_stool_3days_users(ex_df, target_date):
 
     target_day = target.date()
     check_dates = [target_day - timedelta(days=i) for i in [2, 1, 0]]
-    period_text = f"{check_dates[0].strftime('%m/%d')}?{check_dates[-1].strftime('%m/%d')}"
+    period_text = f"{check_dates[0].strftime('%m/%d')}〜{check_dates[-1].strftime('%m/%d')}"
 
-    work = ex_df.copy()
+    work = ex_df.copy() if ex_df is not None else pd.DataFrame()
     if not work.empty:
+        if "記録日" not in work.columns:
+            return pd.DataFrame(columns=["利用者名", "対象期間", "最終排便記録", "確認メモ"])
         work["記録日"] = pd.to_datetime(work["記録日"], errors="coerce")
+        work = work[work["記録日"].notna()].copy()
 
-    for user in active_users:
+    target_users = active_users if "active_users" in globals() else []
+
+    for user in target_users:
         stool_counts = []
         for d in check_dates:
-            day_df = get_day_excretion_data(work, d, user)
-            stool_counts.append(summarize_excretion(day_df)["排便回数"])
+            day_df = get_day_excretion_data(work, d, user) if not work.empty else pd.DataFrame()
+            stool_counts.append(count_stool_records(day_df))
 
         if sum(stool_counts) == 0:
             last_stool_text = "確認できません"
-            if not work.empty:
+            if not work.empty and "便量" in work.columns:
                 user_df = work[
-                    (work["利用者名"] == user)
+                    (work["利用者名"].astype(str) == str(user))
                     & (work["記録日"].dt.date < check_dates[0])
                 ].copy()
                 if not user_df.empty:
-                    stool_df = user_df[user_df["便量"].fillna("なし") != "なし"].copy()
+                    stool_df = user_df[user_df["便量"].apply(is_present_excretion_value)].copy()
                     if not stool_df.empty:
                         last_date = stool_df["記録日"].max()
                         if pd.notna(last_date):
