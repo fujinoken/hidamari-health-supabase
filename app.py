@@ -4549,10 +4549,11 @@ def is_present_excretion_value(value, none_words=None):
 def is_stool_present_row(row):
     """1行の排泄データから、排便ありかを判定する。
 
-    Ver4.5.2修正：
-    - 便量だけでなく、便量コード・便性状・便性状コードも見る。
-    - ただし「便性状=なし」「便性状コード=0」は排便なし。
-    - 旧データで便量が空欄でも、便性状に普通便/下痢便/水様便等があれば排便あり。
+    Ver4.5.3修正：
+    - 排便3日なし抽出で誤判定しないため、原則として「便量」を主判定にする。
+    - 便性状が「普通便」の初期値だけ入っている行は、排便ありにしない。
+    - 便量コードが1以上、または便量が「少・中・大・多・普・普通・あり・有」なら排便あり。
+    - 便量が空欄の場合のみ、下痢便・水様便・硬便など明確な便性状を補助判定に使う。
     """
     if row is None:
         return False
@@ -4566,20 +4567,40 @@ def is_stool_present_row(row):
     stool_type = clean_text(getv("便性状", "")) if "clean_text" in globals() else str(getv("便性状", "") or "").strip()
     stool_type_code = clean_text(getv("便性状コード", "")) if "clean_text" in globals() else str(getv("便性状コード", "") or "").strip()
 
-    # コードが1以上なら排便あり
-    if stool_amount_code not in ["", "0", "０"]:
-        return True
-    if stool_type_code not in ["", "0", "０"]:
+    none_values = {"", "なし", "無し", "無", "ない", "ナシ", "未", "未記録", "未入力", "0", "０", "nan", "none", "nat", "null", "-", "ー", "―", "－"}
+    positive_amount_values = {"少", "中", "大", "多", "普", "普通", "あり", "有", "有り", "排便あり"}
+    abnormal_type_values = {"硬便", "下痢便", "水様便", "軟便", "泥状便"}
+
+    amount_norm = str(stool_amount).strip()
+    amount_code_norm = str(stool_amount_code).strip()
+    type_norm = str(stool_type).strip()
+    type_code_norm = str(stool_type_code).strip()
+
+    # 便量が明確に「なし」の場合は、便性状に初期値が残っていても排便なし。
+    if amount_norm.lower() in {v.lower() for v in none_values}:
+        return False
+
+    # 便量コードが1以上なら排便あり。
+    if amount_code_norm not in ["", "0", "０"]:
+        try:
+            if int(float(amount_code_norm)) > 0:
+                return True
+        except Exception:
+            return True
+
+    # 便量の日本語値で判定。
+    if amount_norm in positive_amount_values:
         return True
 
-    # 日本語入力値で判定
-    if is_present_excretion_value(stool_amount):
-        return True
-    if is_present_excretion_value(stool_type):
-        return True
+    # 便量が空欄・旧データの場合だけ、便性状を補助判定に使う。
+    # ただし「普通便」単独は、初期値の可能性が高いため排便ありにしない。
+    if amount_norm == "":
+        if type_code_norm not in ["", "0", "０", "1"]:
+            return True
+        if type_norm in abnormal_type_values:
+            return True
 
     return False
-
 
 def count_stool_records(df):
     """実際に排便ありとみなせる行数を数える。"""
