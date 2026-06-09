@@ -115,6 +115,7 @@ ADMIN_ONLY_MENUS = [
     "LIFE登録一覧",
     "加算シミュレーション",
     "現場の気づき構造化・AI管理者支援",
+    "AI管理者アシスタント",
     "セキュリティ・保守管理",
     "利用者ID移行チェック",
     "利用者名ゆれ紐づけマスタ",
@@ -12664,7 +12665,7 @@ def logout_button():
 # =========================
 # Ver3.0 UI共通設定・共通部品
 # =========================
-APP_VERSION = "Ver4.1 利用者名ゆれ紐づけマスタ版"
+APP_VERSION = "Ver4.6 AI管理者アシスタント版"
 APP_COPY = "押し間違えず、迷わず、観察して次につなぐ 現場OS"
 
 UI_COLORS = {
@@ -12678,7 +12679,7 @@ MENU_GROUPS_ADMIN = {
     "記録確認": ["過去データ管理", "排泄詳細管理", "実施履歴一覧", "短期目標データ管理"],
     "短期目標・LIFE": ["短期目標・モニタリング", "短期目標マスタ", "LIFE入力標準化", "管理者LIFE入力", "LIFE不足チェック", "LIFE CSV出力", "LIFE登録一覧", "加算シミュレーション"],
     "帳票・共有": ["家族向けレポート作成", "ひだまりレポートPDF", "データダウンロード"],
-    "設定・保守": ["利用者マスタ管理", "ログイン・職員ID管理", "セキュリティ・保守管理", "利用者ID移行チェック", "利用者名ゆれ紐づけマスタ", "自分専用ダッシュボード設定", "メニューカテゴリ設定", "システム設定", "現場の気づき構造化・AI管理者支援"],
+    "設定・保守": ["利用者マスタ管理", "ログイン・職員ID管理", "セキュリティ・保守管理", "利用者ID移行チェック", "利用者名ゆれ紐づけマスタ", "自分専用ダッシュボード設定", "メニューカテゴリ設定", "システム設定", "現場の気づき構造化・AI管理者支援", "AI管理者アシスタント"],
 }
 
 MENU_GROUPS_STAFF = {"今日の入力": ["業務全体申し送り", "健康チェック入力", "排泄チェック入力", "日々の実施チェック"]}
@@ -13431,6 +13432,463 @@ def format_handover_structured_note(fact_text, insight_text, next_text):
     if clean_text(next_text):
         parts.append("【次に見ること】\n" + clean_text(next_text))
     return "\n\n".join(parts)
+
+
+
+# ============================================================
+# Ver4.6：AI管理者アシスタント
+# ------------------------------------------------------------
+# 管理者が利用者・期間を指定し、健康記録・排泄記録・申し送り・短期目標・
+# モニタリングを横断抽出して「見落としを減らす」ための整理レポートを作成する。
+# 方針：診断しない／記録を整理する／気になる変化を拾う／最終確認は人が行う。
+# ============================================================
+
+def _hidamari_ai_to_date_series(series):
+    try:
+        return pd.to_datetime(series, errors="coerce").dt.date
+    except Exception:
+        return pd.Series([None] * len(series))
+
+
+def _hidamari_ai_filter_period(df, date_col, user_name="", start_date=None, end_date=None):
+    """利用者名と期間でDataFrameを安全に抽出する。"""
+    if df is None or df.empty:
+        return pd.DataFrame()
+    work = df.copy()
+    if date_col not in work.columns:
+        return work.iloc[0:0].copy()
+    work["_ai_date"] = _hidamari_ai_to_date_series(work[date_col])
+    if user_name and "利用者名" in work.columns:
+        work = work[work["利用者名"].astype(str).str.strip() == str(user_name).strip()].copy()
+    if start_date is not None:
+        work = work[work["_ai_date"] >= start_date].copy()
+    if end_date is not None:
+        work = work[work["_ai_date"] <= end_date].copy()
+    return work.drop(columns=["_ai_date"], errors="ignore")
+
+
+def _hidamari_ai_clean(value, default=""):
+    try:
+        if pd.isna(value):
+            return default
+    except Exception:
+        pass
+    text = str(value).strip()
+    if text.lower() in ["nan", "none", "nat"]:
+        return default
+    return text
+
+
+def _hidamari_ai_num(series):
+    try:
+        return pd.to_numeric(series, errors="coerce")
+    except Exception:
+        return pd.Series(dtype=float)
+
+
+def _hidamari_ai_mean_text(df, col, suffix=""):
+    if df is None or df.empty or col not in df.columns:
+        return "記録なし"
+    vals = _hidamari_ai_num(df[col]).dropna()
+    if vals.empty:
+        return "記録なし"
+    return f"平均 {vals.mean():.1f}{suffix}（最小 {vals.min():.1f}／最大 {vals.max():.1f}）"
+
+
+def _hidamari_ai_percent_text(df, col):
+    return _hidamari_ai_mean_text(df, col, "%")
+
+
+def _hidamari_ai_text_join(values, limit=8):
+    items = []
+    for v in values:
+        t = _hidamari_ai_clean(v)
+        if t and t not in items:
+            items.append(t)
+        if len(items) >= limit:
+            break
+    return "／".join(items) if items else "特記なし"
+
+
+def _hidamari_ai_detect_health_changes(health_df):
+    lines = []
+    if health_df is None or health_df.empty:
+        return ["健康記録は対象期間内にありません。"]
+
+    lines.append(f"健康チェック記録：{len(health_df)}件")
+    for col, suffix in [
+        ("体温", "℃"),
+        ("血圧上", ""),
+        ("血圧下", ""),
+        ("脈拍", "回/分"),
+        ("SpO2", "%"),
+        ("体重", "kg"),
+        ("水分摂取量ml", "ml"),
+    ]:
+        if col in health_df.columns:
+            lines.append(f"{col}：{_hidamari_ai_mean_text(health_df, col, suffix)}")
+
+    meal_cols = ["朝食摂取率", "昼食摂取率", "夕食摂取率"]
+    for col in meal_cols:
+        if col in health_df.columns:
+            lines.append(f"{col}：{_hidamari_ai_percent_text(health_df, col)}")
+
+    memo_cols = [c for c in ["気になる変化", "家族共有メモ", "LIFE補助メモ", "栄養リスク", "口腔状態"] if c in health_df.columns]
+    memos = []
+    for c in memo_cols:
+        memos.extend(health_df[c].dropna().astype(str).tolist())
+    if memos:
+        lines.append("記録上の気になる記述：" + _hidamari_ai_text_join(memos, limit=10))
+    return lines
+
+
+def _hidamari_ai_detect_excretion(ex_df):
+    lines = []
+    if ex_df is None or ex_df.empty:
+        return ["排泄記録は対象期間内にありません。"]
+
+    lines.append(f"排泄チェック記録：{len(ex_df)}件")
+    if "尿量" in ex_df.columns:
+        urine_counts = ex_df["尿量"].fillna("").astype(str).value_counts().to_dict()
+        lines.append("尿量内訳：" + "、".join([f"{k}:{v}件" for k, v in urine_counts.items() if k]))
+    if "尿性状" in ex_df.columns:
+        urine_type_counts = ex_df["尿性状"].fillna("").astype(str).value_counts().to_dict()
+        lines.append("尿性状内訳：" + "、".join([f"{k}:{v}件" for k, v in urine_type_counts.items() if k]))
+
+    stool_df = ex_df.copy()
+    if "便量" in stool_df.columns:
+        stool_yes = stool_df[~stool_df["便量"].fillna("").astype(str).isin(["", "なし", "0", "未記録"])]
+        lines.append(f"排便あり記録：{len(stool_yes)}件")
+        if not stool_yes.empty and "記録日" in stool_yes.columns:
+            dts = pd.to_datetime(stool_yes["記録日"], errors="coerce").dropna()
+            if not dts.empty:
+                lines.append(f"最終排便記録日：{dts.max().strftime('%Y-%m-%d')}")
+        stool_counts = stool_df["便量"].fillna("").astype(str).value_counts().to_dict()
+        lines.append("便量内訳：" + "、".join([f"{k}:{v}件" for k, v in stool_counts.items() if k]))
+    if "便性状" in ex_df.columns:
+        stool_type_counts = ex_df["便性状"].fillna("").astype(str).value_counts().to_dict()
+        lines.append("便性状内訳：" + "、".join([f"{k}:{v}件" for k, v in stool_type_counts.items() if k]))
+
+    memo_cols = [c for c in ["排泄メモ"] if c in ex_df.columns]
+    memos = []
+    for c in memo_cols:
+        memos.extend(ex_df[c].dropna().astype(str).tolist())
+    if memos:
+        lines.append("排泄メモ：" + _hidamari_ai_text_join(memos, limit=10))
+    return lines
+
+
+def _hidamari_ai_detect_handover(handover_df):
+    lines = []
+    if handover_df is None or handover_df.empty:
+        return ["申し送り記録は対象期間内にありません。"]
+
+    lines.append(f"申し送り記録：{len(handover_df)}件")
+    if "優先度" in handover_df.columns:
+        priority_counts = handover_df["優先度"].fillna("").astype(str).value_counts().to_dict()
+        lines.append("優先度内訳：" + "、".join([f"{k}:{v}件" for k, v in priority_counts.items() if k]))
+    if "対応状況" in handover_df.columns:
+        status_counts = handover_df["対応状況"].fillna("").astype(str).value_counts().to_dict()
+        lines.append("対応状況内訳：" + "、".join([f"{k}:{v}件" for k, v in status_counts.items() if k]))
+
+    text_cols = [c for c in ["全体申し送り", "要確認事項", "Excel自動抽出情報"] if c in handover_df.columns]
+    notes = []
+    for _, row in handover_df.iterrows():
+        date_text = _hidamari_ai_clean(row.get("日付", ""))
+        pri = _hidamari_ai_clean(row.get("優先度", ""))
+        status = _hidamari_ai_clean(row.get("対応状況", ""))
+        body = "／".join([_hidamari_ai_clean(row.get(c, "")) for c in text_cols if _hidamari_ai_clean(row.get(c, ""))])
+        if body:
+            notes.append(f"{date_text} {pri} {status}：{body}")
+    if notes:
+        lines.append("気になる申し送り抜粋：" + "\n- " + "\n- ".join(notes[:10]))
+    return lines
+
+
+def _hidamari_ai_detect_short_goals(goal_df, goal_check_df):
+    lines = []
+    if (goal_df is None or goal_df.empty) and (goal_check_df is None or goal_check_df.empty):
+        return ["短期目標関連記録は対象期間内にありません。"]
+
+    if goal_df is not None and not goal_df.empty:
+        lines.append(f"短期目標マスタ：{len(goal_df)}件")
+        if "短期目標" in goal_df.columns:
+            lines.append("登録中の短期目標：" + _hidamari_ai_text_join(goal_df["短期目標"].tolist(), limit=6))
+
+    if goal_check_df is not None and not goal_check_df.empty:
+        lines.append(f"短期目標実施チェック：{len(goal_check_df)}件")
+        if "実施状況" in goal_check_df.columns:
+            counts = goal_check_df["実施状況"].fillna("").astype(str).value_counts().to_dict()
+            lines.append("実施状況内訳：" + "、".join([f"{k}:{v}件" for k, v in counts.items() if k]))
+            done = sum(v for k, v in counts.items() if "実施" in str(k) and "未" not in str(k))
+            total = sum(v for k, v in counts.items() if str(k).strip())
+            if total:
+                lines.append(f"概算実施率：{done / total * 100:.1f}%")
+        memo_cols = [c for c in ["本人の様子", "未実施理由", "職員メモ"] if c in goal_check_df.columns]
+        memos = []
+        for c in memo_cols:
+            memos.extend(goal_check_df[c].dropna().astype(str).tolist())
+        if memos:
+            lines.append("実施記録メモ：" + _hidamari_ai_text_join(memos, limit=10))
+    return lines
+
+
+def _hidamari_ai_detect_monitoring(monitoring_df):
+    lines = []
+    if monitoring_df is None or monitoring_df.empty:
+        return ["モニタリング下書きは対象期間内にありません。"]
+
+    lines.append(f"モニタリング下書き：{len(monitoring_df)}件")
+    for col in ["実施率", "本人の様子まとめ", "未実施理由まとめ", "モニタリング下書き", "今後の方向性"]:
+        if col in monitoring_df.columns:
+            vals = [_hidamari_ai_clean(v) for v in monitoring_df[col].tolist()]
+            vals = [v for v in vals if v]
+            if vals:
+                lines.append(f"{col}：" + _hidamari_ai_text_join(vals, limit=5))
+    return lines
+
+
+def _hidamari_ai_collect_records(user_name, start_date, end_date):
+    health_df = _hidamari_ai_filter_period(load_health_data(), "記録日", user_name, start_date, end_date)
+    ex_df = _hidamari_ai_filter_period(load_excretion_data(), "記録日", user_name, start_date, end_date)
+    handover_df = _hidamari_ai_filter_period(load_business_handover_data(), "日付", user_name, start_date, end_date)
+    goal_check_df = _hidamari_ai_filter_period(load_sqlite_table(SQLITE_TABLE_SHORT_GOAL_CHECKS, SHORT_GOAL_CHECK_COLUMNS, date_cols=["日付"]), "日付", user_name, start_date, end_date)
+    monitoring_df = _hidamari_ai_filter_period(load_sqlite_table(SQLITE_TABLE_MONITORING_DRAFTS, MONITORING_DRAFT_COLUMNS, date_cols=["作成日"]), "作成日", user_name, start_date, end_date)
+
+    goal_df = load_sqlite_table(SQLITE_TABLE_SHORT_GOAL_MASTER, SHORT_GOAL_MASTER_COLUMNS, date_cols=["開始日", "終了予定日"])
+    if goal_df is not None and not goal_df.empty and "利用者名" in goal_df.columns:
+        goal_df = goal_df[goal_df["利用者名"].astype(str).str.strip() == str(user_name).strip()].copy()
+
+    return {
+        "health": health_df,
+        "excretion": ex_df,
+        "handover": handover_df,
+        "short_goal_master": goal_df,
+        "short_goal_checks": goal_check_df,
+        "monitoring": monitoring_df,
+    }
+
+
+def _hidamari_ai_build_admin_report(user_name, start_date, end_date, records):
+    period_text = f"{start_date}〜{end_date}"
+    health_lines = _hidamari_ai_detect_health_changes(records.get("health"))
+    ex_lines = _hidamari_ai_detect_excretion(records.get("excretion"))
+    handover_lines = _hidamari_ai_detect_handover(records.get("handover"))
+    goal_lines = _hidamari_ai_detect_short_goals(records.get("short_goal_master"), records.get("short_goal_checks"))
+    mon_lines = _hidamari_ai_detect_monitoring(records.get("monitoring"))
+
+    check_points = []
+    joined = "\n".join(health_lines + ex_lines + handover_lines + goal_lines + mon_lines)
+    if "濃縮尿" in joined or "水分" in joined:
+        check_points.append("水分摂取量・尿性状・声かけ状況を確認する。")
+    if "排便あり記録：0件" in joined or "便量内訳：なし" in joined:
+        check_points.append("排便間隔、腹部症状、食事量、下剤等の情報を確認する。")
+    if "未対応" in joined or "対応中" in joined:
+        check_points.append("申し送りの未対応・対応中項目に、次の一手と担当が残っているか確認する。")
+    if "概算実施率" in joined:
+        check_points.append("短期目標の実施率だけでなく、本人の様子と未実施理由をあわせて確認する。")
+    if not check_points:
+        check_points.append("大きな偏りは記録上目立ちません。継続して通常観察を行う。")
+
+    family_summary = [
+        "記録に基づく共有では、診断や断定を避け、事実・変化・今後の見守り方針を分けて説明する。",
+        "家族共有メモや申し送りの要確認事項がある場合は、生活上の変化としてやわらかく伝える。",
+    ]
+
+    monitoring_draft = [
+        f"{period_text}の記録を確認したところ、健康チェック・排泄チェック・申し送り・短期目標実施状況をもとに、生活状況を継続観察している。",
+        "体調・食事水分・排泄・本人の様子に関する記録をもとに、必要時は職員間で共有し、次回確認につなげる。",
+        "医療的判断は行わず、気になる変化が続く場合は管理者・看護職・主治医等へ確認する。",
+    ]
+
+    def bullet(lines):
+        return "\n".join([f"- {x}" for x in lines if _hidamari_ai_clean(x)])
+
+    report = f"""# ひだまりAI管理者レポート
+
+対象利用者：{user_name}
+対象期間：{period_text}
+作成日時：{format_now_jst("%Y-%m-%d %H:%M:%S")}
+
+※このレポートは診断ではありません。記録を整理し、管理者の見落としを減らすための確認メモです。最終判断は必ず人が行ってください。
+
+## 1. この期間の体調変化
+{bullet(health_lines)}
+
+## 2. 排泄リズムの変化
+{bullet(ex_lines)}
+
+## 3. 食事・水分・睡眠の傾向
+- 食事は健康チェックの朝食・昼食・夕食摂取率を中心に確認しています。
+- 水分は「水分摂取量ml」の記録を中心に確認しています。
+- 睡眠項目が記録欄にない場合は、申し送り・気になる変化欄の記述から補助的に確認してください。
+
+## 4. 気になる申し送り
+{bullet(handover_lines)}
+
+## 5. 短期目標の実施状況
+{bullet(goal_lines)}
+
+## 6. 家族説明用まとめ
+{bullet(family_summary)}
+
+## 7. モニタリング下書き
+{bullet(monitoring_draft)}
+{bullet(mon_lines)}
+
+## 8. 管理者確認ポイント
+{bullet(check_points)}
+"""
+    return report
+
+
+def _hidamari_ai_make_report_pdf(report_text, user_name, start_date, end_date):
+    if colors is None:
+        return None
+    ensure_dirs()
+    REPORT_DIR.mkdir(parents=True, exist_ok=True)
+    safe_user = re.sub(r"[^\w一-龥ぁ-んァ-ンー\-]", "_", str(user_name))
+    pdf_path = REPORT_DIR / f"hidamari_ai_admin_report_{safe_user}_{start_date}_{end_date}.pdf"
+    try:
+        pdfmetrics.registerFont(UnicodeCIDFont("HeiseiMin-W3"))
+    except Exception:
+        pass
+    buffer = BytesIO()
+    doc = SimpleDocTemplate(buffer, pagesize=A4, rightMargin=16*mm, leftMargin=16*mm, topMargin=14*mm, bottomMargin=14*mm)
+    styles = getSampleStyleSheet()
+    base = ParagraphStyle("hidamari_base", parent=styles["Normal"], fontName="HeiseiMin-W3", fontSize=9.5, leading=14)
+    title = ParagraphStyle("hidamari_title", parent=base, fontSize=15, leading=20, spaceAfter=8)
+    story = []
+    for line in report_text.splitlines():
+        line = line.rstrip()
+        if line.startswith("# "):
+            story.append(Paragraph(line.replace("# ", ""), title))
+            story.append(Spacer(1, 3*mm))
+        elif line.startswith("## "):
+            story.append(Spacer(1, 2*mm))
+            story.append(Paragraph(line.replace("## ", ""), ParagraphStyle("hidamari_h2", parent=base, fontSize=12, leading=16, spaceBefore=3, spaceAfter=2)))
+        elif line.startswith("- "):
+            story.append(Paragraph("・" + html.escape(line[2:]), base))
+        elif line.strip() == "":
+            story.append(Spacer(1, 1.5*mm))
+        else:
+            story.append(Paragraph(html.escape(line), base))
+    doc.build(story)
+    pdf_path.write_bytes(buffer.getvalue())
+    return pdf_path
+
+
+def _hidamari_ai_save_insight_log(user_name, start_date, end_date, report_text):
+    try:
+        ensure_ai_insight_log_file()
+        df = load_sqlite_table(SQLITE_TABLE_AI_INSIGHT_LOGS, AI_INSIGHT_LOG_COLUMNS)
+        row = {
+            "作成日時": format_now_jst("%Y-%m-%d %H:%M:%S"),
+            "分析基準日": str(end_date),
+            "利用者名": user_name,
+            "対象期間": f"{start_date}〜{end_date}",
+            "ルール分析": "健康・排泄・申し送り・短期目標・モニタリング横断抽出",
+            "AI分析結果": report_text,
+        }
+        df = pd.concat([df, pd.DataFrame([row], columns=AI_INSIGHT_LOG_COLUMNS)], ignore_index=True)
+        save_sqlite_table(df, SQLITE_TABLE_AI_INSIGHT_LOGS, AI_INSIGHT_LOG_COLUMNS, unique_cols=["作成日時", "利用者名", "対象期間"], sort_cols=["作成日時"])
+        add_audit_log("AI管理者レポート作成", SQLITE_TABLE_AI_INSIGHT_LOGS, user_name, f"{start_date}〜{end_date}")
+        clear_hidamari_read_cache("AI管理者レポート作成")
+        return True
+    except Exception as e:
+        try:
+            st.warning(f"AI分析ログ保存に失敗しました：{e}")
+        except Exception:
+            pass
+        return False
+
+
+def show_ai_admin_assistant_menu():
+    """管理者の見落としを減らすAI：利用者・期間指定で横断整理する。"""
+    if not is_admin_user():
+        st.warning("このメニューは管理者専用です。")
+        return
+
+    ui_section("AI管理者アシスタント", "利用者と期間を指定して、健康・排泄・申し送り・短期目標・モニタリングを横断整理します。", "🧠")
+    ui_card(
+        "基本方針",
+        "診断はしません。記録を整理し、気になる変化と管理者確認ポイントを拾うための補助機能です。",
+        "最終判断は管理者・看護職・主治医等の人が行います。",
+        soft=True,
+    )
+
+    users_df_local = load_users(include_hidden=False)
+    if users_df_local is None or users_df_local.empty or "利用者名" not in users_df_local.columns:
+        st.warning("利用者マスタに表示中の利用者がありません。")
+        return
+    user_options = users_df_local["利用者名"].dropna().astype(str).tolist()
+
+    c1, c2, c3 = st.columns([1.2, 1, 1])
+    with c1:
+        user_name = st.selectbox("利用者を選ぶ", user_options, key="ai_admin_user_name")
+    with c2:
+        start_date = st.date_input("開始日", today_jst() - timedelta(days=14), key="ai_admin_start_date")
+    with c3:
+        end_date = st.date_input("終了日", today_jst(), key="ai_admin_end_date")
+
+    if start_date > end_date:
+        st.error("開始日は終了日以前にしてください。")
+        return
+
+    run = st.button("記録を一括抽出してAI整理する", type="primary", use_container_width=True)
+    if not run and "hidamari_ai_admin_report" not in st.session_state:
+        st.info("利用者と期間を選んで、管理者向けレポートを作成してください。")
+        return
+
+    if run:
+        records = _hidamari_ai_collect_records(user_name, start_date, end_date)
+        report = _hidamari_ai_build_admin_report(user_name, start_date, end_date, records)
+        st.session_state["hidamari_ai_admin_report"] = report
+        st.session_state["hidamari_ai_admin_records"] = records
+        st.session_state["hidamari_ai_admin_meta"] = {"user_name": user_name, "start_date": start_date, "end_date": end_date}
+
+    report = st.session_state.get("hidamari_ai_admin_report", "")
+    records = st.session_state.get("hidamari_ai_admin_records", {})
+    meta = st.session_state.get("hidamari_ai_admin_meta", {"user_name": user_name, "start_date": start_date, "end_date": end_date})
+
+    st.subheader("管理者向け整理結果")
+    st.markdown(report)
+
+    st.download_button(
+        "Markdownでダウンロード",
+        data=report.encode("utf-8"),
+        file_name=f"hidamari_ai_admin_report_{meta.get('user_name')}_{meta.get('start_date')}_{meta.get('end_date')}.md",
+        mime="text/markdown",
+        use_container_width=True,
+    )
+
+    pdf_path = _hidamari_ai_make_report_pdf(report, meta.get("user_name"), meta.get("start_date"), meta.get("end_date"))
+    if pdf_path and Path(pdf_path).exists():
+        st.download_button(
+            "PDFでダウンロード",
+            data=Path(pdf_path).read_bytes(),
+            file_name=Path(pdf_path).name,
+            mime="application/pdf",
+            use_container_width=True,
+        )
+
+    if st.button("この結果をAI分析ログに保存する", use_container_width=True):
+        if _hidamari_ai_save_insight_log(meta.get("user_name"), meta.get("start_date"), meta.get("end_date"), report):
+            st.success("AI分析ログに保存しました。")
+
+    st.divider()
+    st.subheader("抽出元データ")
+    tabs = st.tabs(["健康", "排泄", "申し送り", "短期目標", "モニタリング"])
+    tab_keys = ["health", "excretion", "handover", "short_goal_checks", "monitoring"]
+    for tab, key in zip(tabs, tab_keys):
+        with tab:
+            df = records.get(key, pd.DataFrame())
+            if df is None or df.empty:
+                st.info("対象期間の記録はありません。")
+            else:
+                st.dataframe(df, use_container_width=True, hide_index=True)
+
+
 
 def flatten_menu_groups(groups):
     menus = []
@@ -14305,6 +14763,9 @@ if menu == "管理者ダッシュボード":
 
 elif menu == "現場の気づき構造化・AI管理者支援":
     show_structured_insight_menu()
+
+elif menu == "AI管理者アシスタント":
+    show_ai_admin_assistant_menu()
 
 # =========================
 # 業務全体申し送り
