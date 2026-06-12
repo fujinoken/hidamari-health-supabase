@@ -1953,11 +1953,16 @@ def _make_all_sqlite_tables_excel_bytes():
 
 
 def _read_supabase_core_tables_for_backup():
-    """Supabase主要7機能をJSON/Excel退避用に読み込む。"""
+    """
+    完全バックアップ用にSupabase主要テーブルを全件取得する。
+
+    重要：
+    - 画面表示用の supabase_read_table() はキャッシュ・期間絞り込みの影響を受ける可能性がある。
+    - バックアップではキャッシュを使わず、PostgRESTから直接ページング取得する。
+    - data(JSONB)内の本体データに加えて、確認用に __record_key / __updated_at も残す。
+    """
     result = {}
-    if not ("supabase_is_enabled" in globals() and supabase_is_enabled()):
-        return result
-    for table_name, cols in [
+    targets = [
         (SQLITE_TABLE_USERS, USER_COLUMNS if "USER_COLUMNS" in globals() else []),
         (SQLITE_TABLE_HEALTH, HEALTH_COLUMNS if "HEALTH_COLUMNS" in globals() else []),
         (SQLITE_TABLE_EXCRETION, EXCRETION_COLUMNS if "EXCRETION_COLUMNS" in globals() else []),
@@ -1965,13 +1970,55 @@ def _read_supabase_core_tables_for_backup():
         (SQLITE_TABLE_SHORT_GOAL_CHECKS, SHORT_GOAL_CHECK_COLUMNS if "SHORT_GOAL_CHECK_COLUMNS" in globals() else []),
         (SQLITE_TABLE_SHORT_GOAL_MASTER, SHORT_GOAL_MASTER_COLUMNS if "SHORT_GOAL_MASTER_COLUMNS" in globals() else []),
         (SQLITE_TABLE_MONITORING_DRAFTS, MONITORING_DRAFT_COLUMNS if "MONITORING_DRAFT_COLUMNS" in globals() else []),
-    ]:
+    ]
+
+    if not ("supabase_is_enabled" in globals() and supabase_is_enabled()):
+        for table_name, _cols in targets:
+            result[table_name] = [{"backup_error": "Supabase未設定または接続不可"}]
+        return result
+
+    for table_name, cols in targets:
         try:
-            result[table_name] = supabase_read_table(table_name, columns=cols).to_dict(orient="records")
+            all_records = []
+            page_size = 1000
+            offset = 0
+            while True:
+                headers = _supabase_headers(prefer="")
+                headers["Range-Unit"] = "items"
+                headers["Range"] = f"{offset}-{offset + page_size - 1}"
+                res = requests.get(
+                    _supabase_endpoint(table_name),
+                    headers=headers,
+                    params=[("select", "record_key,data,updated_at"), ("order", "updated_at.asc")],
+                    timeout=30,
+                )
+                if res.status_code not in [200, 206]:
+                    res.raise_for_status()
+                rows = res.json() or []
+                for item in rows:
+                    data = item.get("data") or {}
+                    if isinstance(data, dict):
+                        row = dict(data)
+                        row["__record_key"] = item.get("record_key", "")
+                        row["__updated_at"] = item.get("updated_at", "")
+                        all_records.append(row)
+                if len(rows) < page_size:
+                    break
+                offset += page_size
+
+            if cols:
+                df = pd.DataFrame(all_records)
+                for col in cols:
+                    if col not in df.columns:
+                        df[col] = ""
+                # 確認用メタ列は末尾に残す
+                meta_cols = [c for c in ["__record_key", "__updated_at"] if c in df.columns]
+                result[table_name] = df[list(cols) + meta_cols].to_dict(orient="records")
+            else:
+                result[table_name] = all_records
         except Exception as e:
             result[table_name] = [{"backup_error": str(e)}]
     return result
-
 
 def _make_supabase_core_excel_bytes(supabase_data: dict):
     output = BytesIO()
@@ -2000,11 +2047,11 @@ def get_backup_target_status_df():
         "詳細": f"{len(_list_sqlite_tables_for_backup())} テーブル",
     })
     rows.append({
-        "対象": "Supabase主要7機能JSON/Excel退避",
+        "対象": "Supabase本番データ全件退避",
         "状態": "OK" if ("supabase_is_enabled" in globals() and supabase_is_enabled()) else "未設定",
-        "詳細": "利用者マスタ・健康チェック・排泄チェック・申し送り・短期目標実施チェック・短期目標マスタ・モニタリング下書き",
+        "詳細": "キャッシュを使わず、利用者・健康・排泄・申し送り・短期目標・モニタリングを全件取得",
     })
-    for folder in [BUSINESS_HANDOVER_PHOTO_DIR, BUSINESS_HANDOVER_EXCEL_DIR]:
+    for folder in [BUSINESS_HANDOVER_PHOTO_DIR, BUSINESS_HANDOVER_EXCEL_DIR, REPORT_DIR]:
         count = 0
         if folder.exists():
             count = len([f for f in folder.rglob("*") if f.is_file()])
@@ -2016,23 +2063,118 @@ def get_backup_target_status_df():
     return pd.DataFrame(rows)
 
 
+def _write_dataframe_to_zip_excel(zf, arcname, df, fallback_message="データなし"):
+    """DataFrameをExcelとしてZIPへ安全に書き込む。"""
+    try:
+        output = BytesIO()
+        with pd.ExcelWriter(output, engine="openpyxl") as writer:
+            work = df if isinstance(df, pd.DataFrame) and not df.empty else pd.DataFrame([{"message": fallback_message}])
+            work.to_excel(writer, sheet_name="data", index=False)
+        output.seek(0)
+        zf.writestr(arcname, output.getvalue())
+    except Exception as e:
+        zf.writestr(str(arcname).replace(".xlsx", "_error.txt"), str(e))
+
+
+def _write_folder_to_zip(zf, folder: Path, arc_prefix: str):
+    """指定フォルダをZIPへ安全に格納する。"""
+    try:
+        folder = Path(folder)
+        if not folder.exists():
+            zf.writestr(f"{arc_prefix.rstrip('/')}/_folder_not_found.txt", str(folder))
+            return 0
+        count = 0
+        for file in folder.rglob("*"):
+            if file.is_file():
+                rel = file.relative_to(folder)
+                zf.write(file, arcname=f"{arc_prefix.rstrip('/')}/{rel.as_posix()}")
+                count += 1
+        if count == 0:
+            zf.writestr(f"{arc_prefix.rstrip('/')}/_empty.txt", "対象ファイルはありません。")
+        return count
+    except Exception as e:
+        zf.writestr(f"{arc_prefix.rstrip('/')}/_backup_error.txt", str(e))
+        return 0
+
+
+def _read_sqlite_table_for_complete_backup(table_name, columns=None):
+    """完全バックアップ用にSQLiteテーブルを安全に読む。"""
+    try:
+        if not sqlite_table_exists(table_name):
+            return pd.DataFrame(columns=list(columns or []))
+        df = _original_load_sqlite_table(table_name, columns or [])
+        if columns:
+            for col in columns:
+                if col not in df.columns:
+                    df[col] = ""
+            df = df[list(columns)]
+        return df
+    except Exception as e:
+        return pd.DataFrame([{"backup_error": str(e), "table": table_name}])
+
+
+def _write_complete_system_excels(zf):
+    """監査ログ・ログイン履歴・設定などをSystem配下へ退避する。"""
+    system_targets = [
+        ("System/audit_log.xlsx", SQLITE_TABLE_AUDIT_LOGS if "SQLITE_TABLE_AUDIT_LOGS" in globals() else "audit_logs", AUDIT_LOG_COLUMNS if "AUDIT_LOG_COLUMNS" in globals() else []),
+        ("System/login_history.xlsx", SQLITE_TABLE_LOGIN_HISTORY if "SQLITE_TABLE_LOGIN_HISTORY" in globals() else "login_history", LOGIN_HISTORY_COLUMNS if "LOGIN_HISTORY_COLUMNS" in globals() else []),
+        ("System/settings.xlsx", SQLITE_TABLE_APP_SETTINGS if "SQLITE_TABLE_APP_SETTINGS" in globals() else "app_settings", APP_SETTING_COLUMNS if "APP_SETTING_COLUMNS" in globals() else []),
+        ("System/accounts.xlsx", SQLITE_TABLE_ACCOUNTS if "SQLITE_TABLE_ACCOUNTS" in globals() else "login_accounts", ACCOUNT_COLUMNS if "ACCOUNT_COLUMNS" in globals() else []),
+        ("System/role_permissions.xlsx", SQLITE_TABLE_ROLE_PERMISSIONS if "SQLITE_TABLE_ROLE_PERMISSIONS" in globals() else "role_permissions", ROLE_PERMISSION_COLUMNS if "ROLE_PERMISSION_COLUMNS" in globals() else []),
+        ("System/backup_history.xlsx", SQLITE_TABLE_BACKUP_HISTORY if "SQLITE_TABLE_BACKUP_HISTORY" in globals() else "backup_history", BACKUP_HISTORY_COLUMNS if "BACKUP_HISTORY_COLUMNS" in globals() else []),
+        ("System/ai_insight_logs.xlsx", SQLITE_TABLE_AI_INSIGHT_LOGS if "SQLITE_TABLE_AI_INSIGHT_LOGS" in globals() else "ai_insight_logs", AI_INSIGHT_LOG_COLUMNS if "AI_INSIGHT_LOG_COLUMNS" in globals() else []),
+        ("System/user_name_aliases.xlsx", SQLITE_TABLE_USER_NAME_ALIASES if "SQLITE_TABLE_USER_NAME_ALIASES" in globals() else "user_name_aliases", USER_NAME_ALIAS_COLUMNS if "USER_NAME_ALIAS_COLUMNS" in globals() else []),
+        ("System/handover_keywords.xlsx", SQLITE_TABLE_HANDOVER_KEYWORDS if "SQLITE_TABLE_HANDOVER_KEYWORDS" in globals() else "handover_keywords", HANDOVER_KEYWORD_COLUMNS if "HANDOVER_KEYWORD_COLUMNS" in globals() else []),
+    ]
+    for arcname, table_name, cols in system_targets:
+        try:
+            _write_dataframe_to_zip_excel(zf, arcname, _read_sqlite_table_for_complete_backup(table_name, cols))
+        except Exception as e:
+            zf.writestr(arcname.replace(".xlsx", "_error.txt"), str(e))
+
+
+def _write_supabase_complete_backup_files(zf, supabase_data: dict):
+    """Supabase全件を用途別Excelと互換JSON/Excelで格納する。"""
+    label_map = {
+        SQLITE_TABLE_USERS: "users.xlsx",
+        SQLITE_TABLE_HEALTH: "health.xlsx",
+        SQLITE_TABLE_EXCRETION: "excretion.xlsx",
+        SQLITE_TABLE_HANDOVER: "handover.xlsx",
+        SQLITE_TABLE_SHORT_GOAL_CHECKS: "short_goal_checks.xlsx",
+        SQLITE_TABLE_SHORT_GOAL_MASTER: "short_goal_master.xlsx",
+        SQLITE_TABLE_MONITORING_DRAFTS: "monitoring.xlsx",
+    }
+    for table_name, file_name in label_map.items():
+        records = supabase_data.get(table_name, [])
+        df = pd.DataFrame(records if isinstance(records, list) else [])
+        _write_dataframe_to_zip_excel(zf, f"Supabase/{file_name}", df, fallback_message=f"{table_name} は空です。")
+
+    # 復元機能との互換用。既存の復元処理は exports/supabase_core_tables.json を読む。
+    zf.writestr(
+        "exports/supabase_core_tables.json",
+        json.dumps(supabase_data, ensure_ascii=False, indent=2, default=str),
+    )
+    zf.writestr("exports/supabase_core_tables.xlsx", _make_supabase_core_excel_bytes(supabase_data))
+
 def create_backup_zip(kind="手動"):
     """
-    一括バックアップを作成する。
-    - SQLite DB本体
-    - SQLite全テーブルExcel退避
-    - Supabase主要7機能 JSON/Excel退避
-    - 写真・添付ファイル
-    - バックアップ情報
+    完全バックアップZIPを作成する。
+
+    Ver4.8.5 完全バックアップ方針：
+    - Supabase本番データはキャッシュを使わず全件取得
+    - SQLite DB本体、WAL/SHM、全SQLiteテーブルExcelを同梱
+    - 写真、添付Excel、reports配下の帳票を同梱
+    - 監査ログ、ログイン履歴、設定、アカウント等をSystem配下へExcel出力
+    - 既存復元処理との互換のため exports/supabase_core_tables.json も維持
     """
     ensure_security_dirs()
     timestamp = format_now_jst("%Y%m%d_%H%M%S")
     safe_kind = re.sub(r"[^\w一-龥ぁ-んァ-ンー\-]", "_", str(kind))
-    zip_path = BACKUP_DIR / f"hidamari_backup_{safe_kind}_{timestamp}.zip"
+    zip_path = BACKUP_DIR / f"hidamari_complete_backup_{safe_kind}_{timestamp}.zip"
 
     try:
-        # SQLite補助DBが壊れていても、Supabase主要データのバックアップは継続する。
         sqlite_db_ok_for_file_backup = False
+        sqlite_check_message = ""
         if HIDAMARI_DB_FILE.exists():
             try:
                 with get_hidamari_conn() as conn:
@@ -2040,85 +2182,114 @@ def create_backup_zip(kind="手動"):
                     conn.execute("PRAGMA wal_checkpoint(FULL);")
                 sqlite_db_ok_for_file_backup = True
             except Exception as e:
-                _mark_sqlite_backup_error(e, "backup_sqlite_checkpoint")
+                sqlite_check_message = str(e)
+                _mark_sqlite_backup_error(e, "complete_backup_sqlite_checkpoint")
                 if is_sqlite_corruption_error(e):
-                    quarantine_corrupt_sqlite_db(f"backup_sqlite_checkpoint: {e}")
+                    quarantine_corrupt_sqlite_db(f"complete_backup_sqlite_checkpoint: {e}")
                 sqlite_db_ok_for_file_backup = False
 
+        # ここは画面表示用キャッシュを使わない全件取得
         supabase_data = _read_supabase_core_tables_for_backup()
+
         backup_info = {
             "app": "ひだまり 健康チェック管理システム",
+            "backup_type": "complete",
+            "version_note": "Ver4.8.5 完全バックアップZIP",
             "created_at": format_now_jst("%Y-%m-%d %H:%M:%S"),
             "kind": str(kind),
             "user": current_login_user() if "current_login_user" in globals() else "",
-            "sqlite_db": str(HIDAMARI_DB_FILE),
             "supabase_enabled": bool("supabase_is_enabled" in globals() and supabase_is_enabled()),
+            "supabase_tables": list(supabase_data.keys()) if isinstance(supabase_data, dict) else [],
+            "sqlite_db": str(HIDAMARI_DB_FILE),
+            "sqlite_db_included": bool(HIDAMARI_DB_FILE.exists() and sqlite_db_ok_for_file_backup),
+            "sqlite_check_message": sqlite_check_message,
             "sqlite_tables": _list_sqlite_tables_for_backup(),
-            "note": "SQLite本体に加えて、確認用ExcelとSupabase主要7機能の退避データを含みます。",
+            "included_folders": {
+                "Photos": str(BUSINESS_HANDOVER_PHOTO_DIR),
+                "Attachments": str(BUSINESS_HANDOVER_EXCEL_DIR),
+                "Reports": str(REPORT_DIR),
+                "SQLite": str(DATA_DIR),
+                "System": "SQLite内の監査ログ・ログイン履歴・設定等をExcel出力",
+            },
+            "note": "Supabase本番データ、SQLite、写真、帳票、設定/ログ系を含む完全バックアップです。画面表示用キャッシュや7日表示には依存しません。",
         }
 
         with zipfile.ZipFile(zip_path, "w", zipfile.ZIP_DEFLATED) as zf:
-            zf.writestr("backup_info.json", json.dumps(backup_info, ensure_ascii=False, indent=2))
+            zf.writestr("backup_info.json", json.dumps(backup_info, ensure_ascii=False, indent=2, default=str))
 
-            if HIDAMARI_DB_FILE.exists() and sqlite_db_ok_for_file_backup:
+            # Supabase本番データ全件
+            try:
+                _write_supabase_complete_backup_files(zf, supabase_data)
+            except Exception as e:
+                zf.writestr("Supabase/_backup_error.txt", str(e))
+
+            # SQLite DB本体と関連ファイル
+            sqlite_files = [
+                HIDAMARI_DB_FILE,
+                Path(str(HIDAMARI_DB_FILE) + "-wal"),
+                Path(str(HIDAMARI_DB_FILE) + "-shm"),
+                DATA_DIR / "hidamari_life.db",
+                Path("hidamari_life.db"),
+            ]
+            wrote_sqlite_file = False
+            for db_file in sqlite_files:
                 try:
-                    zf.write(HIDAMARI_DB_FILE, arcname=f"data/{HIDAMARI_DB_FILE.name}")
+                    if db_file.exists():
+                        # メインDBが壊れている場合は、本体だけスキップし、WAL/SHMや他DBは可能な範囲で残す
+                        if db_file == HIDAMARI_DB_FILE and not sqlite_db_ok_for_file_backup:
+                            zf.writestr("SQLite/hidamari_health_db_skipped.txt", f"SQLite補助DBが破損または読込不可のためDB本体同梱をスキップしました: {sqlite_check_message}")
+                            continue
+                        zf.write(db_file, arcname=f"SQLite/{db_file.name}")
+                        wrote_sqlite_file = True
                 except Exception as e:
-                    zf.writestr("data/sqlite_db_file_backup_error.txt", str(e))
-            elif HIDAMARI_DB_FILE.exists():
-                zf.writestr(
-                    "data/sqlite_db_skipped.txt",
-                    "SQLite補助DBが破損または読込不可のため、DB本体の同梱をスキップしました。Supabase主要データのJSON/Excel退避を確認してください。"
-                )
-
-            for life_db in [DATA_DIR / "hidamari_life.db", Path("hidamari_life.db")]:
-                if life_db.exists():
-                    zf.write(life_db, arcname=f"data/{life_db.name}")
+                    zf.writestr(f"SQLite/{db_file.name}_backup_error.txt", str(e))
+            if not wrote_sqlite_file:
+                zf.writestr("SQLite/_no_sqlite_file.txt", "同梱可能なSQLite DBファイルはありませんでした。")
 
             # SQLite全テーブル確認用Excel
             try:
-                zf.writestr("exports/sqlite_all_tables.xlsx", _make_all_sqlite_tables_excel_bytes())
+                sqlite_excel = _make_all_sqlite_tables_excel_bytes()
+                zf.writestr("SQLite/sqlite_all_tables.xlsx", sqlite_excel)
+                zf.writestr("exports/sqlite_all_tables.xlsx", sqlite_excel)  # 旧パス互換
             except Exception as e:
-                zf.writestr("exports/sqlite_all_tables_error.txt", str(e))
+                zf.writestr("SQLite/sqlite_all_tables_error.txt", str(e))
 
-            # Supabase主要7機能退避
+            # System：ログ・設定・アカウント等
             try:
-                zf.writestr(
-                    "exports/supabase_core_tables.json",
-                    json.dumps(supabase_data, ensure_ascii=False, indent=2, default=str),
-                )
-                zf.writestr("exports/supabase_core_tables.xlsx", _make_supabase_core_excel_bytes(supabase_data))
+                _write_complete_system_excels(zf)
             except Exception as e:
-                zf.writestr("exports/supabase_core_tables_error.txt", str(e))
+                zf.writestr("System/_backup_error.txt", str(e))
 
-            # 写真・添付ファイル
-            for folder in [BUSINESS_HANDOVER_PHOTO_DIR, BUSINESS_HANDOVER_EXCEL_DIR]:
-                if folder.exists():
-                    for file in folder.rglob("*"):
-                        if file.is_file():
-                            zf.write(file, arcname=str(file))
+            # 写真・添付・帳票
+            _write_folder_to_zip(zf, BUSINESS_HANDOVER_PHOTO_DIR, "Photos/business_handover_photos")
+            _write_folder_to_zip(zf, BUSINESS_HANDOVER_EXCEL_DIR, "Attachments/business_handover_excels")
+            _write_folder_to_zip(zf, REPORT_DIR, "Reports")
 
-        record_backup_history(kind, zip_path, "成功", "一括バックアップ作成")
-        add_audit_log("バックアップ作成", "backup_history", zip_path.name, f"{kind}バックアップを作成")
+            # data内の旧Excel/JSON設定類も念のため保管
+            try:
+                for file in DATA_DIR.glob("*"):
+                    if file.is_file() and file.suffix.lower() in [".xlsx", ".json", ".csv", ".txt"]:
+                        zf.write(file, arcname=f"System/data_files/{file.name}")
+            except Exception as e:
+                zf.writestr("System/data_files_backup_error.txt", str(e))
+
+        record_backup_history(kind, zip_path, "成功", "完全バックアップZIP作成")
+        add_audit_log("完全バックアップ作成", "backup_history", zip_path.name, f"{kind}完全バックアップを作成")
         return zip_path, ""
     except Exception as e:
-        # バックアップ全体が落ちた場合も、可能な範囲でSupabase主要データだけ緊急退避する。
+        # 完全バックアップ全体が落ちた場合も、Supabase本番データだけは緊急退避する。
         try:
-            emergency_path = BACKUP_DIR / f"hidamari_backup_{safe_kind}_{timestamp}_supabase_only.zip"
+            emergency_path = BACKUP_DIR / f"hidamari_complete_backup_{safe_kind}_{timestamp}_supabase_only.zip"
             supabase_data = _read_supabase_core_tables_for_backup()
             with zipfile.ZipFile(emergency_path, "w", zipfile.ZIP_DEFLATED) as zf:
                 zf.writestr("backup_error.txt", str(e))
-                zf.writestr(
-                    "exports/supabase_core_tables.json",
-                    json.dumps(supabase_data, ensure_ascii=False, indent=2, default=str),
-                )
-                zf.writestr("exports/supabase_core_tables.xlsx", _make_supabase_core_excel_bytes(supabase_data))
+                _write_supabase_complete_backup_files(zf, supabase_data)
             try:
-                record_backup_history(kind, emergency_path, "一部成功", f"SQLite補助DBエラー。Supabase主要データのみ退避: {e}")
+                record_backup_history(kind, emergency_path, "一部成功", f"完全バックアップ失敗。Supabase本番データのみ退避: {e}")
             except Exception:
                 pass
             try:
-                add_audit_log("バックアップ一部成功", "backup_history", emergency_path.name, str(e))
+                add_audit_log("完全バックアップ一部成功", "backup_history", emergency_path.name, str(e))
             except Exception:
                 pass
             return emergency_path, ""
@@ -2128,10 +2299,11 @@ def create_backup_zip(kind="手動"):
             except Exception:
                 pass
             try:
-                add_audit_log("バックアップ失敗", "backup_history", zip_path.name, str(e2))
+                add_audit_log("完全バックアップ失敗", "backup_history", zip_path.name, str(e2))
             except Exception:
                 pass
             return None, str(e2)
+
 def run_daily_auto_backup():
     """1日1回だけ自動バックアップを作成する。"""
     try:
@@ -2303,7 +2475,7 @@ def restore_from_backup_zip(uploaded_file, restore_sqlite=True, restore_files=Tr
 
             if restore_files:
                 file_count = 0
-                for folder in [BUSINESS_HANDOVER_PHOTO_DIR, BUSINESS_HANDOVER_EXCEL_DIR]:
+                for folder in [BUSINESS_HANDOVER_PHOTO_DIR, BUSINESS_HANDOVER_EXCEL_DIR, REPORT_DIR]:
                     for name in names:
                         if name.startswith(str(folder)) and not name.endswith("/"):
                             target = Path(name)
@@ -2523,7 +2695,7 @@ def restore_from_backup_path(backup_path: Path):
             if "data/hidamari_life.db" in names:
                 (DATA_DIR / "hidamari_life.db").write_bytes(zf.read("data/hidamari_life.db"))
 
-            for folder in [BUSINESS_HANDOVER_PHOTO_DIR, BUSINESS_HANDOVER_EXCEL_DIR]:
+            for folder in [BUSINESS_HANDOVER_PHOTO_DIR, BUSINESS_HANDOVER_EXCEL_DIR, REPORT_DIR]:
                 for name in names:
                     if name.startswith(str(folder)) and not name.endswith("/"):
                         target = Path(name)
