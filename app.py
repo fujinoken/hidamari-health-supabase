@@ -56,6 +56,33 @@ except Exception:
     colors = None
 
 
+
+# =========================
+# Ver4.8.2 起動順安全化：キャッシュ関連の最小定義を最上部で先に用意
+# =========================
+# Streamlit Cloudでは、デコレータ行の評価時点で関数名が未定義だと
+# NameErrorでアプリ全体が停止するため、後続の本定義より前に安全版を置く。
+DEFAULT_QUERY_CACHE_TTL_SEC = 60
+DEFAULT_RECENT_DAYS = 7
+SAFE_READ_CACHE_TTL_SEC = 300
+
+def cache_safe_master_read(ttl=60):
+    """st.cache_data が使えない環境でもアプリを止めない安全デコレータ。"""
+    def _decorator(func):
+        try:
+            return st.cache_data(ttl=ttl, show_spinner=False)(func)
+        except Exception:
+            return func
+    return _decorator
+
+def clear_hidamari_read_cache(reason=""):
+    """保存・削除・マスタ更新後に、表示用キャッシュを安全にクリアする。"""
+    try:
+        st.cache_data.clear()
+    except Exception:
+        pass
+
+
 # =========================
 # Ver4.7 表記修正：時間帯の「?」を「〜」に修正
 # =========================
