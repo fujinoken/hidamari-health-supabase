@@ -2427,18 +2427,204 @@ def _restore_supabase_core_tables_from_backup(zf, names):
         return result
 
 
+
+# =========================
+# 復元安全化（Ver4.8.6）
+# 完全バックアップZIP／旧バックアップZIPの両方に対応する。
+# =========================
+def _zip_has_member(names, candidates):
+    name_set = set(names or [])
+    for candidate in candidates:
+        if candidate in name_set:
+            return candidate
+    return ""
+
+def _safe_zip_member_to_target(zf, member_name: str, target_path: Path) -> bool:
+    """
+    ZIP内ファイルを指定先へ安全に復元する。
+    - ディレクトリトラバーサル対策
+    - 親フォルダ自動作成
+    """
+    if not member_name or member_name.endswith("/"):
+        return False
+    target_path = Path(target_path)
+    target_path.parent.mkdir(parents=True, exist_ok=True)
+    target_path.write_bytes(zf.read(member_name))
+    return True
+
+def _restore_folder_prefix_from_zip(zf, names, zip_prefix: str, target_root: Path) -> int:
+    """ZIP内の指定prefix配下を、target_rootへ相対パスを保って復元する。"""
+    count = 0
+    zip_prefix = str(zip_prefix).strip("/")
+    target_root = Path(target_root)
+    for name in names:
+        if not name or name.endswith("/"):
+            continue
+        normalized = name.strip("/")
+        if not normalized.startswith(zip_prefix + "/"):
+            continue
+        rel = normalized[len(zip_prefix) + 1:]
+        if not rel or rel.startswith("../") or "/../" in rel or rel == "..":
+            continue
+        try:
+            _safe_zip_member_to_target(zf, name, target_root / rel)
+            count += 1
+        except Exception:
+            continue
+    return count
+
+def _restore_legacy_folder_from_zip(zf, names, folder: Path) -> int:
+    """
+    旧バックアップ形式の data/... パスをそのまま復元する。
+    Streamlit上の相対Pathのみを対象にして、危険な絶対パスは除外する。
+    """
+    count = 0
+    folder_text = str(folder).replace("\\", "/").strip("/")
+    for name in names:
+        normalized = str(name).replace("\\", "/").strip("/")
+        if not normalized or normalized.endswith("/"):
+            continue
+        if normalized.startswith("../") or "/../" in normalized or Path(normalized).is_absolute():
+            continue
+        if normalized.startswith(folder_text + "/"):
+            try:
+                _safe_zip_member_to_target(zf, name, Path(normalized))
+                count += 1
+            except Exception:
+                continue
+    return count
+
+def _restore_sqlite_files_from_zip(zf, names) -> list:
+    """
+    SQLite DB本体を復元する。
+    Ver4.8.5完全バックアップ形式:
+      SQLite/hidamari_health.db
+      SQLite/hidamari_health.db-wal
+      SQLite/hidamari_health.db-shm
+      SQLite/hidamari_life.db
+    旧形式:
+      data/hidamari_health.db
+      data/hidamari_life.db
+    """
+    restored = []
+
+    main_db_member = _zip_has_member(names, [
+        f"SQLite/{HIDAMARI_DB_FILE.name}",
+        f"data/{HIDAMARI_DB_FILE.name}",
+        HIDAMARI_DB_FILE.name,
+    ])
+    if not main_db_member:
+        raise FileNotFoundError(
+            "SQLite復元を選択していますが、このZIPには hidamari_health.db が含まれていません。"
+            "完全バックアップZIPの場合は SQLite/hidamari_health.db、旧バックアップの場合は data/hidamari_health.db が必要です。"
+        )
+
+    # 既存WAL/SHMが残ると復元後に不整合が出ることがあるため、先に退避削除する。
+    for sidecar in [Path(str(HIDAMARI_DB_FILE) + "-wal"), Path(str(HIDAMARI_DB_FILE) + "-shm")]:
+        try:
+            if sidecar.exists():
+                sidecar.unlink()
+        except Exception:
+            pass
+
+    HIDAMARI_DB_FILE.parent.mkdir(parents=True, exist_ok=True)
+    HIDAMARI_DB_FILE.write_bytes(zf.read(main_db_member))
+    restored.append("hidamari_health.db")
+
+    # WAL/SHMは完全バックアップに含まれている場合のみ復元する。
+    sidecar_map = [
+        (f"SQLite/{HIDAMARI_DB_FILE.name}-wal", Path(str(HIDAMARI_DB_FILE) + "-wal")),
+        (f"SQLite/{HIDAMARI_DB_FILE.name}-shm", Path(str(HIDAMARI_DB_FILE) + "-shm")),
+        (f"data/{HIDAMARI_DB_FILE.name}-wal", Path(str(HIDAMARI_DB_FILE) + "-wal")),
+        (f"data/{HIDAMARI_DB_FILE.name}-shm", Path(str(HIDAMARI_DB_FILE) + "-shm")),
+    ]
+    for member, target in sidecar_map:
+        try:
+            if member in names:
+                target.write_bytes(zf.read(member))
+                restored.append(target.name)
+        except Exception:
+            pass
+
+    life_member = _zip_has_member(names, [
+        "SQLite/hidamari_life.db",
+        "data/hidamari_life.db",
+        "hidamari_life.db",
+    ])
+    if life_member:
+        try:
+            (DATA_DIR / "hidamari_life.db").write_bytes(zf.read(life_member))
+            restored.append("hidamari_life.db")
+        except Exception:
+            pass
+
+    return restored
+
+def _restore_files_from_complete_or_legacy_zip(zf, names) -> int:
+    """
+    写真・添付・帳票を復元する。
+    Ver4.8.5完全バックアップ形式と旧形式の両方に対応。
+    """
+    file_count = 0
+
+    # Ver4.8.5 完全バックアップ形式
+    file_count += _restore_folder_prefix_from_zip(
+        zf, names, "Photos/business_handover_photos", BUSINESS_HANDOVER_PHOTO_DIR
+    )
+    file_count += _restore_folder_prefix_from_zip(
+        zf, names, "Attachments/business_handover_excels", BUSINESS_HANDOVER_EXCEL_DIR
+    )
+    file_count += _restore_folder_prefix_from_zip(
+        zf, names, "Reports", REPORT_DIR
+    )
+
+    # 旧形式：data/... や reports/... をそのまま復元
+    for folder in [BUSINESS_HANDOVER_PHOTO_DIR, BUSINESS_HANDOVER_EXCEL_DIR, REPORT_DIR]:
+        file_count += _restore_legacy_folder_from_zip(zf, names, folder)
+
+    return file_count
+
+def get_restore_zip_diagnostic(uploaded_file) -> pd.DataFrame:
+    """復元前にZIPの中身を診断するための補助。画面表示に使える。"""
+    rows = []
+    try:
+        pos = uploaded_file.tell()
+    except Exception:
+        pos = None
+    try:
+        uploaded_file.seek(0)
+        with zipfile.ZipFile(uploaded_file, "r") as zf:
+            names = zf.namelist()
+            rows.append({"項目": "ZIPファイル", "状態": "OK", "詳細": f"{len(names)}件のファイル"})
+            rows.append({"項目": "backup_info.json", "状態": "OK" if "backup_info.json" in names else "確認", "詳細": "あり" if "backup_info.json" in names else "なし"})
+            rows.append({"項目": "SQLite DB", "状態": "OK" if _zip_has_member(names, [f"SQLite/{HIDAMARI_DB_FILE.name}", f"data/{HIDAMARI_DB_FILE.name}", HIDAMARI_DB_FILE.name]) else "NG", "詳細": "復元可能" if _zip_has_member(names, [f"SQLite/{HIDAMARI_DB_FILE.name}", f"data/{HIDAMARI_DB_FILE.name}", HIDAMARI_DB_FILE.name]) else "hidamari_health.dbが見つかりません"})
+            rows.append({"項目": "Supabase退避JSON", "状態": "OK" if "exports/supabase_core_tables.json" in names else "確認", "詳細": "あり" if "exports/supabase_core_tables.json" in names else "なし"})
+            photos = len([n for n in names if n.startswith("Photos/") or n.startswith(str(BUSINESS_HANDOVER_PHOTO_DIR).replace("\\", "/"))])
+            reports = len([n for n in names if n.startswith("Reports/") or n.startswith(str(REPORT_DIR).replace("\\", "/"))])
+            rows.append({"項目": "写真", "状態": "OK" if photos else "確認", "詳細": f"{photos}件"})
+            rows.append({"項目": "帳票", "状態": "OK" if reports else "確認", "詳細": f"{reports}件"})
+    except Exception as e:
+        rows.append({"項目": "ZIP診断", "状態": "NG", "詳細": str(e)})
+    finally:
+        try:
+            if pos is not None:
+                uploaded_file.seek(pos)
+            else:
+                uploaded_file.seek(0)
+        except Exception:
+            pass
+    return pd.DataFrame(rows)
+
 def restore_from_backup_zip(uploaded_file, restore_sqlite=True, restore_files=True, restore_supabase=False):
     """
     バックアップZIPから復元する。管理者のみ。
 
-    復元対象を選択可能：
-    - SQLite DB本体
-    - 写真・添付ファイル
-    - Supabase主要7機能（利用者マスタ・健康チェック・排泄チェック・申し送り・短期目標実施チェック）
-
-    注意：
-    Supabase復元は安全優先でupsert方式です。
-    バックアップにあるデータを戻しますが、現在Supabaseに存在する別データを全削除しません。
+    Ver4.8.6:
+    - Ver4.8.5完全バックアップZIPの新パスに対応
+      SQLite/・Photos/・Attachments/・Reports/・System/
+    - 旧バックアップZIPの data/・reports/ パスにも互換対応
+    - 復元前バックアップを必ず作成
+    - Supabase復元は安全優先のupsert方式
     """
     if not is_admin_user():
         return False, "管理者のみ復元できます。"
@@ -2460,29 +2646,19 @@ def restore_from_backup_zip(uploaded_file, restore_sqlite=True, restore_files=Tr
         restore_zip_path.write_bytes(uploaded_file.read())
 
         with zipfile.ZipFile(restore_zip_path, "r") as zf:
+            bad_file = zf.testzip()
+            if bad_file:
+                return False, f"ZIPファイルに破損があります：{bad_file}"
+
             names = zf.namelist()
 
             if restore_sqlite:
-                if f"data/{HIDAMARI_DB_FILE.name}" not in names:
-                    return False, "SQLite復元を選択していますが、このZIPには hidamari_health.db が含まれていません。"
-
-                HIDAMARI_DB_FILE.write_bytes(zf.read(f"data/{HIDAMARI_DB_FILE.name}"))
-                restore_summary.append("SQLite DB本体")
-
-                if "data/hidamari_life.db" in names:
-                    (DATA_DIR / "hidamari_life.db").write_bytes(zf.read("data/hidamari_life.db"))
-                    restore_summary.append("hidamari_life.db")
+                restored_sqlite = _restore_sqlite_files_from_zip(zf, names)
+                restore_summary.append("SQLite DB本体（" + "、".join(restored_sqlite) + "）")
 
             if restore_files:
-                file_count = 0
-                for folder in [BUSINESS_HANDOVER_PHOTO_DIR, BUSINESS_HANDOVER_EXCEL_DIR, REPORT_DIR]:
-                    for name in names:
-                        if name.startswith(str(folder)) and not name.endswith("/"):
-                            target = Path(name)
-                            target.parent.mkdir(parents=True, exist_ok=True)
-                            target.write_bytes(zf.read(name))
-                            file_count += 1
-                restore_summary.append(f"写真・添付ファイル {file_count}件")
+                file_count = _restore_files_from_complete_or_legacy_zip(zf, names)
+                restore_summary.append(f"写真・添付・帳票ファイル {file_count}件")
 
             if restore_supabase:
                 sb_result = _restore_supabase_core_tables_from_backup(zf, names)
@@ -2490,6 +2666,11 @@ def restore_from_backup_zip(uploaded_file, restore_sqlite=True, restore_files=Tr
                     return False, f"Supabase主要7機能の復元に失敗しました：{sb_result.get('error')}"
                 sb_msg = " / ".join(sb_result.get("messages", []))
                 restore_summary.append(f"Supabase主要7機能（{sb_msg}）")
+
+        try:
+            clear_hidamari_read_cache("バックアップ復元")
+        except Exception:
+            pass
 
         summary_text = "、".join(restore_summary) if restore_summary else "復元対象なし"
         add_audit_log("データ復元", "restore", restore_zip_path.name, f"復元対象：{summary_text}")
