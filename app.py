@@ -654,6 +654,67 @@ def supabase_replace_table(df: pd.DataFrame, table_name: str, columns=None, uniq
     return supabase_upsert_table(df, table_name, columns=columns, unique_cols=unique_cols)
 
 
+
+# =========================
+# SQLite破損DB自動隔離（Ver4.5.4）
+# Streamlit Cloud上のSQLite補助DBが破損した場合、
+# Supabase正本を守るため、壊れたDBを退避リネームして新規作成可能にする。
+# =========================
+SQLITE_CORRUPTION_KEYWORDS = [
+    "database disk image is malformed",
+    "file is not a database",
+    "database is malformed",
+    "malformed database schema",
+]
+
+def is_sqlite_corruption_error(e) -> bool:
+    msg = str(e).lower()
+    return any(k in msg for k in SQLITE_CORRUPTION_KEYWORDS)
+
+def quarantine_corrupt_sqlite_db(reason=""):
+    """
+    壊れたSQLite補助DBを隔離する。
+    Supabaseを正本にしているため、SQLite補助DBは再作成対象とする。
+    """
+    try:
+        DATA_DIR.mkdir(parents=True, exist_ok=True)
+    except Exception:
+        pass
+
+    try:
+        if st.session_state.get("sqlite_quarantine_done"):
+            return
+    except Exception:
+        pass
+
+    timestamp = datetime.utcnow().strftime("%Y%m%d_%H%M%S")
+    targets = [
+        HIDAMARI_DB_FILE,
+        Path(str(HIDAMARI_DB_FILE) + "-wal"),
+        Path(str(HIDAMARI_DB_FILE) + "-shm"),
+    ]
+
+    moved = []
+    for src in targets:
+        try:
+            if src.exists():
+                dst = src.with_name(f"{src.name}.corrupt_{timestamp}")
+                src.replace(dst)
+                moved.append(f"{src.name} -> {dst.name}")
+        except Exception:
+            pass
+
+    try:
+        st.session_state["sqlite_quarantine_done"] = True
+        st.session_state["sqlite_backup_available"] = False
+        st.session_state["sqlite_backup_last_error"] = f"SQLite補助DBを隔離しました: {reason}"
+        if moved and not st.session_state.get("sqlite_quarantine_notice_shown"):
+            st.warning("SQLite補助DBの破損を検出したため、壊れたDBを隔離しました。Supabase正本で処理を継続します。")
+            st.session_state["sqlite_quarantine_notice_shown"] = True
+    except Exception:
+        pass
+
+
 # =========================
 # SQLiteバックアップ安全化（Ver4.5.2）
 # Supabaseを正本にしているため、SQLiteミラー／バックアップ側のエラーで
@@ -668,6 +729,11 @@ def _safe_empty_df(columns=None):
 
 
 def _mark_sqlite_backup_error(e, table_name=""):
+    try:
+        if is_sqlite_corruption_error(e):
+            quarantine_corrupt_sqlite_db(f"{table_name}: {e}" if table_name else str(e))
+    except Exception:
+        pass
     try:
         st.session_state["sqlite_backup_available"] = False
         st.session_state["sqlite_backup_last_error"] = f"{table_name}: {e}" if table_name else str(e)
@@ -1233,6 +1299,14 @@ def initialize_sqlite_engine():
         return result
     except Exception as e:
         _mark_sqlite_backup_error(e, "initialize_sqlite_engine")
+        # 破損DBを隔離できた場合は、1回だけ新規DBとして再初期化を試す
+        try:
+            if is_sqlite_corruption_error(e):
+                result = db_engine.initialize_sqlite_engine()
+                st.session_state["sqlite_backup_available"] = True
+                return result
+        except Exception as e2:
+            _mark_sqlite_backup_error(e2, "initialize_sqlite_engine_retry")
         _show_sqlite_backup_warning_once(e, "initialize_sqlite_engine")
         return None
 
@@ -1836,9 +1910,19 @@ def create_backup_zip(kind="手動"):
     zip_path = BACKUP_DIR / f"hidamari_backup_{safe_kind}_{timestamp}.zip"
 
     try:
+        # SQLite補助DBが壊れていても、Supabase主要データのバックアップは継続する。
+        sqlite_db_ok_for_file_backup = False
         if HIDAMARI_DB_FILE.exists():
-            with get_hidamari_conn() as conn:
-                conn.execute("PRAGMA wal_checkpoint(FULL);")
+            try:
+                with get_hidamari_conn() as conn:
+                    conn.execute("PRAGMA quick_check;")
+                    conn.execute("PRAGMA wal_checkpoint(FULL);")
+                sqlite_db_ok_for_file_backup = True
+            except Exception as e:
+                _mark_sqlite_backup_error(e, "backup_sqlite_checkpoint")
+                if is_sqlite_corruption_error(e):
+                    quarantine_corrupt_sqlite_db(f"backup_sqlite_checkpoint: {e}")
+                sqlite_db_ok_for_file_backup = False
 
         supabase_data = _read_supabase_core_tables_for_backup()
         backup_info = {
@@ -1855,8 +1939,16 @@ def create_backup_zip(kind="手動"):
         with zipfile.ZipFile(zip_path, "w", zipfile.ZIP_DEFLATED) as zf:
             zf.writestr("backup_info.json", json.dumps(backup_info, ensure_ascii=False, indent=2))
 
-            if HIDAMARI_DB_FILE.exists():
-                zf.write(HIDAMARI_DB_FILE, arcname=f"data/{HIDAMARI_DB_FILE.name}")
+            if HIDAMARI_DB_FILE.exists() and sqlite_db_ok_for_file_backup:
+                try:
+                    zf.write(HIDAMARI_DB_FILE, arcname=f"data/{HIDAMARI_DB_FILE.name}")
+                except Exception as e:
+                    zf.writestr("data/sqlite_db_file_backup_error.txt", str(e))
+            elif HIDAMARI_DB_FILE.exists():
+                zf.writestr(
+                    "data/sqlite_db_skipped.txt",
+                    "SQLite補助DBが破損または読込不可のため、DB本体の同梱をスキップしました。Supabase主要データのJSON/Excel退避を確認してください。"
+                )
 
             for life_db in [DATA_DIR / "hidamari_life.db", Path("hidamari_life.db")]:
                 if life_db.exists():
@@ -1889,9 +1981,36 @@ def create_backup_zip(kind="手動"):
         add_audit_log("バックアップ作成", "backup_history", zip_path.name, f"{kind}バックアップを作成")
         return zip_path, ""
     except Exception as e:
-        record_backup_history(kind, zip_path, "失敗", str(e))
-        add_audit_log("バックアップ失敗", "backup_history", zip_path.name, str(e))
-        return None, str(e)
+        # バックアップ全体が落ちた場合も、可能な範囲でSupabase主要データだけ緊急退避する。
+        try:
+            emergency_path = BACKUP_DIR / f"hidamari_backup_{safe_kind}_{timestamp}_supabase_only.zip"
+            supabase_data = _read_supabase_core_tables_for_backup()
+            with zipfile.ZipFile(emergency_path, "w", zipfile.ZIP_DEFLATED) as zf:
+                zf.writestr("backup_error.txt", str(e))
+                zf.writestr(
+                    "exports/supabase_core_tables.json",
+                    json.dumps(supabase_data, ensure_ascii=False, indent=2, default=str),
+                )
+                zf.writestr("exports/supabase_core_tables.xlsx", _make_supabase_core_excel_bytes(supabase_data))
+            try:
+                record_backup_history(kind, emergency_path, "一部成功", f"SQLite補助DBエラー。Supabase主要データのみ退避: {e}")
+            except Exception:
+                pass
+            try:
+                add_audit_log("バックアップ一部成功", "backup_history", emergency_path.name, str(e))
+            except Exception:
+                pass
+            return emergency_path, ""
+        except Exception as e2:
+            try:
+                record_backup_history(kind, zip_path, "失敗", str(e2))
+            except Exception:
+                pass
+            try:
+                add_audit_log("バックアップ失敗", "backup_history", zip_path.name, str(e2))
+            except Exception:
+                pass
+            return None, str(e2)
 def run_daily_auto_backup():
     """1日1回だけ自動バックアップを作成する。"""
     try:
