@@ -57,6 +57,10 @@ except Exception:
 
 
 # =========================
+# Ver4.7 表記修正：時間帯の「?」を「〜」に修正
+# =========================
+
+# =========================
 # ページ設定
 # =========================
 st.set_page_config(
@@ -2853,12 +2857,12 @@ HEALTH_COLUMNS = [
 ]
 
 EXCRETION_SLOTS = [
-    ("午前", "9時?12時"),
-    ("午後", "12時?15時"),
-    ("夕方", "15時?17時"),
-    ("夜", "18時?22時"),
-    ("深夜", "22時?5時"),
-    ("朝方", "5時?8時"),
+    ("午前", "9時〜12時"),
+    ("午後", "12時〜15時"),
+    ("夕方", "15時〜17時"),
+    ("夜", "18時〜22時"),
+    ("深夜", "22時〜5時"),
+    ("朝方", "5時〜8時"),
 ]
 
 URINE_AMOUNT_OPTIONS = ["なし", "少", "中", "大"]
@@ -15507,14 +15511,14 @@ elif menu == "排泄チェック入力":
                 "登録日時": format_now_jst("%Y-%m-%d %H:%M:%S"),
             })
 
-        st.markdown("####  日中帯（9時?17時）")
+        st.markdown("####  日中帯（9時〜17時）")
         day_cols = st.columns(3)
 
         for col, (slot, time_label) in zip(day_cols, EXCRETION_SLOTS[:3]):
             with col:
                 render_slot(slot, time_label, "#FFF7EC", "#E5D5BF")
 
-        st.markdown("####  夜間帯（18時?翌8時）")
+        st.markdown("####  夜間帯（18時〜翌8時）")
         night_cols = st.columns(3)
 
         for col, (slot, time_label) in zip(night_cols, EXCRETION_SLOTS[3:]):
