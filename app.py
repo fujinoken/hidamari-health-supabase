@@ -590,6 +590,17 @@ def _df_to_supabase_payload(df: pd.DataFrame, table_name: str, unique_cols=None)
 DEFAULT_QUERY_CACHE_TTL_SEC = 60
 DEFAULT_RECENT_DAYS = 7
 
+# Ver4.8.1 起動順修正：キャッシュデコレータを使用前に定義
+def cache_safe_master_read(ttl=60):
+    """st.cache_data が使えない環境でもアプリを止めない安全デコレータ。"""
+    def _decorator(func):
+        try:
+            return st.cache_data(ttl=ttl, show_spinner=False)(func)
+        except Exception:
+            return func
+    return _decorator
+
+
 def _date_to_iso(value):
     if value in [None, ""]:
         return ""
