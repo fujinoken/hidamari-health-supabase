@@ -3064,6 +3064,206 @@ def run_startup_database_guard():
             st.rerun()
         return False
 
+
+# =========================
+# バックアップ整合性チェック（Ver4.8.8）
+# 本番データを復元・更新せず、現在Supabase件数とバックアップZIP内件数を比較する。
+# =========================
+def _supabase_backup_check_targets():
+    return [
+        (SQLITE_TABLE_USERS, "利用者マスタ"),
+        (SQLITE_TABLE_HEALTH, "健康チェック"),
+        (SQLITE_TABLE_EXCRETION, "排泄チェック"),
+        (SQLITE_TABLE_HANDOVER, "業務全体申し送り"),
+        (SQLITE_TABLE_SHORT_GOAL_CHECKS, "短期目標実施チェック"),
+        (SQLITE_TABLE_SHORT_GOAL_MASTER, "短期目標マスタ"),
+        (SQLITE_TABLE_MONITORING_DRAFTS, "モニタリング下書き"),
+    ]
+
+
+def _count_current_supabase_records_uncached(table_name: str) -> tuple:
+    """
+    現在のSupabase本番テーブル件数を、画面表示キャッシュを使わずに取得する。
+    戻り値：(件数, メッセージ)
+    """
+    if not ("supabase_is_enabled" in globals() and supabase_is_enabled()):
+        return None, "Supabase未設定または接続不可"
+    if requests is None:
+        return None, "requestsが利用できません"
+    try:
+        total = 0
+        page_size = 1000
+        offset = 0
+        while True:
+            headers = _supabase_headers(prefer="")
+            headers["Range-Unit"] = "items"
+            headers["Range"] = f"{offset}-{offset + page_size - 1}"
+            res = requests.get(
+                _supabase_endpoint(table_name),
+                headers=headers,
+                params=[("select", "record_key"), ("order", "updated_at.asc")],
+                timeout=30,
+            )
+            if res.status_code not in [200, 206]:
+                res.raise_for_status()
+            rows = res.json() or []
+            total += len(rows)
+            if len(rows) < page_size:
+                break
+            offset += page_size
+        return int(total), ""
+    except Exception as e:
+        return None, str(e)
+
+
+def _clean_backup_records_for_count(records):
+    if not isinstance(records, list):
+        return []
+    clean = []
+    for item in records:
+        if isinstance(item, dict) and "backup_error" not in item:
+            clean.append(item)
+    return clean
+
+
+def _read_backup_supabase_counts_from_zip(uploaded_or_path) -> tuple:
+    """
+    バックアップZIP内のSupabase主要7機能件数を読む。
+    本番データには一切書き込まない。
+    対応：
+      - exports/supabase_core_tables.json
+      - exports/supabase_core_tables.xlsx
+      - Supabase/*.xlsx
+    """
+    counts = {}
+    messages = []
+
+    try:
+        if hasattr(uploaded_or_path, "getvalue"):
+            zip_bytes = uploaded_or_path.getvalue()
+            zip_source = BytesIO(zip_bytes)
+        else:
+            zip_source = uploaded_or_path
+
+        with zipfile.ZipFile(zip_source, "r") as zf:
+            names = zf.namelist()
+
+            # 最優先：復元互換JSON
+            if "exports/supabase_core_tables.json" in names:
+                raw = zf.read("exports/supabase_core_tables.json").decode("utf-8")
+                data = json.loads(raw) if raw.strip() else {}
+                if isinstance(data, dict):
+                    for table_name, _label in _supabase_backup_check_targets():
+                        counts[table_name] = len(_clean_backup_records_for_count(data.get(table_name, [])))
+                    return counts, messages
+                messages.append("exports/supabase_core_tables.json の形式が正しくありません。")
+
+            # 次点：互換Excel
+            if "exports/supabase_core_tables.xlsx" in names:
+                xls_bytes = BytesIO(zf.read("exports/supabase_core_tables.xlsx"))
+                for table_name, _label in _supabase_backup_check_targets():
+                    try:
+                        df = pd.read_excel(xls_bytes, sheet_name=table_name)
+                        # 次のシート読込のためにBytesIO位置を戻す
+                        xls_bytes.seek(0)
+                        if "backup_error" in df.columns:
+                            df = df[df["backup_error"].isna()]
+                        counts[table_name] = int(len(df))
+                    except Exception as e:
+                        xls_bytes.seek(0)
+                        counts[table_name] = None
+                        messages.append(f"{table_name}: Excel読込不可 / {e}")
+                return counts, messages
+
+            # 完全バックアップの用途別Excel
+            file_map = {
+                SQLITE_TABLE_USERS: "Supabase/users.xlsx",
+                SQLITE_TABLE_HEALTH: "Supabase/health.xlsx",
+                SQLITE_TABLE_EXCRETION: "Supabase/excretion.xlsx",
+                SQLITE_TABLE_HANDOVER: "Supabase/handover.xlsx",
+                SQLITE_TABLE_SHORT_GOAL_CHECKS: "Supabase/short_goal_checks.xlsx",
+                SQLITE_TABLE_SHORT_GOAL_MASTER: "Supabase/short_goal_master.xlsx",
+                SQLITE_TABLE_MONITORING_DRAFTS: "Supabase/monitoring.xlsx",
+            }
+            found_any = False
+            for table_name, member in file_map.items():
+                if member in names:
+                    found_any = True
+                    try:
+                        df = pd.read_excel(BytesIO(zf.read(member)))
+                        # 空テーブル用のmessage行だけの場合は0件扱い
+                        if list(df.columns) == ["message"]:
+                            counts[table_name] = 0
+                        elif "backup_error" in df.columns:
+                            counts[table_name] = int(len(df[df["backup_error"].isna()]))
+                        else:
+                            counts[table_name] = int(len(df))
+                    except Exception as e:
+                        counts[table_name] = None
+                        messages.append(f"{member}: 読込不可 / {e}")
+            if found_any:
+                return counts, messages
+
+            messages.append("SupabaseバックアップデータがZIP内に見つかりません。")
+            return counts, messages
+    except Exception as e:
+        messages.append(f"ZIP読込エラー: {e}")
+        return counts, messages
+
+
+def check_backup_integrity_against_current_supabase(uploaded_or_path) -> dict:
+    """
+    バックアップ整合性チェック本体。
+    復元・保存・削除は一切しない。
+    """
+    backup_counts, messages = _read_backup_supabase_counts_from_zip(uploaded_or_path)
+
+    rows = []
+    matched = 0
+    checked = 0
+
+    for table_name, label in _supabase_backup_check_targets():
+        current_count, current_msg = _count_current_supabase_records_uncached(table_name)
+        backup_count = backup_counts.get(table_name, None)
+
+        if current_count is None:
+            status = "現在件数取得不可"
+            detail = current_msg
+        elif backup_count is None:
+            status = "バックアップ件数取得不可"
+            detail = "ZIP内に対象データがない、または読込できません。"
+        else:
+            checked += 1
+            diff = int(backup_count) - int(current_count)
+            if diff == 0:
+                matched += 1
+                status = "一致"
+                detail = "OK"
+            else:
+                status = "差異あり"
+                detail = f"バックアップ - 現在 = {diff:+d} 件"
+
+        rows.append({
+            "対象": label,
+            "テーブル": table_name,
+            "現在Supabase件数": "" if current_count is None else int(current_count),
+            "バックアップ件数": "" if backup_count is None else int(backup_count),
+            "判定": status,
+            "詳細": detail,
+        })
+
+    match_rate = round((matched / checked * 100), 1) if checked else 0
+    overall = "一致" if checked and matched == checked else ("確認が必要" if checked else "判定不可")
+
+    return {
+        "overall": overall,
+        "match_rate": match_rate,
+        "checked": checked,
+        "matched": matched,
+        "messages": messages,
+        "df": pd.DataFrame(rows),
+    }
+
 def show_security_maintenance_menu():
     if not is_admin_user():
         st.warning("このメニューは管理者専用です。")
@@ -3084,6 +3284,82 @@ def show_security_maintenance_menu():
         except Exception as e:
             st.warning(f"バックアップ対象の検査表示に失敗しました：{e}")
 
+        st.divider()
+        st.markdown("#### バックアップ整合性チェック")
+        st.caption("本番Supabaseには一切書き込まず、現在件数とバックアップZIP内件数を比較します。復元テストの代わりに安全確認できます。")
+
+        check_source = st.radio(
+            "チェックするバックアップの選び方",
+            ["保存済みバックアップから選ぶ", "ZIPをアップロードする"],
+            horizontal=True,
+            key="backup_integrity_source",
+        )
+
+        integrity_target = None
+        if check_source == "保存済みバックアップから選ぶ":
+            try:
+                saved_backups = sorted(
+                    list(BACKUP_DIR.glob("hidamari_backup_*.zip")) + list(BACKUP_DIR.glob("hidamari_complete_backup_*.zip")),
+                    key=lambda x: x.stat().st_mtime,
+                    reverse=True,
+                )
+            except Exception:
+                saved_backups = []
+            if saved_backups:
+                selected_integrity = st.selectbox(
+                    "整合性チェックする保存済みバックアップ",
+                    [b.name for b in saved_backups],
+                    key="selected_integrity_backup",
+                )
+                integrity_target = BACKUP_DIR / selected_integrity
+            else:
+                st.info("保存済みバックアップが見つかりません。ZIPをアップロードして確認してください。")
+        else:
+            integrity_upload = st.file_uploader(
+                "整合性チェックするバックアップZIPを選択",
+                type=["zip"],
+                key="backup_integrity_upload",
+            )
+            integrity_target = integrity_upload
+
+        if st.button("バックアップ整合性チェックを実行", use_container_width=True):
+            if integrity_target is None:
+                st.error("チェックするバックアップZIPを選択してください。")
+            elif not ("supabase_is_enabled" in globals() and supabase_is_enabled()):
+                st.error("Supabaseが未設定または接続できません。")
+            else:
+                with st.spinner("バックアップZIPと現在Supabase件数を照合しています..."):
+                    result = check_backup_integrity_against_current_supabase(integrity_target)
+                if result.get("overall") == "一致":
+                    st.success(f"整合性OK：{result.get('matched')}/{result.get('checked')} テーブル一致（一致率 {result.get('match_rate')}%）")
+                elif result.get("overall") == "確認が必要":
+                    st.warning(f"確認が必要：{result.get('matched')}/{result.get('checked')} テーブル一致（一致率 {result.get('match_rate')}%）")
+                else:
+                    st.error("判定できませんでした。バックアップZIPの形式を確認してください。")
+                for msg in result.get("messages", []):
+                    st.info(msg)
+                check_df = result.get("df", pd.DataFrame())
+                if isinstance(check_df, pd.DataFrame) and not check_df.empty:
+                    st.dataframe(check_df, use_container_width=True, hide_index=True)
+                    st.download_button(
+                        "整合性チェック結果をExcelでダウンロード",
+                        data=to_excel_download(check_df),
+                        file_name=f"backup_integrity_check_{today_jst().strftime('%Y%m%d')}.xlsx",
+                        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                        use_container_width=True,
+                    )
+                try:
+                    add_audit_log(
+                        "バックアップ整合性チェック",
+                        "backup",
+                        "",
+                        f"結果:{result.get('overall')} / 一致率:{result.get('match_rate')}%",
+                    )
+                except Exception:
+                    pass
+
+        st.divider()
+
         if st.button("今すぐ手動バックアップを作成", type="primary", use_container_width=True):
             zip_path, err = create_backup_zip(kind="手動")
             if err:
@@ -3091,7 +3367,11 @@ def show_security_maintenance_menu():
             else:
                 st.success(f"バックアップを作成しました：{zip_path.name}")
 
-        backups = sorted(BACKUP_DIR.glob("hidamari_backup_*.zip"), key=lambda x: x.stat().st_mtime, reverse=True)
+        backups = sorted(
+            list(BACKUP_DIR.glob("hidamari_backup_*.zip")) + list(BACKUP_DIR.glob("hidamari_complete_backup_*.zip")),
+            key=lambda x: x.stat().st_mtime,
+            reverse=True,
+        )
         if backups:
             selected = st.selectbox("ダウンロードするバックアップ", [b.name for b in backups])
             target = BACKUP_DIR / selected
