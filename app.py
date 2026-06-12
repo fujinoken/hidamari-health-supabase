@@ -15444,8 +15444,11 @@ elif menu == "排泄チェック入力":
                 unsafe_allow_html=True,
             )
 
-            urine_amount_default = existing.get("尿量", "なし") if existing is not None else "なし"
-            urine_type_default = existing.get("尿性状", "なし") if existing is not None else "なし"
+            # Ver4.6：排泄チェックの初期値を現場入力向けに最適化
+            # 新規入力時は、頻度の高い「尿量：中」「尿性状：普通尿」を最初から選択する。
+            # 既存データがある場合は、保存済みの値をそのまま表示する。
+            urine_amount_default = existing.get("尿量", "中") if existing is not None else "中"
+            urine_type_default = existing.get("尿性状", "普通尿") if existing is not None else "普通尿"
             stool_amount_default = existing.get("便量", "なし") if existing is not None else "なし"
             stool_type_default = existing.get("便性状", "なし") if existing is not None else "なし"
 
@@ -16150,12 +16153,12 @@ elif menu == "排泄詳細管理":
         urine_amount = st.selectbox(
             "尿量",
             URINE_AMOUNT_OPTIONS,
-            index=get_option_index(URINE_AMOUNT_OPTIONS, current.get("尿量", "なし") if current is not None else "なし"),
+            index=get_option_index(URINE_AMOUNT_OPTIONS, current.get("尿量", "中") if current is not None else "中"),
         )
         urine_type = st.selectbox(
             "尿性状",
             URINE_TYPE_OPTIONS,
-            index=get_option_index(URINE_TYPE_OPTIONS, current.get("尿性状", "なし") if current is not None else "なし"),
+            index=get_option_index(URINE_TYPE_OPTIONS, current.get("尿性状", "普通尿") if current is not None else "普通尿"),
         )
         stool_amount = st.selectbox(
             "便量",
