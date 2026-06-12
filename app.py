@@ -12747,13 +12747,20 @@ def show_structured_insight_menu():
         st.warning("開始日が終了日より後になっています。日付を入れ替えて分析します。")
         start_day, end_day = end_day, start_day
 
-    # ダッシュボードは確認日前後の直近データだけを読む（全件取得しない）
-    dash_start = target_date - timedelta(days=14)
-    dash_end = target_date
+    # Ver4.8.3 修正：
+    # ここでは target_date という変数は定義されていないため、
+    # 画面で選択した分析基準日 end_day を使う。
+    # 直近データだけを読み、全件取得による重さを避ける。
+    dash_end = end_day
+    dash_start = dash_end - timedelta(days=14)
     health_df = load_health_data(start_date=dash_start, end_date=dash_end)
     ex_df = load_excretion_data(start_date=dash_start, end_date=dash_end)
-    handover_df = load_business_handover_data() if 'load_business_handover_data' in globals() else read_excel_safe(HANDOVER_FILE, BUSINESS_HANDOVER_COLUMNS)
-    goal_df = load_short_goal_checks()
+    if 'load_business_handover_data' in globals():
+        handover_df = load_business_handover_data(start_date=dash_start, end_date=dash_end)
+    else:
+        handover_df = read_excel_safe(HANDOVER_FILE, BUSINESS_HANDOVER_COLUMNS)
+        handover_df = _filter_df_by_date_range(handover_df, "日付", dash_start, dash_end)
+    goal_df = load_short_goal_checks(start_date=dash_start, end_date=dash_end)
 
     result = analyze_structured_insights(
         health_df,
