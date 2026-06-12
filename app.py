@@ -267,12 +267,60 @@ def safe_apply_sqlite_pragmas(conn, for_write=False):
 hidamari_db_connection = db_engine.hidamari_db_connection
 hidamari_write_transaction = db_engine.hidamari_write_transaction
 get_hidamari_conn = db_engine.get_hidamari_conn
-sqlite_table_exists = db_engine.sqlite_table_exists
-sqlite_table_row_count = db_engine.sqlite_table_row_count
+
+_original_sqlite_table_exists = db_engine.sqlite_table_exists
+_original_sqlite_table_row_count = db_engine.sqlite_table_row_count
+_original_db_write_dataframe = db_engine.db_write_dataframe
+_original_db_read_dataframe = db_engine.db_read_dataframe
+
+def sqlite_table_exists(table_name):
+    """SQLite補助DBの存在確認。失敗時はFalseで返し、アプリを止めない。"""
+    try:
+        return _original_sqlite_table_exists(table_name)
+    except Exception as e:
+        try:
+            _mark_sqlite_backup_error(e, f"sqlite_table_exists:{table_name}")
+        except Exception:
+            pass
+        return False
+
+def sqlite_table_row_count(table_name):
+    """SQLite補助DBの件数確認。失敗時は0で返し、初期化・ログインを止めない。"""
+    try:
+        return _original_sqlite_table_row_count(table_name)
+    except Exception as e:
+        try:
+            _mark_sqlite_backup_error(e, f"sqlite_table_row_count:{table_name}")
+        except Exception:
+            pass
+        return 0
+
 normalize_df_columns = db_engine.normalize_df_columns
 prepare_sqlite_dataframe = db_engine.prepare_sqlite_dataframe
-db_write_dataframe = db_engine.db_write_dataframe
-db_read_dataframe = db_engine.db_read_dataframe
+
+def db_write_dataframe(df, table_name, columns, *args, **kwargs):
+    """低層SQLite書込の安全ラッパー。"""
+    try:
+        return _original_db_write_dataframe(df, table_name, columns, *args, **kwargs)
+    except Exception as e:
+        try:
+            _mark_sqlite_backup_error(e, f"db_write_dataframe:{table_name}")
+            _show_sqlite_backup_warning_once(e, table_name)
+        except Exception:
+            pass
+        return False
+
+def db_read_dataframe(table_name, columns, *args, **kwargs):
+    """低層SQLite読込の安全ラッパー。"""
+    try:
+        return _original_db_read_dataframe(table_name, columns, *args, **kwargs)
+    except Exception as e:
+        try:
+            _mark_sqlite_backup_error(e, f"db_read_dataframe:{table_name}")
+            _show_sqlite_backup_warning_once(e, table_name)
+        except Exception:
+            pass
+        return pd.DataFrame(columns=list(columns or []))
 
 # =========================
 # Supabase外部DB対応（Ver4.5）
@@ -560,10 +608,17 @@ def supabase_read_table(table_name: str, columns=None) -> pd.DataFrame:
         return df
     except Exception as e:
         try:
-            st.warning(f"Supabase読込に失敗したため、ローカルSQLiteを読み込みます：{table_name} / {e}")
+            st.warning(f"Supabase読込に失敗しました。SQLite補助DBが使える場合のみ読み込みます：{table_name} / {e}")
         except Exception:
             pass
-        return _original_load_sqlite_table(table_name, columns or [])
+        try:
+            return _original_load_sqlite_table(table_name, columns or [])
+        except Exception as e2:
+            try:
+                _mark_sqlite_backup_error(e2, table_name)
+            except Exception:
+                pass
+            return pd.DataFrame(columns=list(columns or []))
 
 
 def supabase_upsert_table(df: pd.DataFrame, table_name: str, columns=None, unique_cols=None) -> bool:
@@ -3790,73 +3845,147 @@ def normalize_accounts_df(df):
 
 def ensure_account_file():
     """
-    ログインアカウントをSQLiteで管理する。
-    既存の login_account_master.xlsx がある場合は初回のみSQLiteへ移行し、
-    以後はSQLiteを正とする。
+    ログインアカウントを用意する。
+    SQLite補助DBが壊れている／ロックしている場合でも、既定アカウントでログイン画面を継続する。
     """
-    ensure_dirs()
+    try:
+        ensure_dirs()
+    except Exception:
+        pass
 
-    # 既にSQLiteにデータがあれば何もしない
-    if sqlite_table_row_count(SQLITE_TABLE_ACCOUNTS) > 0:
-        return
-
-    # 旧Excelがあれば移行
-    if ACCOUNT_FILE.exists():
-        try:
-            df = pd.read_excel(ACCOUNT_FILE, sheet_name="ログインアカウント")
-        except Exception:
-            df = pd.DataFrame(columns=ACCOUNT_COLUMNS)
-        df = normalize_accounts_df(df)
-        if not df.empty:
-            save_sqlite_table(df, SQLITE_TABLE_ACCOUNTS, ACCOUNT_COLUMNS, unique_cols=["ログインID"])
+    try:
+        if sqlite_table_row_count(SQLITE_TABLE_ACCOUNTS) > 0:
             return
+    except Exception:
+        pass
 
-    # 何もなければ初期アカウントを作成
-    df = pd.DataFrame(default_account_rows(), columns=ACCOUNT_COLUMNS)
-    save_sqlite_table(df, SQLITE_TABLE_ACCOUNTS, ACCOUNT_COLUMNS, unique_cols=["ログインID"])
+    # 旧Excelがあれば移行を試みる。失敗しても止めない。
+    try:
+        if ACCOUNT_FILE.exists():
+            try:
+                df = pd.read_excel(ACCOUNT_FILE, sheet_name="ログインアカウント")
+            except Exception:
+                df = pd.DataFrame(columns=ACCOUNT_COLUMNS)
+            df = normalize_accounts_df(df)
+            if not df.empty:
+                save_sqlite_table(df, SQLITE_TABLE_ACCOUNTS, ACCOUNT_COLUMNS, unique_cols=["ログインID"])
+                return
+    except Exception as e:
+        try:
+            _mark_sqlite_backup_error(e, "ensure_account_file_excel")
+        except Exception:
+            pass
+
+    # 何もなければ初期アカウントを作成。SQLite保存に失敗してもログイン自体は継続可能。
+    try:
+        df = pd.DataFrame(default_account_rows(), columns=ACCOUNT_COLUMNS)
+        save_sqlite_table(df, SQLITE_TABLE_ACCOUNTS, ACCOUNT_COLUMNS, unique_cols=["ログインID"])
+    except Exception as e:
+        try:
+            _mark_sqlite_backup_error(e, "ensure_account_file_default")
+        except Exception:
+            pass
 
 
 def load_accounts():
-    ensure_account_file()
-    df = load_sqlite_table(SQLITE_TABLE_ACCOUNTS, ACCOUNT_COLUMNS)
-    return normalize_accounts_df(df)
+    """
+    アカウント読込。
+    SQLite補助DBのエラーや空データでログイン不能にならないよう、最後はdefault_account_rowsへフォールバックする。
+    """
+    try:
+        ensure_account_file()
+    except Exception as e:
+        try:
+            _mark_sqlite_backup_error(e, "load_accounts.ensure")
+        except Exception:
+            pass
+
+    try:
+        df = load_sqlite_table(SQLITE_TABLE_ACCOUNTS, ACCOUNT_COLUMNS)
+        df = normalize_accounts_df(df)
+        if df is not None and not df.empty:
+            return df
+    except Exception as e:
+        try:
+            _mark_sqlite_backup_error(e, "load_accounts")
+            _show_sqlite_backup_warning_once(e, "login_accounts")
+        except Exception:
+            pass
+
+    # 最終フォールバック：初期ログインを必ず維持する
+    try:
+        return normalize_accounts_df(pd.DataFrame(default_account_rows(), columns=ACCOUNT_COLUMNS))
+    except Exception:
+        return pd.DataFrame(default_account_rows())
 
 
 def save_accounts(df):
-    work = normalize_accounts_df(df)
-    save_sqlite_table(work, SQLITE_TABLE_ACCOUNTS, ACCOUNT_COLUMNS, unique_cols=["ログインID"])
+    try:
+        work = normalize_accounts_df(df)
+        return save_sqlite_table(work, SQLITE_TABLE_ACCOUNTS, ACCOUNT_COLUMNS, unique_cols=["ログインID"])
+    except Exception as e:
+        try:
+            _mark_sqlite_backup_error(e, "save_accounts")
+        except Exception:
+            pass
+        return False
 
 
 def ensure_login_history_file():
     """
     ログイン履歴をSQLiteで管理する。
-    既存の login_history.xlsx がある場合は初回のみSQLiteへ移行し、
-    以後はSQLiteを正とする。
+    SQLite補助DBの不調でログイン処理を止めない。
     """
-    ensure_dirs()
+    try:
+        ensure_dirs()
+    except Exception:
+        pass
 
-    if sqlite_table_row_count(SQLITE_TABLE_LOGIN_HISTORY) > 0:
-        return
-
-    if LOGIN_HISTORY_FILE.exists():
-        try:
-            df = pd.read_excel(LOGIN_HISTORY_FILE, sheet_name="ログイン履歴")
-        except Exception:
-            df = pd.DataFrame(columns=LOGIN_HISTORY_COLUMNS)
-        for col in LOGIN_HISTORY_COLUMNS:
-            if col not in df.columns:
-                df[col] = ""
-        df = df[LOGIN_HISTORY_COLUMNS].copy()
-        if not df.empty:
-            save_sqlite_table(df, SQLITE_TABLE_LOGIN_HISTORY, LOGIN_HISTORY_COLUMNS, sort_cols=["日時"])
+    try:
+        if sqlite_table_row_count(SQLITE_TABLE_LOGIN_HISTORY) > 0:
             return
+    except Exception:
+        pass
 
-    save_sqlite_table(pd.DataFrame(columns=LOGIN_HISTORY_COLUMNS), SQLITE_TABLE_LOGIN_HISTORY, LOGIN_HISTORY_COLUMNS, sort_cols=["日時"])
+    try:
+        if LOGIN_HISTORY_FILE.exists():
+            try:
+                df = pd.read_excel(LOGIN_HISTORY_FILE, sheet_name="ログイン履歴")
+            except Exception:
+                df = pd.DataFrame(columns=LOGIN_HISTORY_COLUMNS)
+            for col in LOGIN_HISTORY_COLUMNS:
+                if col not in df.columns:
+                    df[col] = ""
+            df = df[LOGIN_HISTORY_COLUMNS].copy()
+            if not df.empty:
+                save_sqlite_table(df, SQLITE_TABLE_LOGIN_HISTORY, LOGIN_HISTORY_COLUMNS, sort_cols=["日時"])
+                return
+    except Exception as e:
+        try:
+            _mark_sqlite_backup_error(e, "ensure_login_history_file_excel")
+        except Exception:
+            pass
+
+    try:
+        save_sqlite_table(pd.DataFrame(columns=LOGIN_HISTORY_COLUMNS), SQLITE_TABLE_LOGIN_HISTORY, LOGIN_HISTORY_COLUMNS, sort_cols=["日時"])
+    except Exception as e:
+        try:
+            _mark_sqlite_backup_error(e, "ensure_login_history_file_empty")
+        except Exception:
+            pass
 
 
 def load_login_history():
-    ensure_login_history_file()
-    df = load_sqlite_table(SQLITE_TABLE_LOGIN_HISTORY, LOGIN_HISTORY_COLUMNS)
+    try:
+        ensure_login_history_file()
+        df = load_sqlite_table(SQLITE_TABLE_LOGIN_HISTORY, LOGIN_HISTORY_COLUMNS)
+    except Exception as e:
+        try:
+            _mark_sqlite_backup_error(e, "load_login_history")
+        except Exception:
+            pass
+        df = pd.DataFrame(columns=LOGIN_HISTORY_COLUMNS)
+
     for col in LOGIN_HISTORY_COLUMNS:
         if col not in df.columns:
             df[col] = ""
@@ -3864,29 +3993,42 @@ def load_login_history():
 
 
 def save_login_history(df):
-    work = df.copy()
-    for col in LOGIN_HISTORY_COLUMNS:
-        if col not in work.columns:
-            work[col] = ""
-    work = work[LOGIN_HISTORY_COLUMNS]
-    save_sqlite_table(work, SQLITE_TABLE_LOGIN_HISTORY, LOGIN_HISTORY_COLUMNS, sort_cols=["日時"])
+    try:
+        work = df.copy()
+        for col in LOGIN_HISTORY_COLUMNS:
+            if col not in work.columns:
+                work[col] = ""
+        work = work[LOGIN_HISTORY_COLUMNS]
+        return save_sqlite_table(work, SQLITE_TABLE_LOGIN_HISTORY, LOGIN_HISTORY_COLUMNS, sort_cols=["日時"])
+    except Exception as e:
+        try:
+            _mark_sqlite_backup_error(e, "save_login_history")
+        except Exception:
+            pass
+        return False
 
 
 def add_login_history(login_id, label, role, result, memo=""):
-    df = load_login_history()
-    row = {
-        "日時": format_now_jst("%Y-%m-%d %H:%M:%S"),
-        "ログインID": clean_text(login_id).lower(),
-        "表示名": clean_text(label),
-        "権限": clean_text(role),
-        "結果": clean_text(result),
-        "メモ": clean_text(memo),
-    }
-    df = pd.concat([df, pd.DataFrame([row], columns=LOGIN_HISTORY_COLUMNS)], ignore_index=True)
-    # 履歴が大きくなりすぎないよう、直近1000件まで保持
-    if len(df) > 1000:
-        df = df.tail(1000)
-    save_login_history(df)
+    """ログイン履歴追加。履歴保存に失敗してもログイン処理を止めない。"""
+    try:
+        df = load_login_history()
+        row = {
+            "日時": format_now_jst("%Y-%m-%d %H:%M:%S"),
+            "ログインID": clean_text(login_id).lower(),
+            "表示名": clean_text(label),
+            "権限": clean_text(role),
+            "結果": clean_text(result),
+            "メモ": clean_text(memo),
+        }
+        df = pd.concat([df, pd.DataFrame([row], columns=LOGIN_HISTORY_COLUMNS)], ignore_index=True)
+        if len(df) > 1000:
+            df = df.tail(1000)
+        save_login_history(df)
+    except Exception as e:
+        try:
+            _mark_sqlite_backup_error(e, "add_login_history")
+        except Exception:
+            pass
 
 
 def account_requires_password_change(account_row) -> bool:
