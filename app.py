@@ -864,6 +864,11 @@ def _mark_sqlite_backup_error(e, table_name=""):
 
 def _show_sqlite_backup_warning_once(e, table_name=""):
     try:
+        # 復元処理中は、監査ログ・権限・履歴テーブルの再初期化失敗を
+        # 画面上の「エラー」に見せない。復元本体は別メッセージで結果表示する。
+        if st.session_state.get("restore_suppress_sqlite_aux_warnings"):
+            st.session_state[f"sqlite_backup_warning_suppressed_{table_name}"] = str(e)
+            return
         key = f"sqlite_backup_warning_shown_{table_name}"
         if not st.session_state.get(key):
             st.warning(
@@ -2615,9 +2620,58 @@ def get_restore_zip_diagnostic(uploaded_file) -> pd.DataFrame:
             pass
     return pd.DataFrame(rows)
 
+
+def _post_restore_initialize_aux_tables_quietly() -> list:
+    """
+    復元後の補助テーブル再初期化を静かに行う。
+    SQLite DB本体を復元した直後は、監査ログ・権限・バックアップ履歴の保存で
+    一時的に失敗することがあるため、画面には警告を出さず、内部メモだけ残す。
+    """
+    messages = []
+    try:
+        initialize_sqlite_engine()
+        messages.append("SQLiteエンジン再初期化OK")
+    except Exception as e:
+        messages.append(f"SQLiteエンジン再初期化は保留: {e}")
+    try:
+        ensure_security_tables()
+        messages.append("セキュリティ補助テーブル確認OK")
+    except Exception as e:
+        messages.append(f"セキュリティ補助テーブル確認は保留: {e}")
+    try:
+        initialize_default_app_settings()
+        messages.append("設定テーブル確認OK")
+    except Exception as e:
+        messages.append(f"設定テーブル確認は保留: {e}")
+    return messages
+
+
+def _safe_add_restore_audit_and_history(restore_zip_path: Path, summary_text: str, pre_backup: Path = None):
+    """
+    復元完了後の監査ログ・履歴保存。
+    ここで失敗しても復元本体を失敗扱いにしない。
+    """
+    notes = []
+    try:
+        add_audit_log("データ復元", "restore", restore_zip_path.name, f"復元対象：{summary_text}")
+        notes.append("監査ログ記録OK")
+    except Exception as e:
+        notes.append(f"監査ログ記録は保留: {e}")
+    try:
+        record_backup_history("復元", restore_zip_path, "成功", f"復元対象：{summary_text}")
+        notes.append("バックアップ履歴記録OK")
+    except Exception as e:
+        notes.append(f"バックアップ履歴記録は保留: {e}")
+    return notes
+
 def restore_from_backup_zip(uploaded_file, restore_sqlite=True, restore_files=True, restore_supabase=False):
     """
     バックアップZIPから復元する。管理者のみ。
+
+    Ver4.8.7 復元後の警告表示安全化:
+    - SQLite DB復元直後の監査ログ/権限/バックアップ履歴テーブル初期化失敗を画面上のエラー風警告にしない
+    - 復元本体（SQLite/Supabase/写真/帳票）が成功していれば、結果を成功として返す
+    - 復元後に可能な範囲でSQLite安全再初期化・セキュリティテーブル再作成を行う
 
     Ver4.8.6:
     - Ver4.8.5完全バックアップZIPの新パスに対応
@@ -2638,6 +2692,11 @@ def restore_from_backup_zip(uploaded_file, restore_sqlite=True, restore_files=Tr
         return False, f"復元前バックアップに失敗しました：{pre_err}"
 
     restore_summary = []
+    restore_notes = []
+
+    # 復元中はSQLite補助テーブルの警告を抑制し、復元結果メッセージへ集約する。
+    previous_suppress = bool(st.session_state.get("restore_suppress_sqlite_aux_warnings", False))
+    st.session_state["restore_suppress_sqlite_aux_warnings"] = True
 
     try:
         filename = clean_text(getattr(uploaded_file, "name", "restore.zip"), "restore.zip")
@@ -2672,13 +2731,32 @@ def restore_from_backup_zip(uploaded_file, restore_sqlite=True, restore_files=Tr
         except Exception:
             pass
 
+        # 復元後に、補助テーブルを可能な範囲で静かに整える。
+        restore_notes.extend(_post_restore_initialize_aux_tables_quietly())
+
+        try:
+            clear_hidamari_read_cache("バックアップ復元")
+        except Exception:
+            pass
+
         summary_text = "、".join(restore_summary) if restore_summary else "復元対象なし"
-        add_audit_log("データ復元", "restore", restore_zip_path.name, f"復元対象：{summary_text}")
-        record_backup_history("復元", restore_zip_path, "成功", f"復元対象：{summary_text}")
-        return True, f"復元しました。対象：{summary_text}。復元前バックアップも作成済みです：{pre_backup.name if pre_backup else ''}"
+        restore_notes.extend(_safe_add_restore_audit_and_history(restore_zip_path, summary_text, pre_backup))
+
+        note_text = " / ".join([n for n in restore_notes if n])
+        note_suffix = f" 補足：{note_text}" if note_text else ""
+        return True, f"復元しました。対象：{summary_text}。復元前バックアップも作成済みです：{pre_backup.name if pre_backup else ''}。{note_suffix}"
     except Exception as e:
-        add_audit_log("データ復元失敗", "restore", "", str(e))
+        try:
+            # 失敗ログも、ここで失敗して復元エラーを上書きしない。
+            add_audit_log("データ復元失敗", "restore", "", str(e))
+        except Exception:
+            pass
         return False, f"復元に失敗しました：{e}"
+    finally:
+        try:
+            st.session_state["restore_suppress_sqlite_aux_warnings"] = previous_suppress
+        except Exception:
+            pass
 
 # =========================
 # 起動時DB安全チェック・異常時復元（Ver4.8）
