@@ -579,32 +579,106 @@ def _df_to_supabase_payload(df: pd.DataFrame, table_name: str, unique_cols=None)
     return list(dedup.values())
 
 
-def supabase_read_table(table_name: str, columns=None) -> pd.DataFrame:
-    if not supabase_is_enabled() or table_name not in SUPABASE_CORE_TABLES:
-        return _original_load_sqlite_table(table_name, columns or [])
+# =========================
+# Supabase読込の軽量化（Ver4.8）
+# =========================
+# 目的：
+# - 毎回全件を読みに行かない
+# - 今日〜直近7日など、画面表示に必要な期間だけ読む
+# - 同じ条件の読込は30〜60秒キャッシュする
+# - 保存・削除後は clear_hidamari_read_cache() でキャッシュを消す
+DEFAULT_QUERY_CACHE_TTL_SEC = 60
+DEFAULT_RECENT_DAYS = 7
+
+def _date_to_iso(value):
+    if value in [None, ""]:
+        return ""
     try:
-        url = _supabase_endpoint(table_name, "?select=record_key,data,updated_at&order=updated_at.desc")
-        res = requests.get(url, headers=_supabase_headers(prefer=""), timeout=20)
-        res.raise_for_status()
-        rows = res.json() or []
-        data_rows = []
-        for item in rows:
-            data = item.get("data") or {}
-            if isinstance(data, dict):
-                data_rows.append(data)
-        df = pd.DataFrame(data_rows)
-        if columns:
-            for col in columns:
-                if col not in df.columns:
-                    df[col] = ""
-            df = df[columns]
+        dt = pd.to_datetime(value, errors="coerce")
+        if pd.isna(dt):
+            return ""
+        return dt.strftime("%Y-%m-%d")
+    except Exception:
+        return ""
+
+def recent_start_date(days=DEFAULT_RECENT_DAYS, base_date=None):
+    base = base_date or today_jst()
+    try:
+        return base - timedelta(days=max(int(days), 1) - 1)
+    except Exception:
+        return today_jst() - timedelta(days=DEFAULT_RECENT_DAYS - 1)
+
+def _normalize_supabase_df_from_rows(rows, columns=None):
+    data_rows = []
+    for item in rows or []:
+        data = item.get("data") or {}
+        if isinstance(data, dict):
+            data_rows.append(data)
+    df = pd.DataFrame(data_rows)
+    if columns:
+        for col in columns:
+            if col not in df.columns:
+                df[col] = ""
+        df = df[list(columns)]
+    return df
+
+def _filter_df_by_date_range(df, date_col, start_date=None, end_date=None):
+    if df is None or df.empty or not date_col or date_col not in df.columns:
+        return df
+    start_iso = _date_to_iso(start_date)
+    end_iso = _date_to_iso(end_date)
+    if not start_iso and not end_iso:
+        return df
+    work = df.copy()
+    work[date_col] = pd.to_datetime(work[date_col], errors="coerce")
+    if start_iso:
+        start_dt = pd.to_datetime(start_iso, errors="coerce")
+        if not pd.isna(start_dt):
+            work = work[work[date_col].dt.date >= start_dt.date()]
+    if end_iso:
+        end_dt = pd.to_datetime(end_iso, errors="coerce")
+        if not pd.isna(end_dt):
+            work = work[work[date_col].dt.date <= end_dt.date()]
+    return work
+
+@cache_safe_master_read(ttl=DEFAULT_QUERY_CACHE_TTL_SEC)
+def _supabase_read_table_cached(table_name: str, columns_tuple=(), date_field: str = "", start_iso: str = "", end_iso: str = "", limit: int = 0) -> pd.DataFrame:
+    # PostgRESTのJSONBフィルタで data->>記録日 / data->>日付 を絞る。
+    params = [("select", "record_key,data,updated_at")]
+    if date_field and start_iso:
+        params.append((f"data->>{date_field}", f"gte.{start_iso}"))
+    if date_field and end_iso:
+        params.append((f"data->>{date_field}", f"lte.{end_iso}"))
+    params.append(("order", "updated_at.desc"))
+    if limit and int(limit) > 0:
+        params.append(("limit", str(int(limit))))
+
+    res = requests.get(
+        _supabase_endpoint(table_name),
+        headers=_supabase_headers(prefer=""),
+        params=params,
+        timeout=20,
+    )
+    res.raise_for_status()
+    return _normalize_supabase_df_from_rows(res.json() or [], list(columns_tuple))
+
+def supabase_read_table(table_name: str, columns=None, date_field: str = "", start_date=None, end_date=None, limit: int = 0) -> pd.DataFrame:
+    if not supabase_is_enabled() or table_name not in SUPABASE_CORE_TABLES:
+        df = _original_load_sqlite_table(table_name, columns or [])
+        return _filter_df_by_date_range(df, date_field, start_date, end_date)
+    try:
+        columns_tuple = tuple(columns or [])
+        start_iso = _date_to_iso(start_date)
+        end_iso = _date_to_iso(end_date)
+        df = _supabase_read_table_cached(table_name, columns_tuple, date_field or "", start_iso, end_iso, int(limit or 0))
 
         # Supabase正本化直後の安全措置：
         # Supabase側が空で、SQLiteミラー側に旧データがある場合はSQLiteを返す。
-        # ensure_hidamari_db() の保存処理で、その後Supabaseへupsert移行される。
+        # 期間指定がある場合はSQLite側も同じ期間に絞る。
         if df.empty:
             try:
                 local_df = _original_load_sqlite_table(table_name, columns or [])
+                local_df = _filter_df_by_date_range(local_df, date_field, start_date, end_date)
                 if local_df is not None and not local_df.empty:
                     return local_df
             except Exception:
@@ -616,7 +690,8 @@ def supabase_read_table(table_name: str, columns=None) -> pd.DataFrame:
         except Exception:
             pass
         try:
-            return _original_load_sqlite_table(table_name, columns or [])
+            df = _original_load_sqlite_table(table_name, columns or [])
+            return _filter_df_by_date_range(df, date_field, start_date, end_date)
         except Exception as e2:
             try:
                 _mark_sqlite_backup_error(e2, table_name)
@@ -644,6 +719,10 @@ def supabase_upsert_table(df: pd.DataFrame, table_name: str, columns=None, uniqu
             chunk = payload[i:i + 300]
             post_res = requests.post(post_url, headers=headers, json=chunk, timeout=30)
             post_res.raise_for_status()
+        try:
+            clear_hidamari_read_cache(f"Supabase保存:{table_name}")
+        except Exception:
+            pass
         return True
     except Exception as e:
         try:
@@ -4590,10 +4669,17 @@ def ensure_health_file():
     )
 
 
-def load_health_data():
-    """健康チェックをSQLiteから読み込む。"""
+def load_health_data(start_date=None, end_date=None, recent_days=None):
+    """健康チェックを読み込む。start_date/end_date指定時はSupabase側で期間を絞って高速化する。"""
     ensure_health_file()
-    df = load_sqlite_table(SQLITE_TABLE_HEALTH, HEALTH_COLUMNS, date_cols=["記録日"])
+    if recent_days and start_date is None and end_date is None:
+        start_date = recent_start_date(recent_days)
+        end_date = today_jst()
+    if supabase_is_enabled():
+        df = supabase_read_table(SQLITE_TABLE_HEALTH, HEALTH_COLUMNS, date_field="記録日", start_date=start_date, end_date=end_date)
+    else:
+        df = load_sqlite_table(SQLITE_TABLE_HEALTH, HEALTH_COLUMNS, date_cols=["記録日"])
+        df = _filter_df_by_date_range(df, "記録日", start_date, end_date)
     df = attach_user_ids(df)
 
     if not df.empty:
@@ -4624,6 +4710,7 @@ def save_health_data(df):
         date_cols=["記録日"],
         unique_cols=["記録日", "利用者名"],
     )
+    clear_hidamari_read_cache("健康チェック保存")
 
 
 def find_health_index(df, record_date, user_name):
@@ -4731,10 +4818,17 @@ def normalize_excretion_record(record):
     return record
 
 
-def load_excretion_data():
-    """排泄チェックをSQLiteから読み込む。"""
+def load_excretion_data(start_date=None, end_date=None, recent_days=None):
+    """排泄チェックを読み込む。start_date/end_date指定時はSupabase側で期間を絞って高速化する。"""
     ensure_excretion_file()
-    df = load_sqlite_table(SQLITE_TABLE_EXCRETION, EXCRETION_COLUMNS, date_cols=["記録日"])
+    if recent_days and start_date is None and end_date is None:
+        start_date = recent_start_date(recent_days)
+        end_date = today_jst()
+    if supabase_is_enabled():
+        df = supabase_read_table(SQLITE_TABLE_EXCRETION, EXCRETION_COLUMNS, date_field="記録日", start_date=start_date, end_date=end_date)
+    else:
+        df = load_sqlite_table(SQLITE_TABLE_EXCRETION, EXCRETION_COLUMNS, date_cols=["記録日"])
+        df = _filter_df_by_date_range(df, "記録日", start_date, end_date)
 
     if not df.empty:
         df["記録日"] = pd.to_datetime(df["記録日"], errors="coerce")
@@ -4775,6 +4869,7 @@ def save_excretion_data(df):
         date_cols=["記録日"],
         unique_cols=["記録日", "利用者名", "時間帯"],
     )
+    clear_hidamari_read_cache("排泄チェック保存")
 
 
 def find_excretion_index(df, record_date, user_name, slot):
@@ -6610,10 +6705,17 @@ def ensure_business_handover_file():
     )
 
 
-def load_business_handover_data():
-    """業務全体申し送りをSQLiteから読み込む。"""
+def load_business_handover_data(start_date=None, end_date=None, recent_days=None):
+    """業務全体申し送りを読み込む。期間指定時はSupabase側で絞って高速化する。"""
     ensure_business_handover_file()
-    df = load_sqlite_table(SQLITE_TABLE_HANDOVER, BUSINESS_HANDOVER_COLUMNS, date_cols=["日付"])
+    if recent_days and start_date is None and end_date is None:
+        start_date = recent_start_date(recent_days)
+        end_date = today_jst()
+    if supabase_is_enabled():
+        df = supabase_read_table(SQLITE_TABLE_HANDOVER, BUSINESS_HANDOVER_COLUMNS, date_field="日付", start_date=start_date, end_date=end_date)
+    else:
+        df = load_sqlite_table(SQLITE_TABLE_HANDOVER, BUSINESS_HANDOVER_COLUMNS, date_cols=["日付"])
+        df = _filter_df_by_date_range(df, "日付", start_date, end_date)
 
     if not df.empty:
         df["日付"] = pd.to_datetime(df["日付"], errors="coerce")
@@ -6643,6 +6745,7 @@ def save_business_handover_data(df):
         unique_cols=["記録ID"],
         sort_cols=["記録日時"],
     )
+    clear_hidamari_read_cache("申し送り保存")
     add_audit_log("保存", SQLITE_TABLE_HANDOVER, "", "業務全体申し送りを保存しました")
 
 
@@ -9193,13 +9296,20 @@ def save_short_goal_master(df):
     add_audit_log("保存", SQLITE_TABLE_SHORT_GOAL_MASTER, "", "短期目標マスタを保存しました")
 
 
-def load_short_goal_checks():
+def load_short_goal_checks(start_date=None, end_date=None, recent_days=None):
     ensure_short_goal_files()
-    df = load_sqlite_table(
-        SQLITE_TABLE_SHORT_GOAL_CHECKS,
-        SHORT_GOAL_CHECK_COLUMNS,
-        date_cols=["日付"],
-    )
+    if recent_days and start_date is None and end_date is None:
+        start_date = recent_start_date(recent_days)
+        end_date = today_jst()
+    if supabase_is_enabled():
+        df = supabase_read_table(SQLITE_TABLE_SHORT_GOAL_CHECKS, SHORT_GOAL_CHECK_COLUMNS, date_field="日付", start_date=start_date, end_date=end_date)
+    else:
+        df = load_sqlite_table(
+            SQLITE_TABLE_SHORT_GOAL_CHECKS,
+            SHORT_GOAL_CHECK_COLUMNS,
+            date_cols=["日付"],
+        )
+        df = _filter_df_by_date_range(df, "日付", start_date, end_date)
     return attach_user_ids(df)
 
 
@@ -9213,6 +9323,7 @@ def save_short_goal_checks(df):
         date_cols=["日付"],
         unique_cols=["記録ID"],
     )
+    clear_hidamari_read_cache("短期目標実施チェック保存")
     add_audit_log("保存", SQLITE_TABLE_SHORT_GOAL_CHECKS, "", "短期目標実施記録を保存しました")
 
 
@@ -12598,8 +12709,11 @@ def show_structured_insight_menu():
         st.warning("開始日が終了日より後になっています。日付を入れ替えて分析します。")
         start_day, end_day = end_day, start_day
 
-    health_df = load_health_data()
-    ex_df = load_excretion_data()
+    # ダッシュボードは確認日前後の直近データだけを読む（全件取得しない）
+    dash_start = target_date - timedelta(days=14)
+    dash_end = target_date
+    health_df = load_health_data(start_date=dash_start, end_date=dash_end)
+    ex_df = load_excretion_data(start_date=dash_start, end_date=dash_end)
     handover_df = load_business_handover_data() if 'load_business_handover_data' in globals() else read_excel_safe(HANDOVER_FILE, BUSINESS_HANDOVER_COLUMNS)
     goal_df = load_short_goal_checks()
 
@@ -15207,7 +15321,8 @@ elif menu == "健康チェック入力":
     with col3:
         input_staff = st.text_input("入力者", placeholder="例：藤野", key="health_staff")
 
-    health_df = load_health_data()
+    # 入力画面では選択日の前後だけ読む。既存データ確認のために全件取得しない。
+    health_df = load_health_data(start_date=record_date, end_date=record_date)
     idx = find_health_index(health_df, record_date, user_name)
 
     if idx is None:
@@ -15645,7 +15760,8 @@ elif menu == "過去データ管理":
         st.subheader("健康チェックデータ")
         st.caption("健康チェックデータを、記録日＋利用者名で検索・更新・削除します。")
 
-        health_df = load_health_data()
+        # 過去データ管理の初期表示は直近7日だけ読む。一覧検索では選択月だけ読み直す。
+        health_df = load_health_data(recent_days=7)
 
         if health_df.empty:
             st.info("まだ健康チェックデータがありません。")
@@ -15748,12 +15864,14 @@ elif menu == "過去データ管理":
             st.divider()
             st.subheader("一覧検索")
 
-            health_df = load_health_data()
             if not health_df.empty:
-                health_df["記録日"] = pd.to_datetime(health_df["記録日"], errors="coerce")
                 year = st.number_input("年", min_value=2024, max_value=2035, value=today_jst().year, step=1, key="past_health_year")
                 month = st.number_input("月", min_value=1, max_value=12, value=today_jst().month, step=1, key="past_health_month")
                 user_filter = st.selectbox("利用者で絞り込み", ["全員"] + all_users, key="past_health_filter_user")
+                month_start = date(int(year), int(month), 1)
+                month_end = (month_start.replace(day=28) + timedelta(days=4)).replace(day=1) - timedelta(days=1)
+                health_df = load_health_data(start_date=month_start, end_date=month_end)
+                health_df["記録日"] = pd.to_datetime(health_df["記録日"], errors="coerce")
 
                 result = health_df[
                     (health_df["記録日"].dt.year == int(year))
@@ -15781,10 +15899,10 @@ elif menu == "過去データ管理":
         target_day = st.date_input("確認日", value=today_jst(), key="past_input_status_date")
         user_filter = st.selectbox("利用者で絞り込み", ["全員"] + all_users, key="past_input_status_user")
 
-        health_df = load_health_data()
-        ex_df = load_excretion_data()
+        health_df = load_health_data(start_date=target_day, end_date=target_day)
+        ex_df = load_excretion_data(start_date=target_day, end_date=target_day)
         goal_check_df = load_short_goal_check_data() if "load_short_goal_check_data" in globals() else pd.DataFrame(columns=SHORT_GOAL_CHECK_COLUMNS)
-        handover_df = load_business_handover_data()
+        handover_df = load_business_handover_data(start_date=target_day, end_date=target_day)
 
         if not health_df.empty:
             health_df["記録日"] = pd.to_datetime(health_df["記録日"], errors="coerce")
@@ -16238,8 +16356,10 @@ elif menu == "家族向けレポート作成":
     with col3:
         report_month = st.number_input("対象月", min_value=1, max_value=12, value=today_jst().month, step=1)
 
-    health_df = load_health_data()
-    ex_df = load_excretion_data()
+    report_start = date(int(report_year), int(report_month), 1)
+    report_end = (report_start.replace(day=28) + timedelta(days=4)).replace(day=1) - timedelta(days=1)
+    health_df = load_health_data(start_date=report_start, end_date=report_end)
+    ex_df = load_excretion_data(start_date=report_start, end_date=report_end)
 
     report_text = create_family_summary_text(health_df, ex_df, report_user, report_year, report_month)
     st.text_area("家族向け文章", value=report_text, height=420)
@@ -16276,7 +16396,9 @@ elif menu == "ひだまりレポートPDF":
 
     if st.button("ひだまりレポートPDFを作成する"):
         try:
-            path = create_hidamari_pdf(load_health_data(), load_excretion_data(), pdf_user, pdf_year, pdf_month)
+            pdf_start = date(int(pdf_year), int(pdf_month), 1)
+            pdf_end = (pdf_start.replace(day=28) + timedelta(days=4)).replace(day=1) - timedelta(days=1)
+            path = create_hidamari_pdf(load_health_data(start_date=pdf_start, end_date=pdf_end), load_excretion_data(start_date=pdf_start, end_date=pdf_end), pdf_user, pdf_year, pdf_month)
             with open(path, "rb") as f:
                 st.download_button(
                     "PDFをダウンロード",
