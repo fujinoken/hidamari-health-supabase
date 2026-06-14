@@ -12498,22 +12498,141 @@ def show_admin_backup_download():
 # レポート系
 # =========================
 def create_family_summary_text(health_df, excretion_df, user_name, year, month):
+    """
+    家族向け・管理者確認向けの月間文章を作成する。
+
+    Ver4.8.3:
+    - 1件だけを拾って終わらないよう、対象月の全健康記録・全排泄記録を確認する。
+    - 気になる記録がある場合は日付ごとに列挙する。
+    - 気になる記録がない場合も「確認されませんでした」と明記する。
+    - 医療判断ではなく、記録整理・継続確認点として表現する。
+    """
     target = get_month_health_data(health_df, user_name, year, month)
     ex_target = get_month_excretion_data(excretion_df, user_name, year, month)
 
+    def _fmt_date(value):
+        try:
+            dt = pd.to_datetime(value, errors="coerce")
+            if pd.isna(dt):
+                return "日付不明"
+            return dt.strftime("%m/%d")
+        except Exception:
+            return "日付不明"
+
+    def _clean(value):
+        try:
+            if pd.isna(value):
+                return ""
+        except Exception:
+            pass
+        text = str(value).strip()
+        if text.lower() in ["nan", "none", "nat"]:
+            return ""
+        return text
+
+    def _short(value, limit=80):
+        text = _clean(value).replace("\n", " ")
+        return text[:limit] + ("…" if len(text) > limit else "")
+
+    def _num(value):
+        try:
+            return float(value)
+        except Exception:
+            try:
+                s = _clean(value).replace("％", "").replace("%", "")
+                return float(s) if s else None
+            except Exception:
+                return None
+
+    def _record_alerts_from_health_row(row):
+        """健康チェック1行から、家族向けに強すぎない確認ポイントを作る。"""
+        alerts = []
+        temp = _num(row.get("体温", ""))
+        spo2 = _num(row.get("SpO2", ""))
+        bp_high = _num(row.get("血圧上", ""))
+        bp_low = _num(row.get("血圧下", ""))
+        pulse = _num(row.get("脈拍", ""))
+        water = _num(row.get("水分摂取量ml", ""))
+
+        if temp is not None and temp >= 37.5:
+            alerts.append(f"体温{temp:g}℃")
+        if spo2 is not None and spo2 <= 93:
+            alerts.append(f"SpO2 {spo2:g}％")
+        if bp_high is not None and bp_high >= 160:
+            alerts.append(f"血圧上{bp_high:g}")
+        if bp_low is not None and bp_low >= 100:
+            alerts.append(f"血圧下{bp_low:g}")
+        if pulse is not None and (pulse >= 100 or pulse <= 50):
+            alerts.append(f"脈拍{pulse:g}")
+        if water is not None and 0 < water < 800:
+            alerts.append(f"水分摂取量{water:g}ml")
+
+        for meal_col in ["朝食摂取率", "昼食摂取率", "夕食摂取率"]:
+            meal = _num(row.get(meal_col, ""))
+            if meal is not None and meal <= 50:
+                alerts.append(f"{meal_col.replace('摂取率', '')}{meal:g}％")
+
+        nutrition = _clean(row.get("栄養リスク", ""))
+        if nutrition and not nutrition.startswith("0") and nutrition not in ["通常"]:
+            alerts.append(f"栄養リスク：{_short(nutrition, 30)}")
+
+        oral = _clean(row.get("口腔状態", ""))
+        if oral and not oral.startswith("0") and oral not in ["通常"]:
+            alerts.append(f"口腔状態：{_short(oral, 30)}")
+
+        denture = _clean(row.get("義歯使用", ""))
+        if denture and ("不具合" in denture or denture.startswith("2")):
+            alerts.append(f"義歯：{_short(denture, 30)}")
+
+        family_memo = _clean(row.get("家族共有メモ", ""))
+        if family_memo:
+            alerts.append(f"家族共有メモ「{_short(family_memo)}」")
+
+        change = _clean(row.get("気になる変化", ""))
+        if change:
+            alerts.append(f"気になる変化「{_short(change)}」")
+
+        return alerts
+
+    def _record_alerts_from_excretion_row(row):
+        alerts = []
+        slot = _clean(row.get("時間帯", ""))
+        prefix = f"{slot}：" if slot else ""
+        urine_type = _clean(row.get("尿性状", ""))
+        stool_type = _clean(row.get("便性状", ""))
+        stool_amount = _clean(row.get("便量", ""))
+        ex_memo = _clean(row.get("排泄メモ", ""))
+
+        if urine_type == "濃縮尿":
+            alerts.append(prefix + "濃縮尿")
+        if stool_type in ["下痢便", "水様便"]:
+            alerts.append(prefix + stool_type)
+        if stool_amount and stool_amount != "なし" and stool_type and stool_type != "普通便":
+            text = prefix + f"便量{stool_amount}・{stool_type}"
+            if text not in alerts:
+                alerts.append(text)
+        if ex_memo:
+            alerts.append(prefix + f"排泄メモ「{_short(ex_memo)}」")
+        return alerts
+
     lines = []
+    lines.append(f"【対象期間の全体確認】\n{user_name}の{year}年{month}月の記録全体を確認しました。")
+    lines.append("この文章は医療的な判断ではなく、日々の記録をもとにした共有・確認用の整理です。")
 
+    # 健康チェックの概要
     if target.empty:
-        lines.append(f"{user_name}の{year}年{month}月分の健康チェック記録は、現時点では登録されていません。")
+        lines.append(f"【数値から見た状態】\n{user_name}の{year}年{month}月分の健康チェック記録は、現時点では登録されていません。")
     else:
-        lines.append(
-            f"{user_name}の{year}年{month}月の健康チェック記録は、{len(target)}件確認されています。"
-            "この文章は医療的な判断ではなく、日々の記録をもとにした共有です。"
-        )
+        try:
+            target = target.copy()
+            target["記録日"] = pd.to_datetime(target["記録日"], errors="coerce")
+            target = target.sort_values("記録日")
+        except Exception:
+            pass
 
-        temp_mean = to_number(target["体温"]).mean()
-        spo2_mean = to_number(target["SpO2"]).mean()
-        weight_mean = to_number(target["体重"]).mean()
+        temp_mean = to_number(target["体温"]).mean() if "体温" in target.columns else pd.NA
+        spo2_mean = to_number(target["SpO2"]).mean() if "SpO2" in target.columns else pd.NA
+        weight_mean = to_number(target["体重"]).mean() if "体重" in target.columns else pd.NA
 
         health_parts = []
         if not pd.isna(temp_mean):
@@ -12523,51 +12642,93 @@ def create_family_summary_text(health_df, excretion_df, user_name, year, month):
         if not pd.isna(weight_mean):
             health_parts.append(f"体重平均{round(float(weight_mean), 1)}kg")
 
-        if health_parts:
-            lines.append("記録上、" + "、".join(health_parts) + "として確認されています。")
-
         meal_parts = []
         for label in ["朝食摂取率", "昼食摂取率", "夕食摂取率"]:
-            mean = to_number(target[label]).mean()
-            if not pd.isna(mean):
-                meal_parts.append(f"{label.replace('摂取率', '')}平均{round(float(mean), 1)}％")
+            if label in target.columns:
+                mean = to_number(target[label]).mean()
+                if not pd.isna(mean):
+                    meal_parts.append(f"{label.replace('摂取率', '')}平均{round(float(mean), 1)}％")
 
+        overview_lines = [f"健康チェック記録は{len(target)}件確認されています。"]
+        if health_parts:
+            overview_lines.append("記録上、" + "、".join(health_parts) + "として確認されています。")
         if meal_parts:
-            lines.append("食事摂取率は、" + "、".join(meal_parts) + "でした。")
+            overview_lines.append("食事摂取率は、" + "、".join(meal_parts) + "でした。")
+        lines.append("【数値から見た状態】\n" + "\n".join(overview_lines))
 
-        memo_rows = target[target["家族共有メモ"].fillna("").astype(str).str.strip() != ""]
-        change_rows = target[target["気になる変化"].fillna("").astype(str).str.strip() != ""]
+    # 気になる記録を日付ごとに全件確認
+    concern_lines = []
+    if not target.empty:
+        for _, row in target.iterrows():
+            row_alerts = _record_alerts_from_health_row(row)
+            if row_alerts:
+                concern_lines.append(f"{_fmt_date(row.get('記録日'))}　" + "、".join(row_alerts))
 
-        if not memo_rows.empty:
-            first = memo_rows.iloc[0]
-            lines.append(
-                f"ご様子として、{first['記録日'].strftime('%m/%d')}の記録に"
-                f"「{str(first['家族共有メモ'])[:80]}」とあります。"
-            )
+    if not ex_target.empty:
+        try:
+            ex_target = ex_target.copy()
+            ex_target["記録日"] = pd.to_datetime(ex_target["記録日"], errors="coerce")
+            ex_target = ex_target.sort_values(["記録日", "時間帯"])
+        except Exception:
+            pass
+        for _, row in ex_target.iterrows():
+            row_alerts = _record_alerts_from_excretion_row(row)
+            if row_alerts:
+                concern_lines.append(f"{_fmt_date(row.get('記録日'))}　" + "、".join(row_alerts))
 
-        if not change_rows.empty:
-            first = change_rows.iloc[0]
-            lines.append(
-                f"また、{first['記録日'].strftime('%m/%d')}に"
-                f"「{str(first['気になる変化'])[:80]}」という記録があります。"
-                "必要に応じて職員間で共有しながら見守っています。"
-            )
+    if concern_lines:
+        # 同じ文章の重複を避ける
+        unique_concerns = []
+        for item in concern_lines:
+            if item not in unique_concerns:
+                unique_concerns.append(item)
+        lines.append("【気になる記録】\n対象期間中の記録から、次の内容を確認しました。\n" + "\n".join([f"・{x}" for x in unique_concerns[:20]]))
+        if len(unique_concerns) > 20:
+            lines.append(f"※気になる記録が多いため、上位20件まで表示しています。残り{len(unique_concerns) - 20}件は一覧で確認してください。")
+    else:
+        lines.append(
+            "【気になる記録】\n対象期間中の健康チェック・排泄記録を確認しました。"
+            "その他の日について、発熱、SpO2低下、著しい食事低下、濃縮尿、下痢便・水様便、"
+            "睡眠不良や生活上の気になる記録は確認されませんでした。"
+        )
+
+    # 排泄状況
+    if ex_target.empty:
+        lines.append("【排泄状況】\n排泄記録は、対象月にはまだ登録されていません。")
+    else:
+        ex_sum = summarize_excretion(ex_target)
+        ex_lines = [
+            f"排尿記録{ex_sum['排尿回数']}回、排便記録{ex_sum['排便回数']}回、濃縮尿{ex_sum['濃縮尿']}回、下痢便{ex_sum['下痢便']}回、水様便{ex_sum['水様便']}回として記録されています。"
+        ]
+        if int(ex_sum.get("排便回数", 0) or 0) == 0:
+            ex_lines.append("記録上、対象期間中の排便記録が確認できないため、便秘傾向の有無を継続して確認します。")
+        elif int(ex_sum.get("濃縮尿", 0) or 0) > 0 or int(ex_sum.get("下痢便", 0) or 0) > 0 or int(ex_sum.get("水様便", 0) or 0) > 0:
+            ex_lines.append("排泄の性状に気になる記録がある日は、水分摂取量、食事量、腹部の様子、普段との差を合わせて確認します。")
+        else:
+            ex_lines.append("排泄記録上、濃縮尿、下痢便、水様便などの特記は確認されませんでした。")
+        lines.append("【排泄状況】\n" + "\n".join(ex_lines))
 
     assessment = build_assessment_context_text(user_name)
     if assessment:
-        lines.append("アセスメント情報もふまえ、生活全体の様子を確認しています。\n" + assessment)
+        lines.append("【アセスメント情報】\nアセスメント情報もふまえ、生活全体の様子を確認しています。\n" + assessment)
 
-    if ex_target.empty:
-        lines.append("排泄記録は、対象月にはまだ登録されていません。")
-    else:
-        ex_sum = summarize_excretion(ex_target)
-        lines.append(
-            "排泄状況は、"
-            f"排尿記録{ex_sum['排尿回数']}回、排便記録{ex_sum['排便回数']}回、"
-            f"濃縮尿{ex_sum['濃縮尿']}回、下痢便{ex_sum['下痢便']}回、水様便{ex_sum['水様便']}回として記録されています。"
-        )
+    # 継続確認点：気になる記録の有無にかかわらず、現場で次に見る項目を出す
+    follow_points = []
+    if not target.empty:
+        follow_points.extend(["食事摂取量の変化", "SpO2低下時の表情・呼吸状態", "日中の活気や眠気", "本人の普段の様子との差"])
+    if not ex_target.empty:
+        follow_points.extend(["排便間隔", "尿・便の性状", "水分摂取量との関係"])
+    if not follow_points:
+        follow_points.append("記録が入力された後、数値と生活の様子を合わせて確認します")
 
-    lines.append("今後も、数値だけでなく表情や生活の様子も含めて、安心して過ごせるよう見守ってまいります。")
+    # 順序を維持して重複削除
+    dedup_points = []
+    for p in follow_points:
+        if p not in dedup_points:
+            dedup_points.append(p)
+    lines.append("【継続確認が必要な点】\n" + "\n".join([f"・{p}" for p in dedup_points]))
+
+    lines.append("【職員間で共有すること】\n数値だけで判断せず、表情、食事、水分、排泄、睡眠、活動量など、本人の普段の様子との差を職員間で共有しながら見守ります。")
 
     return "\n\n".join(lines)
 
@@ -17364,6 +17525,19 @@ elif menu == "管理者支援":
 ・「問題ありません」「改善しました」「安心です」と断定しない。
 ・記録に基づく表現にする。
 ・不安を煽らず、やわらかく丁寧な文章にする。
+・対象期間中の全記録を確認し、一部の日付だけを拾って終わらない。
+・気になる記録がある場合は日付ごとに列挙する。
+・気になる記録がない場合も「その他の日について、特記すべき体調変化や生活上の気になる記録は確認されませんでした」と明記する。
+・発熱、SpO2低下、食事摂取量低下、水分摂取量低下、排便なし、不穏、転倒、睡眠不良、表情や活気の変化、申し送りの注意事項を確認する。
+・単に平均値をまとめるだけでなく、期間全体を見たうえで、気になる点、継続確認点、職員間で共有すべき点を整理する。
+
+【出力形式】
+【対象期間の全体確認】
+【気になる記録】
+【数値から見た状態】
+【排泄状況】
+【継続確認が必要な点】
+【職員間で共有すること】
 
 【利用者】
 {prompt_user}
