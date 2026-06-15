@@ -58,6 +58,7 @@ except Exception:
 
 
 # =========================
+# Ver4.8.3 OpenAIモデル切替対応
 # Ver4.8.2 起動順安全化：キャッシュ関連の最小定義を最上部で先に用意
 # =========================
 # Streamlit Cloudでは、デコレータ行の評価時点で関数名が未定義だと
@@ -6262,10 +6263,125 @@ def get_openai_api_key(input_key=""):
             return key
     except Exception:
         pass
+    try:
+        openai_section = st.secrets.get("openai", {})
+        key = _secret_get(openai_section, "api_key", "")
+        if key:
+            return str(key).strip()
+    except Exception:
+        pass
     key = os.environ.get("OPENAI_API_KEY", "")
     if key:
         return key
     return clean_text(input_key)
+
+
+# =========================
+# OpenAIモデル切替設定（Ver4.8.3）
+# =========================
+# Streamlit Secrets / 環境変数 / app_settings の順でモデル名を取得する。
+# 例:
+# OPENAI_MODEL = "gpt-4o-mini"
+# OPENAI_MODEL_VISION = "gpt-4o-mini"
+# OPENAI_MODEL_SHORT_GOAL = "gpt-4o-mini"
+# OPENAI_MODEL_MONITORING = "gpt-4o-mini"
+# OPENAI_MODEL_ADMIN = "gpt-4.1-mini"
+OPENAI_MODEL_DEFAULTS = {
+    "default": "gpt-4o-mini",
+    "vision": "gpt-4o-mini",
+    "short_goal": "gpt-4o-mini",
+    "monitoring": "gpt-4o-mini",
+    "admin": "gpt-4.1-mini",
+}
+
+OPENAI_MODEL_LABELS = {
+    "default": "共通",
+    "vision": "写真AI取込",
+    "short_goal": "短期目標AI要約",
+    "monitoring": "モニタリングAI整形",
+    "admin": "AI管理者アドバイス",
+}
+
+
+def _read_openai_model_from_secrets(key_name):
+    """OPENAI_MODEL系の値をStreamlit Secrets / [openai] / 環境変数から読む。"""
+    try:
+        value = st.secrets.get(key_name, "")
+        if value:
+            return str(value).strip()
+    except Exception:
+        pass
+    try:
+        openai_section = st.secrets.get("openai", {})
+        short = key_name.replace("OPENAI_MODEL_", "").lower()
+        candidates = []
+        if short and short != key_name.lower():
+            candidates.extend([f"model_{short}", f"{short}_model", short])
+        if key_name == "OPENAI_MODEL":
+            candidates.extend(["model", "default_model"])
+        for k in candidates:
+            value = _secret_get(openai_section, k, "")
+            if value:
+                return str(value).strip()
+    except Exception:
+        pass
+    value = os.environ.get(key_name, "")
+    if value:
+        return str(value).strip()
+    return ""
+
+
+def get_openai_model(purpose="default", default=None):
+    """
+    用途別にOpenAIモデル名を取得する。
+    優先順位:
+    1. OPENAI_MODEL_<PURPOSE>
+    2. OPENAI_MODEL
+    3. app_settings の openai_model_<purpose>
+    4. 既定値
+    """
+    purpose = clean_text(purpose, "default").lower()
+    default_model = default or OPENAI_MODEL_DEFAULTS.get(purpose, OPENAI_MODEL_DEFAULTS["default"])
+
+    env_key = f"OPENAI_MODEL_{purpose.upper()}"
+    if purpose != "default":
+        value = _read_openai_model_from_secrets(env_key)
+        if value:
+            return value
+
+    value = _read_openai_model_from_secrets("OPENAI_MODEL")
+    if value:
+        return value
+
+    try:
+        setting_value = get_app_setting(f"openai_model_{purpose}", "")
+        if setting_value:
+            return clean_text(setting_value)
+    except Exception:
+        pass
+
+    try:
+        setting_value = get_app_setting("openai_model_default", "")
+        if setting_value:
+            return clean_text(setting_value)
+    except Exception:
+        pass
+
+    return default_model
+
+
+def get_openai_model_status_df():
+    """用途別モデル設定を表にする。"""
+    rows = []
+    for purpose, label in OPENAI_MODEL_LABELS.items():
+        rows.append({
+            "用途": label,
+            "purpose": purpose,
+            "使用モデル": get_openai_model(purpose),
+            "既定モデル": OPENAI_MODEL_DEFAULTS.get(purpose, OPENAI_MODEL_DEFAULTS["default"]),
+            "Secretsキー例": "OPENAI_MODEL" if purpose == "default" else f"OPENAI_MODEL_{purpose.upper()}",
+        })
+    return pd.DataFrame(rows)
 
 
 def try_ocr_image(uploaded_file):
@@ -6328,7 +6444,7 @@ JSON形式：
 }}
 """
         resp = client.chat.completions.create(
-            model="gpt-4o-mini",
+            model=get_openai_model("vision", "gpt-4o-mini"),
             messages=[
                 {"role": "system", "content": "画像から健康チェック表の候補データをJSONで抽出します。医療判断はしません。"},
                 {"role": "user", "content": [
@@ -10219,7 +10335,7 @@ JSON形式：
 """
         client = OpenAI(api_key=api_key)
         res = client.chat.completions.create(
-            model="gpt-4o-mini",
+            model=get_openai_model("short_goal", "gpt-4o-mini"),
             messages=[
                 {"role": "system", "content": "介護記録を断定せず、記録に基づいて短く整理します。"},
                 {"role": "user", "content": prompt},
@@ -12038,7 +12154,7 @@ JSON形式：
     try:
         client = OpenAI(api_key=api_key)
         res = client.chat.completions.create(
-            model="gpt-4o-mini",
+            model=get_openai_model("monitoring", "gpt-4o-mini"),
             messages=[
                 {"role": "system", "content": "介護計画モニタリング表の文章を整理します。断定せず、記録に基づく表現にします。"},
                 {"role": "user", "content": prompt},
@@ -12175,7 +12291,7 @@ def show_ai_monitoring_table_builder():
     with c2:
         target_month_date = st.date_input("対象月", value=today_jst(), key="ai_monitoring_month")
     with c3:
-        use_ai = st.checkbox("AIで文章を整える", value=False, help="OpenAI APIキー設定時のみ使用できます。未設定でも通常下書きは作成できます。")
+        use_ai = st.checkbox("AIで文章を整える", value=False, help=f"OpenAI APIキー設定時のみ使用できます。使用モデル: {get_openai_model('monitoring', 'gpt-4o-mini')}")
 
     target_month = ym_str(target_month_date)
     if st.button("モニタリング表の下書きを作成", type="primary", use_container_width=True):
@@ -13560,7 +13676,7 @@ AIは診断しません。医療判断、治療判断、受診判断、改善・
     try:
         client = OpenAI(api_key=api_key)
         res = client.chat.completions.create(
-            model="gpt-4.1-mini",
+            model=get_openai_model("admin", "gpt-4.1-mini"),
             messages=[
                 {"role": "system", "content": system_prompt},
                 {"role": "user", "content": context},
@@ -13671,6 +13787,7 @@ def show_structured_insight_menu():
 
     st.markdown("---")
     st.markdown("### AI管理者アドバイス")
+    st.caption(f"使用モデル：{get_openai_model('admin', 'gpt-4.1-mini')}")
     if not get_openai_api_key(""):
         st.warning("OpenAI APIキーが未設定です。Streamlit Cloud の Secrets に OPENAI_API_KEY を設定するとAI分析が使えます。")
         st.code('OPENAI_API_KEY = "sk-xxxxxxxxxxxxxxxx"', language="toml")
