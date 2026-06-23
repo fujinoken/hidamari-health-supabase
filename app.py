@@ -11575,6 +11575,7 @@ def show_daily_summary_input():
                         "row": goal_row,
                         "existing": existing_goal_check,
                         "goal_key": goal_key,
+                        "goal_identity": goal_identity,
                         "result": result,
                         "mood": mood,
                         "reflect": reflect,
@@ -11670,8 +11671,12 @@ def show_daily_summary_input():
                     continue
                 uid = get_user_id_by_name(user_name) or ensure_user_id_value(clean_text(selected_goal.get("user_id")), user_name)
                 existing_record_id = summary_text(entry.get("existing"), "記録ID")
+                fallback_record_id = str(uuid.uuid5(
+                    uuid.NAMESPACE_URL,
+                    f"hidamari-daily-summary-short-goal:{record_date}:{uid or user_name}:{entry.get('goal_identity')}",
+                ))
                 goal_records.append({
-                    "記録ID": existing_record_id or str(uuid.uuid4()),
+                    "記録ID": existing_record_id or fallback_record_id,
                     "日付": record_date.strftime("%Y-%m-%d"),
                     "利用者名": user_name,
                     "user_id": uid,
@@ -11689,19 +11694,34 @@ def show_daily_summary_input():
             if not goal_records:
                 skipped_messages.append("保存する短期目標チェックはありません")
             else:
-                check_df = load_short_goal_checks()
-                check_df2 = pd.concat(
-                    [check_df, pd.DataFrame(goal_records, columns=SHORT_GOAL_CHECK_COLUMNS)],
-                    ignore_index=True,
-                )
-                try:
-                    saved = bool(save_short_goal_checks(check_df2))
-                except Exception:
-                    saved = False
-                success_count = len(goal_records) if saved else 0
-                failed_count = len(goal_records) - success_count
-                if saved:
-                    for goal_record in goal_records:
+                success_count = 0
+                failed_count = 0
+                for goal_record in goal_records:
+                    try:
+                        check_df = load_short_goal_checks()
+                        check_df = normalize_df_columns(check_df, SHORT_GOAL_CHECK_COLUMNS)
+                        check_df = check_df.astype("object")
+                        record_id = clean_text(goal_record.get("記録ID"))
+                        if not check_df.empty and "記録ID" in check_df.columns:
+                            mask = check_df["記録ID"].astype(str) == record_id
+                            if mask.any():
+                                idx = check_df.index[mask].tolist()[0]
+                                for col in SHORT_GOAL_CHECK_COLUMNS:
+                                    check_df.at[idx, col] = goal_record.get(col, "")
+                                check_df2 = check_df
+                            else:
+                                check_df2 = pd.concat(
+                                    [check_df, pd.DataFrame([goal_record], columns=SHORT_GOAL_CHECK_COLUMNS).astype("object")],
+                                    ignore_index=True,
+                                )
+                        else:
+                            check_df2 = pd.DataFrame([goal_record], columns=SHORT_GOAL_CHECK_COLUMNS).astype("object")
+                        saved_one = bool(save_short_goal_checks(check_df2))
+                    except Exception:
+                        saved_one = False
+
+                    if saved_one:
+                        success_count += 1
                         try:
                             add_audit_log(
                                 "短期目標実施チェック登録",
@@ -11711,12 +11731,15 @@ def show_daily_summary_input():
                             )
                         except Exception:
                             pass
+                    else:
+                        failed_count += 1
                 detail = f"{len(goal_records)}件中{success_count}件 保存成功"
                 if failed_count:
                     detail += f"、{failed_count}件保存失敗"
                 if skipped_goal_count:
                     detail += f"、{skipped_goal_count}件は実施状況未選択のため未保存"
-                results.append(("短期目標チェック", "saved" if saved and failed_count == 0 else "failed", detail))
+                all_goal_records_saved = success_count == len(goal_records) and failed_count == 0
+                results.append(("短期目標チェック", "saved" if all_goal_records_saved else "failed", detail))
         else:
             skipped_messages.append("保存する短期目標チェックはありません")
 
