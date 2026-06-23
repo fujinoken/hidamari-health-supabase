@@ -126,6 +126,30 @@ from hidamari.features.ai import (
     hidamari_ai_filter_period,
 )
 from hidamari.features.ai_prompts import AI_STRUCTURED_ADVICE_SYSTEM_PROMPT
+from hidamari.pdf.ai_report import (
+    AI_INSIGHT_CONFIRMATION_NOTE,
+    AI_INSIGHT_LOG_EMPTY_TEXT,
+    AI_INSIGHT_LOG_SUMMARY_TITLE,
+    AI_INSIGHT_REPORT_DISCLAIMER,
+    AI_INSIGHT_REPORT_TITLE,
+    ai_admin_report_file_name,
+    append_markdown_lines_to_story,
+)
+from hidamari.pdf.common import (
+    paragraph_lines,
+    pdf_safe_text,
+    register_japanese_pdf_fonts,
+    register_single_japanese_pdf_font,
+    short_goal_join_for_pdf,
+    short_goal_pdf_text,
+)
+from hidamari.pdf.family_report import (
+    HIDAMARI_REPORT_DISCLAIMER,
+    HIDAMARI_REPORT_EXCRETION_HEADING,
+    HIDAMARI_REPORT_NO_EXCRETION_TEXT,
+    HIDAMARI_REPORT_SUMMARY_HEADING,
+    HIDAMARI_REPORT_TITLE,
+)
 from hidamari.ui.common import (
     danger_note,
     os_mindset_box,
@@ -171,8 +195,6 @@ try:
     from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
     from reportlab.lib.units import mm
     from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer, Table, TableStyle, PageBreak
-    from reportlab.pdfbase import pdfmetrics
-    from reportlab.pdfbase.cidfonts import UnicodeCIDFont
 except Exception:
     colors = None
 
@@ -10138,35 +10160,6 @@ def make_short_goal_summary_excel_bytes(
 
 
 
-def _short_goal_pdf_text(value, default="記録なし"):
-    """PDF出力用に空欄・NaNを安全な文字列へ整える。"""
-    try:
-        text = clean_text(value, default) if "clean_text" in globals() else str(value or "").strip()
-    except Exception:
-        text = str(value or "").strip()
-    if not text or text.lower() in ["nan", "none", "nat"]:
-        return default
-    return text
-
-
-def _short_goal_join_for_pdf(values, limit=5):
-    """PDFの1ページに収めるため、本人の様子などを短く整理する。"""
-    items = []
-    try:
-        iterable = list(values)
-    except Exception:
-        iterable = []
-    for value in iterable:
-        text = _short_goal_pdf_text(value, "")
-        if not text:
-            continue
-        if text not in items:
-            items.append(text)
-    if not items:
-        return "記録なし"
-    return "\n".join([f"・{x}" for x in items[:limit]])
-
-
 def make_short_goal_monitoring_pdf_bytes(
     selected_user,
     selected_goal_text,
@@ -10190,15 +10183,7 @@ def make_short_goal_monitoring_pdf_bytes(
     output = BytesIO()
 
     # 日本語フォント。ReportLab標準CIDフォントなので追加フォントファイル不要。
-    try:
-        pdfmetrics.registerFont(UnicodeCIDFont("HeiseiKakuGo-W5"))
-        base_font = "HeiseiKakuGo-W5"
-    except Exception:
-        try:
-            pdfmetrics.registerFont(UnicodeCIDFont("HeiseiMin-W3"))
-            base_font = "HeiseiMin-W3"
-        except Exception:
-            base_font = "Helvetica"
+    base_font = register_single_japanese_pdf_font()
 
     doc = SimpleDocTemplate(
         output,
@@ -10238,7 +10223,7 @@ def make_short_goal_monitoring_pdf_bytes(
     )
 
     def P(value, style=normal_style):
-        text = _short_goal_pdf_text(value, "")
+        text = short_goal_pdf_text(value, "")
         text = text.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
         text = text.replace("\n", "<br/>")
         return Paragraph(text, style)
@@ -10248,10 +10233,10 @@ def make_short_goal_monitoring_pdf_bytes(
         if col not in detail.columns:
             detail[col] = ""
 
-    person_notes = _short_goal_join_for_pdf(detail.get("本人の様子", []), limit=4)
-    reason_summary = _short_goal_pdf_text(summary.get("理由要約") if isinstance(summary, dict) else "", "記録なし")
-    memo_summary = _short_goal_pdf_text(summary.get("職員メモ要約") if isinstance(summary, dict) else "", "記録なし")
-    general_summary = _short_goal_pdf_text(summary.get("総括コメント") if isinstance(summary, dict) else "", "記録なし")
+    person_notes = short_goal_join_for_pdf(detail.get("本人の様子", []), limit=4)
+    reason_summary = short_goal_pdf_text(summary.get("理由要約") if isinstance(summary, dict) else "", "記録なし")
+    memo_summary = short_goal_pdf_text(summary.get("職員メモ要約") if isinstance(summary, dict) else "", "記録なし")
+    general_summary = short_goal_pdf_text(summary.get("総括コメント") if isinstance(summary, dict) else "", "記録なし")
 
     achievement = (
         f"実施状況率：{rate}%（実施のみ率：{done_only_rate}%）\n"
@@ -10267,13 +10252,13 @@ def make_short_goal_monitoring_pdf_bytes(
 
     evaluation = f"{eval_label}\n{general_summary}"
     future_policy = (
-        f"現在の支援内容：{_short_goal_pdf_text(selected_support_text, '記載なし')}\n"
+        f"現在の支援内容：{short_goal_pdf_text(selected_support_text, '記載なし')}\n"
         f"今後は、本人の様子と未実施・一部実施の理由を確認しながら、無理のない範囲で支援を継続する。"
     )
     if reason_summary and reason_summary != "記録なし":
         future_policy += f"\n確認事項：{reason_summary}"
 
-    staff_text = _short_goal_pdf_text(staff_name, current_login_user() if "current_login_user" in globals() else "管理者")
+    staff_text = short_goal_pdf_text(staff_name, current_login_user() if "current_login_user" in globals() else "管理者")
     created_text = format_now_jst("%Y-%m-%d %H:%M") if "format_now_jst" in globals() else datetime.now().strftime("%Y-%m-%d %H:%M")
 
     elements = []
@@ -12502,8 +12487,7 @@ def create_hidamari_pdf(health_df, excretion_df, user_name, year, month):
     if colors is None:
         raise RuntimeError("reportlab が利用できません。requirements.txt に reportlab を追加してください。")
 
-    pdfmetrics.registerFont(UnicodeCIDFont("HeiseiKakuGo-W5"))
-    pdfmetrics.registerFont(UnicodeCIDFont("HeiseiMin-W3"))
+    gothic, mincho = register_japanese_pdf_fonts()
 
     file_path = REPORT_DIR / f"ひだまりレポート_{user_name}_{year}年{month}月.pdf"
 
@@ -12520,7 +12504,7 @@ def create_hidamari_pdf(health_df, excretion_df, user_name, year, month):
     title_style = ParagraphStyle(
         "jp_title",
         parent=styles["Title"],
-        fontName="HeiseiKakuGo-W5",
+        fontName=gothic,
         fontSize=22,
         leading=28,
         alignment=1,
@@ -12529,7 +12513,7 @@ def create_hidamari_pdf(health_df, excretion_df, user_name, year, month):
     h2_style = ParagraphStyle(
         "jp_h2",
         parent=styles["Heading2"],
-        fontName="HeiseiKakuGo-W5",
+        fontName=gothic,
         fontSize=13,
         leading=18,
         textColor=colors.HexColor("#2F3437"),
@@ -12537,37 +12521,37 @@ def create_hidamari_pdf(health_df, excretion_df, user_name, year, month):
     body_style = ParagraphStyle(
         "jp_body",
         parent=styles["BodyText"],
-        fontName="HeiseiMin-W3",
+        fontName=mincho,
         fontSize=10,
         leading=16,
     )
     small_style = ParagraphStyle(
         "jp_small",
         parent=styles["BodyText"],
-        fontName="HeiseiMin-W3",
+        fontName=mincho,
         fontSize=8,
         leading=12,
         textColor=colors.HexColor("#666666"),
     )
 
     story = []
-    story.append(Paragraph("ひだまりレポート", title_style))
+    story.append(Paragraph(HIDAMARI_REPORT_TITLE, title_style))
     story.append(Spacer(1, 6))
     story.append(Paragraph(f"{user_name}　{year}年{month}月", body_style))
     story.append(Spacer(1, 12))
 
     summary = create_family_summary_text(health_df, excretion_df, user_name, year, month)
-    story.append(Paragraph("今月のまとめ", h2_style))
+    story.append(Paragraph(HIDAMARI_REPORT_SUMMARY_HEADING, h2_style))
     for para in summary.split("\n\n"):
         story.append(Paragraph(para.replace("\n", "<br/>"), body_style))
         story.append(Spacer(1, 5))
 
     story.append(PageBreak())
-    story.append(Paragraph("排泄記録", h2_style))
+    story.append(Paragraph(HIDAMARI_REPORT_EXCRETION_HEADING, h2_style))
 
     ex_target = get_month_excretion_data(excretion_df, user_name, year, month)
     if ex_target.empty:
-        story.append(Paragraph("対象月の排泄記録はありません。", body_style))
+        story.append(Paragraph(HIDAMARI_REPORT_NO_EXCRETION_TEXT, body_style))
     else:
         table_data = [["日付", "時間帯", "尿", "便", "メモ"]]
         for _, row in ex_target.iterrows():
@@ -12581,8 +12565,8 @@ def create_hidamari_pdf(health_df, excretion_df, user_name, year, month):
 
         table = Table(table_data, colWidths=[20*mm, 24*mm, 35*mm, 35*mm, 55*mm])
         table.setStyle(TableStyle([
-            ("FONTNAME", (0, 0), (-1, -1), "HeiseiMin-W3"),
-            ("FONTNAME", (0, 0), (-1, 0), "HeiseiKakuGo-W5"),
+            ("FONTNAME", (0, 0), (-1, -1), mincho),
+            ("FONTNAME", (0, 0), (-1, 0), gothic),
             ("BACKGROUND", (0, 0), (-1, 0), colors.HexColor("#F7F4EE")),
             ("BOX", (0, 0), (-1, -1), 0.5, colors.HexColor("#D9D9D9")),
             ("INNERGRID", (0, 0), (-1, -1), 0.25, colors.HexColor("#D9D9D9")),
@@ -12592,7 +12576,7 @@ def create_hidamari_pdf(health_df, excretion_df, user_name, year, month):
         story.append(table)
 
     story.append(Spacer(1, 12))
-    story.append(Paragraph("※このレポートは施設内の記録をもとにした共有資料です。医療的な診断・治療効果の判断を行うものではありません。", small_style))
+    story.append(Paragraph(HIDAMARI_REPORT_DISCLAIMER, small_style))
 
     doc.build(story)
     return file_path
@@ -12912,35 +12896,7 @@ def save_ai_insight_logs(df):
 
 
 
-def _pdf_safe_text(value):
-    """ReportLab Paragraph向けに文字列を安全化する。"""
-    try:
-        if pd.isna(value):
-            return ""
-    except Exception:
-        pass
-    text = str(value)
-    text = text.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
-    text = text.replace("\r\n", "\n").replace("\r", "\n")
-    return text
-
-
-def _paragraph_lines(text, style):
-    """複数行テキストをPDF用Paragraphのリストへ変換する。"""
-    safe = _pdf_safe_text(text)
-    if not safe.strip():
-        return [Paragraph("記録なし", style)]
-    parts = []
-    for line in safe.split("\n"):
-        line = line.strip()
-        if not line:
-            parts.append(Spacer(1, 2 * mm))
-        else:
-            parts.append(Paragraph(line, style))
-    return parts
-
-
-def build_ai_insight_pdf_report(row, report_title="AI管理者向け分析レポート"):
+def build_ai_insight_pdf_report(row, report_title=AI_INSIGHT_REPORT_TITLE):
     """
     AI分析ログ1件を、管理者確認用PDFとして出力する。
     診断・医療判断ではなく、記録整理と確認ポイントのレポートとして扱う。
@@ -12948,14 +12904,7 @@ def build_ai_insight_pdf_report(row, report_title="AI管理者向け分析レポ
     if colors is None:
         raise RuntimeError("ReportLabが利用できません。requirements.txt に reportlab を追加してください。")
 
-    try:
-        pdfmetrics.registerFont(UnicodeCIDFont("HeiseiKakuGo-W5"))
-        pdfmetrics.registerFont(UnicodeCIDFont("HeiseiMin-W3"))
-        gothic = "HeiseiKakuGo-W5"
-        mincho = "HeiseiMin-W3"
-    except Exception:
-        gothic = "Helvetica"
-        mincho = "Helvetica"
+    gothic, mincho = register_japanese_pdf_fonts()
 
     buffer = BytesIO()
     doc = SimpleDocTemplate(
@@ -13012,7 +12961,7 @@ def build_ai_insight_pdf_report(row, report_title="AI管理者向け分析レポ
     )
 
     def cell(v):
-        return Paragraph(_pdf_safe_text(v).replace("\n", "<br/>"), table_style)
+        return Paragraph(pdf_safe_text(v).replace("\n", "<br/>"), table_style)
 
     created_at = row.get("作成日時", "") if isinstance(row, dict) else ""
     base_day = row.get("分析基準日", "") if isinstance(row, dict) else ""
@@ -13023,7 +12972,7 @@ def build_ai_insight_pdf_report(row, report_title="AI管理者向け分析レポ
 
     story = []
     story.append(Paragraph(report_title, title_style))
-    story.append(Paragraph("このPDFは、健康チェック・排泄・申し送り・短期目標の記録を管理者が確認しやすい形に整理したものです。医療判断・診断・受診判断を行うものではありません。", small_style))
+    story.append(Paragraph(AI_INSIGHT_REPORT_DISCLAIMER, small_style))
     story.append(Spacer(1, 4 * mm))
 
     meta_data = [
@@ -13045,13 +12994,13 @@ def build_ai_insight_pdf_report(row, report_title="AI管理者向け分析レポ
     story.append(meta_table)
 
     story.append(Paragraph("1. ルールベース分析", section_style))
-    story.extend(_paragraph_lines(rule_text, body_style))
+    story.extend(paragraph_lines(rule_text, body_style))
 
     story.append(Paragraph("2. AI管理者アドバイス", section_style))
-    story.extend(_paragraph_lines(ai_text, body_style))
+    story.extend(paragraph_lines(ai_text, body_style))
 
     story.append(Spacer(1, 5 * mm))
-    story.append(Paragraph("確認メモ：必要に応じて、記録原本・申し送り・職員間共有内容と照合してください。AIの文章は判断の代替ではなく、管理者確認の補助として扱ってください。", small_style))
+    story.append(Paragraph(AI_INSIGHT_CONFIRMATION_NOTE, small_style))
 
     doc.build(story)
     buffer.seek(0)
@@ -13062,33 +13011,26 @@ def build_ai_insight_log_summary_pdf(logs_df):
     """AI分析ログ一覧をPDFで出力する。"""
     if colors is None:
         raise RuntimeError("ReportLabが利用できません。requirements.txt に reportlab を追加してください。")
-    try:
-        pdfmetrics.registerFont(UnicodeCIDFont("HeiseiKakuGo-W5"))
-        pdfmetrics.registerFont(UnicodeCIDFont("HeiseiMin-W3"))
-        gothic = "HeiseiKakuGo-W5"
-        mincho = "HeiseiMin-W3"
-    except Exception:
-        gothic = "Helvetica"
-        mincho = "Helvetica"
+    gothic, mincho = register_japanese_pdf_fonts()
 
     buffer = BytesIO()
     doc = SimpleDocTemplate(buffer, pagesize=A4, rightMargin=10 * mm, leftMargin=10 * mm, topMargin=12 * mm, bottomMargin=12 * mm)
     styles = getSampleStyleSheet()
     title_style = ParagraphStyle("AiLogTitle", parent=styles["Title"], fontName=gothic, fontSize=15, leading=20, alignment=1)
     small_style = ParagraphStyle("AiLogSmall", parent=styles["BodyText"], fontName=mincho, fontSize=7.5, leading=10)
-    story = [Paragraph("AI分析ログ一覧", title_style), Spacer(1, 5 * mm)]
+    story = [Paragraph(AI_INSIGHT_LOG_SUMMARY_TITLE, title_style), Spacer(1, 5 * mm)]
 
     if logs_df is None or logs_df.empty:
-        story.append(Paragraph("AI分析ログはまだありません。", small_style))
+        story.append(Paragraph(AI_INSIGHT_LOG_EMPTY_TEXT, small_style))
     else:
         show = logs_df.tail(30).copy()
         data = [[Paragraph("作成日時", small_style), Paragraph("利用者名", small_style), Paragraph("対象期間", small_style), Paragraph("AI分析結果（冒頭）", small_style)]]
         for _, r in show.iterrows():
-            ai_short = _pdf_safe_text(r.get("AI分析結果", ""))[:180]
+            ai_short = pdf_safe_text(r.get("AI分析結果", ""))[:180]
             data.append([
-                Paragraph(_pdf_safe_text(r.get("作成日時", "")), small_style),
-                Paragraph(_pdf_safe_text(r.get("利用者名", "")), small_style),
-                Paragraph(_pdf_safe_text(r.get("対象期間", "")), small_style),
+                Paragraph(pdf_safe_text(r.get("作成日時", "")), small_style),
+                Paragraph(pdf_safe_text(r.get("利用者名", "")), small_style),
+                Paragraph(pdf_safe_text(r.get("対象期間", "")), small_style),
                 Paragraph(ai_short, small_style),
             ])
         table = Table(data, colWidths=[32 * mm, 24 * mm, 42 * mm, 90 * mm], repeatRows=1)
@@ -13927,32 +13869,15 @@ def _hidamari_ai_make_report_pdf(report_text, user_name, start_date, end_date):
         return None
     ensure_dirs()
     REPORT_DIR.mkdir(parents=True, exist_ok=True)
-    safe_user = re.sub(r"[^\w一-龥ぁ-んァ-ンー\-]", "_", str(user_name))
-    pdf_path = REPORT_DIR / f"hidamari_ai_admin_report_{safe_user}_{start_date}_{end_date}.pdf"
-    try:
-        pdfmetrics.registerFont(UnicodeCIDFont("HeiseiMin-W3"))
-    except Exception:
-        pass
+    pdf_path = REPORT_DIR / ai_admin_report_file_name(user_name, start_date, end_date)
+    _, mincho = register_japanese_pdf_fonts()
     buffer = BytesIO()
     doc = SimpleDocTemplate(buffer, pagesize=A4, rightMargin=16*mm, leftMargin=16*mm, topMargin=14*mm, bottomMargin=14*mm)
     styles = getSampleStyleSheet()
-    base = ParagraphStyle("hidamari_base", parent=styles["Normal"], fontName="HeiseiMin-W3", fontSize=9.5, leading=14)
+    base = ParagraphStyle("hidamari_base", parent=styles["Normal"], fontName=mincho, fontSize=9.5, leading=14)
     title = ParagraphStyle("hidamari_title", parent=base, fontSize=15, leading=20, spaceAfter=8)
     story = []
-    for line in report_text.splitlines():
-        line = line.rstrip()
-        if line.startswith("# "):
-            story.append(Paragraph(line.replace("# ", ""), title))
-            story.append(Spacer(1, 3*mm))
-        elif line.startswith("## "):
-            story.append(Spacer(1, 2*mm))
-            story.append(Paragraph(line.replace("## ", ""), ParagraphStyle("hidamari_h2", parent=base, fontSize=12, leading=16, spaceBefore=3, spaceAfter=2)))
-        elif line.startswith("- "):
-            story.append(Paragraph("・" + html.escape(line[2:]), base))
-        elif line.strip() == "":
-            story.append(Spacer(1, 1.5*mm))
-        else:
-            story.append(Paragraph(html.escape(line), base))
+    append_markdown_lines_to_story(report_text, story, base, title)
     doc.build(story)
     pdf_path.write_bytes(buffer.getvalue())
     return pdf_path

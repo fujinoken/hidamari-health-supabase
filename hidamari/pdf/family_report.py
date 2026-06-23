@@ -1,0 +1,5 @@
+HIDAMARI_REPORT_TITLE = "ひだまりレポート"
+HIDAMARI_REPORT_SUMMARY_HEADING = "今月のまとめ"
+HIDAMARI_REPORT_EXCRETION_HEADING = "排泄記録"
+HIDAMARI_REPORT_NO_EXCRETION_TEXT = "対象月の排泄記録はありません。"
+HIDAMARI_REPORT_DISCLAIMER = "※このレポートは施設内の記録をもとにした共有資料です。医療的な診断・治療効果の判断を行うものではありません。"
