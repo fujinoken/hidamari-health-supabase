@@ -11412,6 +11412,46 @@ def show_daily_summary_input():
         goal_text = clean_text(goal_row.get("短期目標"))
         return goal_id or hashlib.md5(goal_text.encode("utf-8")).hexdigest()[:10]
 
+    def verify_daily_summary_health_saved():
+        try:
+            verify_df = load_health_data(start_date=record_date, end_date=record_date)
+            return find_health_index(verify_df, record_date, user_name) is not None
+        except Exception:
+            return False
+
+    def verify_daily_summary_excretion_saved(record):
+        try:
+            slot = clean_text(record.get("時間帯"))
+            verify_df = load_excretion_data(start_date=record_date, end_date=record_date)
+            return find_excretion_index(verify_df, record_date, user_name, slot) is not None
+        except Exception:
+            return False
+
+    def verify_daily_summary_short_goal_saved(goal_record):
+        try:
+            verify_df = load_short_goal_checks(start_date=record_date, end_date=record_date)
+            verify_df = normalize_df_columns(verify_df, SHORT_GOAL_CHECK_COLUMNS)
+            if verify_df.empty:
+                return False
+            work = verify_df.copy()
+            work["日付_dt"] = pd.to_datetime(work["日付"], errors="coerce")
+            base_mask = (
+                (work["日付_dt"].dt.strftime("%Y-%m-%d") == clean_text(goal_record.get("日付")))
+                & (work["利用者名"].astype(str) == clean_text(goal_record.get("利用者名")))
+            )
+            record_id = clean_text(goal_record.get("記録ID"))
+            goal_id = clean_text(goal_record.get("目標ID"))
+            goal_text = clean_text(goal_record.get("短期目標"))
+            if record_id and (work["記録ID"].astype(str) == record_id).any():
+                return True
+            if goal_id and (base_mask & (work["目標ID"].astype(str) == goal_id)).any():
+                return True
+            if goal_text and (base_mask & (work["短期目標"].astype(str) == goal_text)).any():
+                return True
+            return False
+        except Exception:
+            return False
+
     def build_daily_summary_short_goal_record(selected_goal, record_id, uid, result, mood, reason, staff_memo, goal_staff, reflect):
         return {
             "記録ID": record_id,
@@ -11710,9 +11750,12 @@ def show_daily_summary_input():
                     st.warning("健康チェックは保存します。入力値に確認が必要な項目があります。")
                 try:
                     saved = bool(upsert_health_record(health_record))
+                    if not saved:
+                        saved = verify_daily_summary_health_saved()
                     results.append(("健康チェック", "saved" if saved else "failed", "", 1, 1 if saved else 0, 0 if saved else 1))
                 except Exception as e:
-                    results.append(("健康チェック", "failed", str(e), 1, 0, 1))
+                    saved = verify_daily_summary_health_saved()
+                    results.append(("健康チェック", "saved" if saved else "failed", "" if saved else str(e), 1, 1 if saved else 0, 0 if saved else 1))
         else:
             skipped_messages.append("保存する健康チェック内容はありません")
 
@@ -11728,6 +11771,8 @@ def show_daily_summary_input():
                     saved = bool(upsert_excretion_record(record))
                 except Exception:
                     saved = False
+                if not saved:
+                    saved = verify_daily_summary_excretion_saved(record)
                 if not saved:
                     failed_slots.append(record.get("時間帯", ""))
                 else:
@@ -11824,9 +11869,18 @@ def show_daily_summary_input():
                 except Exception:
                     saved_all_goals = False
 
-                if saved_all_goals:
+                verified_goal_count = sum(1 for goal_record in goal_records if verify_daily_summary_short_goal_saved(goal_record))
+                if verified_goal_count > 0:
+                    success_count = verified_goal_count
+                    failed_count = max(len(goal_records) - success_count, 0)
+                elif saved_all_goals:
                     success_count = len(goal_records)
                     failed_count = 0
+                else:
+                    success_count = 0
+                    failed_count = len(goal_records)
+
+                if success_count > 0:
                     for goal_record in goal_records:
                         try:
                             add_audit_log(
@@ -11837,9 +11891,6 @@ def show_daily_summary_input():
                             )
                         except Exception:
                             pass
-                else:
-                    success_count = 0
-                    failed_count = len(goal_records)
                 detail = f"{len(goal_records)}件中{success_count}件 保存成功"
                 if failed_count:
                     detail += f"、{failed_count}件保存失敗"
