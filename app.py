@@ -11401,6 +11401,12 @@ def show_daily_summary_input():
         if key not in st.session_state:
             st.session_state[key] = value
 
+    def summary_options_with_value(options, value):
+        value = clean_text(value)
+        if value and value not in options:
+            return options + [value]
+        return options
+
     def summary_existing_goal_check(goal_row):
         if goal_check_df.empty:
             return None
@@ -11561,17 +11567,20 @@ def show_daily_summary_input():
                 reason_key = f"daily_summary_goal_reason_{key_suffix}"
                 memo_key = f"daily_summary_goal_staff_memo_{key_suffix}"
                 staff_key = f"daily_summary_goal_staff_{key_suffix}"
-                result_options = ["", "実施", "一部実施", "未実施"]
-                mood_options = ["", "穏やか", "普段通り", "不安あり", "拒否あり", "疲労あり", "痛み訴えあり", "その他"]
-                reflect_options = ["", "反映する", "反映しない"]
+                existing_result = summary_text(existing_goal_check, "実施状況")
+                existing_mood = summary_text(existing_goal_check, "本人の様子")
+                existing_reflect = summary_text(existing_goal_check, "モニタリング反映")
+                result_options = summary_options_with_value(["", "実施", "一部実施", "未実施"], existing_result)
+                mood_options = summary_options_with_value(["", "穏やか", "普段通り", "不安あり", "拒否あり", "疲労あり", "痛み訴えあり", "その他"], existing_mood)
+                reflect_options = summary_options_with_value(["", "反映する", "反映しない"], existing_reflect)
 
                 summary_init_state(use_key, existing_goal_check is not None)
-                summary_init_state(result_key, summary_text(existing_goal_check, "実施状況"), result_options)
-                summary_init_state(mood_key, summary_text(existing_goal_check, "本人の様子"), mood_options)
-                summary_init_state(reflect_key, summary_text(existing_goal_check, "モニタリング反映"), reflect_options)
+                summary_init_state(result_key, existing_result, result_options)
+                summary_init_state(mood_key, existing_mood, mood_options)
+                summary_init_state(reflect_key, existing_reflect, reflect_options)
                 summary_init_state(reason_key, summary_text(existing_goal_check, "未実施理由"))
                 summary_init_state(memo_key, summary_text(existing_goal_check, "職員メモ"))
-                summary_init_state(staff_key, summary_text(existing_goal_check, "入力職員", input_staff))
+                summary_init_state(staff_key, summary_text(existing_goal_check, "入力職員"))
 
                 use_goal = st.checkbox("この短期目標を記録する", key=use_key)
                 g1, g2, g3 = st.columns(3)
@@ -11585,25 +11594,34 @@ def show_daily_summary_input():
                 staff_memo = st.text_area("職員メモ", key=memo_key)
                 goal_staff = st.text_input("入力職員", key=staff_key)
 
+                enabled_state = bool(st.session_state.get(use_key, False))
+                result_state = clean_text(st.session_state.get(result_key))
+                mood_state = clean_text(st.session_state.get(mood_key))
+                reflect_state = clean_text(st.session_state.get(reflect_key))
+                reason_state = clean_text(st.session_state.get(reason_key))
+                memo_state = clean_text(st.session_state.get(memo_key))
+                staff_state = clean_text(st.session_state.get(staff_key))
                 has_goal_detail = any([
-                    clean_text(result),
-                    clean_text(mood),
-                    clean_text(reflect),
-                    clean_text(reason),
-                    clean_text(staff_memo),
+                    result_state,
+                    mood_state,
+                    reflect_state,
+                    reason_state,
+                    memo_state,
+                    staff_state,
                 ])
-                if use_goal or has_goal_detail:
+                if enabled_state or has_goal_detail:
                     goal_entries.append({
                         "row": goal_row,
                         "existing": existing_goal_check,
                         "goal_key": goal_key,
                         "goal_identity": goal_identity,
-                        "result": result,
-                        "mood": mood,
-                        "reflect": reflect,
-                        "reason": reason,
-                        "staff_memo": staff_memo,
-                        "staff": goal_staff,
+                        "use_key": use_key,
+                        "result_key": result_key,
+                        "mood_key": mood_key,
+                        "reflect_key": reflect_key,
+                        "reason_key": reason_key,
+                        "memo_key": memo_key,
+                        "staff_key": staff_key,
                     })
 
                 if i < len(user_goals):
@@ -11685,7 +11703,16 @@ def show_daily_summary_input():
             skipped_goal_count = 0
             for entry in goal_entries:
                 selected_goal = entry["row"]
-                result = clean_text(entry.get("result"))
+                enabled = bool(st.session_state.get(entry.get("use_key"), False))
+                result = clean_text(st.session_state.get(entry.get("result_key")))
+                mood = clean_text(st.session_state.get(entry.get("mood_key")))
+                reflect = clean_text(st.session_state.get(entry.get("reflect_key")))
+                reason = clean_text(st.session_state.get(entry.get("reason_key")))
+                staff_memo = clean_text(st.session_state.get(entry.get("memo_key")))
+                goal_staff = clean_text(st.session_state.get(entry.get("staff_key")))
+                should_save = any([enabled, result, mood, reflect, reason, staff_memo, goal_staff])
+                if not should_save:
+                    continue
                 if not result:
                     skipped_goal_count += 1
                     st.warning(f"短期目標チェック：{clean_text(selected_goal.get('短期目標'))[:40]} の実施状況が未選択のため保存対象から外しました。")
@@ -11705,11 +11732,11 @@ def show_daily_summary_input():
                     "目標ID": clean_text(selected_goal.get("目標ID")),
                     "短期目標": clean_text(selected_goal.get("短期目標")),
                     "実施状況": result,
-                    "本人の様子": clean_text(entry.get("mood"), "普段通り"),
-                    "未実施理由": clean_text(entry.get("reason")),
-                    "職員メモ": clean_text(entry.get("staff_memo")),
-                    "入力職員": clean_text(entry.get("staff"), input_staff),
-                    "モニタリング反映": clean_text(entry.get("reflect"), "反映する"),
+                    "本人の様子": clean_text(mood, "普段通り"),
+                    "未実施理由": reason,
+                    "職員メモ": staff_memo,
+                    "入力職員": clean_text(goal_staff, input_staff),
+                    "モニタリング反映": clean_text(reflect, "反映する"),
                     "登録日時": now_text,
                 })
 
