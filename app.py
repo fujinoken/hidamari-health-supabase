@@ -5,11 +5,6 @@ import json
 import html
 import hashlib
 
-try:
-    import bcrypt
-except Exception:
-    bcrypt = None
-
 import uuid
 from pathlib import Path
 from datetime import date, datetime, timedelta
@@ -25,6 +20,23 @@ import threading
 import time
 from contextlib import contextmanager
 
+from hidamari.auth.login_state import (
+    INITIAL_ACCOUNT_PASSWORD,
+    INITIAL_LOGIN_IDS,
+    clear_login_failures,
+    is_login_temporarily_locked,
+    record_login_failure,
+)
+from hidamari.auth.password import (
+    account_requires_password_change,
+    hash_password,
+    is_bcrypt_available,
+    password_hash_needs_upgrade,
+    uses_initial_password,
+    validate_new_password,
+    verify_password,
+)
+from hidamari.auth.permissions import is_admin_identity
 from hidamari.config.columns import (
     ACCOUNT_COLUMNS,
     ALERT_CONDITION_COLUMNS,
@@ -264,7 +276,7 @@ def is_admin_user():
     if isinstance(login_info, dict):
         role = role or login_info.get("role", "")
         user = user or login_info.get("username", "") or login_info.get("id", "")
-    return role == "admin" or user == "kanri"
+    return is_admin_identity(role, user)
 
 
 # 管理者専用メニュー制御
@@ -317,11 +329,6 @@ def current_login_user():
     if isinstance(login_info, dict):
         user = user or login_info.get("username", "") or login_info.get("id", "")
     return user or "kanri"
-
-INITIAL_ACCOUNT_PASSWORD = os.environ.get("HIDAMARI_INITIAL_PASSWORD", "rui").strip() or "rui"
-INITIAL_LOGIN_IDS = {"kanri", "staff"}
-LOGIN_FAILURE_LIMIT = 5
-LOGIN_LOCK_SECONDS = 300
 
 # =========================
 # ログイン設定
@@ -4356,74 +4363,6 @@ def ensure_excel_file(path, sheet_name, columns):
     ensure_dirs()
     return
 
-def is_bcrypt_available() -> bool:
-    """bcryptライブラリが利用できるか確認する。"""
-    return bcrypt is not None
-
-
-def is_bcrypt_hash(password_hash: str) -> bool:
-    """保存済みハッシュがbcrypt形式か判定する。"""
-    h = clean_text(password_hash)
-    return h.startswith("$2a$") or h.startswith("$2b$") or h.startswith("$2y$")
-
-
-def is_legacy_sha256_hash(password_hash: str) -> bool:
-    """旧SHA256形式のハッシュか判定する。"""
-    h = clean_text(password_hash)
-    if h.startswith("sha256$"):
-        return True
-    return bool(re.fullmatch(r"[0-9a-fA-F]{64}", h))
-
-
-def make_sha256_hash(password: str) -> str:
-    """互換用SHA256ハッシュ。bcrypt未導入時の緊急フォールバックにも使う。"""
-    password = clean_text(password)
-    return "sha256$" + hashlib.sha256(password.encode("utf-8")).hexdigest()
-
-
-def hash_password(password: str) -> str:
-    """
-    パスワードをbcryptでハッシュ化して保存する。
-    bcryptが未インストールの場合のみ、アプリ停止を避けるためSHA256形式で保存する。
-    ※本番運用では requirements.txt に bcrypt を追加してください。
-    """
-    password = clean_text(password)
-    if is_bcrypt_available():
-        return bcrypt.hashpw(password.encode("utf-8"), bcrypt.gensalt(rounds=12)).decode("utf-8")
-    return make_sha256_hash(password)
-
-
-def verify_password(password: str, password_hash: str) -> bool:
-    """入力パスワードと保存済みハッシュを照合する。bcrypt優先、旧SHA256互換。"""
-    password = clean_text(password)
-    stored = clean_text(password_hash)
-
-    if not password or not stored:
-        return False
-
-    # 新方式：bcrypt
-    if is_bcrypt_hash(stored):
-        if not is_bcrypt_available():
-            return False
-        try:
-            return bcrypt.checkpw(password.encode("utf-8"), stored.encode("utf-8"))
-        except Exception:
-            return False
-
-    # 旧方式：SHA256（64桁hex、または sha256$付き）
-    if is_legacy_sha256_hash(stored):
-        raw = stored.replace("sha256$", "", 1)
-        return hashlib.sha256(password.encode("utf-8")).hexdigest() == raw
-
-    # さらに古い平文保存が紛れていた場合の救済。ログイン成功後にbcryptへ自動更新する。
-    return password == stored
-
-
-def password_hash_needs_upgrade(password_hash: str) -> bool:
-    """bcryptでないハッシュは、ログイン成功時にbcryptへ自動更新する。"""
-    return is_bcrypt_available() and not is_bcrypt_hash(password_hash)
-
-
 def upgrade_account_password_hash(login_id: str, password: str):
     """旧SHA256／平文パスワードをbcryptへ自動移行する。"""
     if not is_bcrypt_available():
@@ -4708,84 +4647,6 @@ def add_login_history(login_id, label, role, result, memo=""):
             pass
 
 
-def _login_failure_key(login_id):
-    login_id = clean_text(login_id).lower()
-    return login_id or "__blank__"
-
-
-def _login_failure_store():
-    if "login_failures" not in st.session_state:
-        st.session_state["login_failures"] = {}
-    return st.session_state["login_failures"]
-
-
-def is_login_temporarily_locked(login_id):
-    store = _login_failure_store()
-    item = store.get(_login_failure_key(login_id), {})
-    locked_until = float(item.get("locked_until", 0) or 0)
-    if locked_until <= 0:
-        return False, 0
-    now_ts = now_jst_dt().timestamp()
-    if now_ts >= locked_until:
-        store.pop(_login_failure_key(login_id), None)
-        return False, 0
-    return True, int(locked_until - now_ts)
-
-
-def record_login_failure(login_id):
-    store = _login_failure_store()
-    key = _login_failure_key(login_id)
-    item = store.get(key, {"count": 0, "locked_until": 0})
-    count = int(item.get("count", 0) or 0) + 1
-    locked_until = 0
-    if count >= LOGIN_FAILURE_LIMIT:
-        locked_until = now_jst_dt().timestamp() + LOGIN_LOCK_SECONDS
-    store[key] = {"count": count, "locked_until": locked_until}
-    return count, max(LOGIN_FAILURE_LIMIT - count, 0), int(LOGIN_LOCK_SECONDS if locked_until else 0)
-
-
-def clear_login_failures(login_id):
-    try:
-        _login_failure_store().pop(_login_failure_key(login_id), None)
-    except Exception:
-        pass
-
-
-def account_requires_password_change(account_row) -> bool:
-    """アカウントが初回パスワード変更必須か判定する。"""
-    if not isinstance(account_row, dict):
-        try:
-            account_row = account_row.to_dict()
-        except Exception:
-            return False
-    value = clean_text(account_row.get("初回パスワード変更必須"))
-    return value in ["はい", "必須", "1", "true", "True", "TRUE"]
-
-
-def validate_new_password(login_id, new_password, confirm_password, current_hash=""):
-    """商品化向けの最低限のパスワード安全性チェック。"""
-    login_id = clean_text(login_id).lower()
-    new_password = clean_text(new_password)
-    confirm_password = clean_text(confirm_password)
-
-    if not new_password:
-        return False, "新しいパスワードを入力してください。"
-    if new_password != confirm_password:
-        return False, "確認用パスワードが一致しません。"
-    if len(new_password) < 8:
-        return False, "パスワードは8文字以上にしてください。"
-    weak_passwords = {INITIAL_ACCOUNT_PASSWORD.lower(), "password", "password123", "12345678", "admin123"}
-    if new_password.lower() in weak_passwords:
-        return False, "推測されやすいパスワードは使用できません。"
-    if login_id and login_id in new_password.lower():
-        return False, "ログインIDを含むパスワードは使用できません。"
-    if not re.search(r"[A-Za-z]", new_password) or not re.search(r"[0-9]", new_password):
-        return False, "英字と数字を両方含めてください。"
-    if current_hash and verify_password(new_password, current_hash):
-        return False, "現在と同じパスワードは使用できません。"
-    return True, ""
-
-
 def update_account_password(login_id, new_password, force_change="いいえ"):
     """パスワードを更新し、初回変更必須フラグを更新する。"""
     accounts = load_accounts()
@@ -4824,8 +4685,8 @@ def authenticate_user(login_id, password):
         add_login_history(login_id, row.get("表示名", ""), row.get("権限", ""), "失敗", "パスワード違い")
         return None, "IDまたはパスワードが違います。"
 
-    uses_initial_password = login_id in INITIAL_LOGIN_IDS and password == INITIAL_ACCOUNT_PASSWORD
-    if uses_initial_password:
+    uses_initial_password_value = uses_initial_password(login_id, password)
+    if uses_initial_password_value:
         row["初回パスワード変更必須"] = "はい"
         try:
             idx = hit.index[-1]
