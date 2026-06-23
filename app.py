@@ -11400,18 +11400,22 @@ def show_daily_summary_input():
             return None
         work = goal_check_df.copy()
         work["日付_dt"] = pd.to_datetime(work["日付"], errors="coerce")
-        mask = (
+        base_mask = (
             (work["日付_dt"].dt.date == record_date)
             & (work["利用者名"].astype(str) == str(user_name))
         )
         goal_id = clean_text(goal_row.get("目標ID"))
+        goal_text = clean_text(goal_row.get("短期目標"))
+        hit = pd.DataFrame(columns=work.columns)
         if goal_id:
-            mask = mask & (work["目標ID"].astype(str) == goal_id)
-        else:
-            mask = mask & (work["短期目標"].astype(str) == clean_text(goal_row.get("短期目標")))
-        hit = work[mask].copy()
+            hit = work[base_mask & (work["目標ID"].astype(str) == goal_id)].copy()
+        if hit.empty and goal_text:
+            hit = work[base_mask & (work["短期目標"].astype(str) == goal_text)].copy()
         if hit.empty:
             return None
+        if "登録日時" in hit.columns:
+            hit["_登録日時_sort"] = pd.to_datetime(hit["登録日時"], errors="coerce")
+            hit = hit.sort_values("_登録日時_sort")
         return hit.iloc[-1]
 
     with st.expander("1. 健康チェック", expanded=True):
@@ -11532,7 +11536,9 @@ def show_daily_summary_input():
                 goal_id = clean_text(goal_row.get("目標ID"))
                 support_text = clean_text(goal_row.get("支援内容"), "支援内容の記載はありません。")
                 existing_goal_check = summary_existing_goal_check(goal_row)
-                key_seed = f"{context_key}_{i}_{goal_id}_{goal_text}_{summary_text(existing_goal_check, '記録ID', 'new')}"
+                goal_identity = goal_id or hashlib.md5(goal_text.encode("utf-8")).hexdigest()[:10]
+                goal_key = f"{goal_identity}_{i}"
+                key_seed = f"{context_key}_{goal_key}"
                 key_suffix = hashlib.md5(key_seed.encode("utf-8")).hexdigest()[:10]
 
                 st.markdown(f"#### 短期目標 {i}")
@@ -11568,6 +11574,7 @@ def show_daily_summary_input():
                     goal_entries.append({
                         "row": goal_row,
                         "existing": existing_goal_check,
+                        "goal_key": goal_key,
                         "result": result,
                         "mood": mood,
                         "reflect": reflect,
@@ -11662,8 +11669,9 @@ def show_daily_summary_input():
                     confirmation_count += 1
                     continue
                 uid = get_user_id_by_name(user_name) or ensure_user_id_value(clean_text(selected_goal.get("user_id")), user_name)
+                existing_record_id = summary_text(entry.get("existing"), "記録ID")
                 goal_records.append({
-                    "記録ID": summary_text(entry.get("existing"), "記録ID", str(uuid.uuid4())),
+                    "記録ID": existing_record_id or str(uuid.uuid4()),
                     "日付": record_date.strftime("%Y-%m-%d"),
                     "利用者名": user_name,
                     "user_id": uid,
