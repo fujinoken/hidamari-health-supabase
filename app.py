@@ -186,12 +186,17 @@ def current_login_user():
         user = user or login_info.get("username", "") or login_info.get("id", "")
     return user or "kanri"
 
+INITIAL_ACCOUNT_PASSWORD = os.environ.get("HIDAMARI_INITIAL_PASSWORD", "rui").strip() or "rui"
+INITIAL_LOGIN_IDS = {"kanri", "staff"}
+LOGIN_FAILURE_LIMIT = 5
+LOGIN_LOCK_SECONDS = 300
+
 # =========================
 # ログイン設定
 # =========================
 USERS = {
-    "kanri": {"password": "rui", "role": "admin", "label": "管理者"},
-    "staff": {"password": "rui", "role": "staff", "label": "職員"},
+    "kanri": {"password": INITIAL_ACCOUNT_PASSWORD, "role": "admin", "label": "管理者"},
+    "staff": {"password": INITIAL_ACCOUNT_PASSWORD, "role": "staff", "label": "職員"},
 }
 
 
@@ -3892,6 +3897,10 @@ def clean_text(value, default=""):
     return text
 
 
+def html_escape_text(value, default=""):
+    return html.escape(clean_text(value, default), quote=True)
+
+
 def safe_float(value, default=0.0):
     try:
         if pd.isna(value) or value == "":
@@ -4702,7 +4711,7 @@ def default_account_rows():
         {
             "ログインID": "kanri",
             "表示名": "管理者",
-            "パスワードハッシュ": hash_password("rui"),
+            "パスワードハッシュ": hash_password(INITIAL_ACCOUNT_PASSWORD),
             "権限": "admin",
             "状態": "有効",
             "備考": "初期管理者。削除・無効化するとログインできなくなるため注意してください。",
@@ -4714,7 +4723,7 @@ def default_account_rows():
         {
             "ログインID": "staff",
             "表示名": "職員",
-            "パスワードハッシュ": hash_password("rui"),
+            "パスワードハッシュ": hash_password(INITIAL_ACCOUNT_PASSWORD),
             "権限": "staff",
             "状態": "有効",
             "備考": "初期職員アカウント",
@@ -4743,7 +4752,7 @@ def normalize_accounts_df(df):
 
     # Ver3.9：初回パスワード変更必須化。
     # 既存DBに列がない場合はここで安全に補完する。
-    # 初期ID（kanri/staff）で、まだ既定パスワード rui のままなら必ず変更対象にする。
+    # 初期ID（kanri/staff）で、まだ既定パスワードのままなら必ず変更対象にする。
     if "初回パスワード変更必須" in work.columns:
         work["初回パスワード変更必須"] = work["初回パスワード変更必須"].map(lambda x: clean_text(x))
         for idx, row in work.iterrows():
@@ -4752,10 +4761,10 @@ def normalize_accounts_df(df):
             password_hash = clean_text(row.get("パスワードハッシュ"))
             if current_value == "":
                 try:
-                    default_pw = verify_password("rui", password_hash)
+                    default_pw = verify_password(INITIAL_ACCOUNT_PASSWORD, password_hash)
                 except Exception:
                     default_pw = False
-                work.at[idx, "初回パスワード変更必須"] = "はい" if (login_id in ["kanri", "staff"] and default_pw) else "いいえ"
+                work.at[idx, "初回パスワード変更必須"] = "はい" if (login_id in INITIAL_LOGIN_IDS and default_pw) else "いいえ"
             elif current_value.lower() in ["true", "1", "yes", "有", "必須", "on"]:
                 work.at[idx, "初回パスワード変更必須"] = "はい"
             else:
@@ -4955,6 +4964,49 @@ def add_login_history(login_id, label, role, result, memo=""):
             pass
 
 
+def _login_failure_key(login_id):
+    login_id = clean_text(login_id).lower()
+    return login_id or "__blank__"
+
+
+def _login_failure_store():
+    if "login_failures" not in st.session_state:
+        st.session_state["login_failures"] = {}
+    return st.session_state["login_failures"]
+
+
+def is_login_temporarily_locked(login_id):
+    store = _login_failure_store()
+    item = store.get(_login_failure_key(login_id), {})
+    locked_until = float(item.get("locked_until", 0) or 0)
+    if locked_until <= 0:
+        return False, 0
+    now_ts = now_jst_dt().timestamp()
+    if now_ts >= locked_until:
+        store.pop(_login_failure_key(login_id), None)
+        return False, 0
+    return True, int(locked_until - now_ts)
+
+
+def record_login_failure(login_id):
+    store = _login_failure_store()
+    key = _login_failure_key(login_id)
+    item = store.get(key, {"count": 0, "locked_until": 0})
+    count = int(item.get("count", 0) or 0) + 1
+    locked_until = 0
+    if count >= LOGIN_FAILURE_LIMIT:
+        locked_until = now_jst_dt().timestamp() + LOGIN_LOCK_SECONDS
+    store[key] = {"count": count, "locked_until": locked_until}
+    return count, max(LOGIN_FAILURE_LIMIT - count, 0), int(LOGIN_LOCK_SECONDS if locked_until else 0)
+
+
+def clear_login_failures(login_id):
+    try:
+        _login_failure_store().pop(_login_failure_key(login_id), None)
+    except Exception:
+        pass
+
+
 def account_requires_password_change(account_row) -> bool:
     """アカウントが初回パスワード変更必須か判定する。"""
     if not isinstance(account_row, dict):
@@ -4978,7 +5030,8 @@ def validate_new_password(login_id, new_password, confirm_password, current_hash
         return False, "確認用パスワードが一致しません。"
     if len(new_password) < 8:
         return False, "パスワードは8文字以上にしてください。"
-    if new_password.lower() in ["rui", "password", "password123", "12345678", "admin123"]:
+    weak_passwords = {INITIAL_ACCOUNT_PASSWORD.lower(), "password", "password123", "12345678", "admin123"}
+    if new_password.lower() in weak_passwords:
         return False, "推測されやすいパスワードは使用できません。"
     if login_id and login_id in new_password.lower():
         return False, "ログインIDを含むパスワードは使用できません。"
@@ -5026,6 +5079,16 @@ def authenticate_user(login_id, password):
     if not verify_password(password, row.get("パスワードハッシュ", "")):
         add_login_history(login_id, row.get("表示名", ""), row.get("権限", ""), "失敗", "パスワード違い")
         return None, "IDまたはパスワードが違います。"
+
+    uses_initial_password = login_id in INITIAL_LOGIN_IDS and password == INITIAL_ACCOUNT_PASSWORD
+    if uses_initial_password:
+        row["初回パスワード変更必須"] = "はい"
+        try:
+            idx = hit.index[-1]
+            accounts.at[idx, "初回パスワード変更必須"] = "はい"
+            save_accounts(accounts)
+        except Exception:
+            pass
 
     # 旧SHA256／平文形式だった場合、ログイン成功時にbcryptへ自動移行する
     if password_hash_needs_upgrade(row.get("パスワードハッシュ", "")):
@@ -13987,9 +14050,15 @@ def login_check():
         if st.button("ログイン", use_container_width=True):
             login_id = clean_text(input_id).lower()
             login_password = clean_text(input_password)
+            locked, remaining_seconds = is_login_temporarily_locked(login_id)
+            if locked:
+                st.error(f"ログイン失敗が続いたため、一時的に制限しています。約{max(remaining_seconds, 1)}秒後に再試行してください。")
+                return False
+
             user, err = authenticate_user(login_id, login_password)
 
             if user:
+                clear_login_failures(login_id)
                 st.session_state.logged_in = True
                 st.session_state.role = clean_text(user.get("権限", "staff"), "staff")
                 st.session_state.user_label = clean_text(user.get("表示名", login_id), login_id)
@@ -14006,7 +14075,13 @@ def login_check():
                 st.session_state["hidamari_login_message"] = random.choice(HIDAMARI_MESSAGES)
                 st.rerun()
             else:
-                st.error(err or "IDまたはパスワードが違います。")
+                count, remaining, locked_seconds = record_login_failure(login_id)
+                if locked_seconds:
+                    st.error(f"ログイン失敗が{count}回続いたため、約{locked_seconds}秒間ログインを制限します。")
+                elif remaining > 0:
+                    st.error((err or "IDまたはパスワードが違います。") + f"（あと{remaining}回失敗すると一時制限されます）")
+                else:
+                    st.error(err or "IDまたはパスワードが違います。")
 
     return False
 
@@ -14476,22 +14551,28 @@ def apply_design():
 
 def ui_section(title, caption="", icon="☀️"):
     """画面見出しの共通部品。今後のUI改修はここを使う。"""
-    caption_html = f'<div class="ui-section-caption">{caption}</div>' if caption else ''
-    st.markdown(f'<div class="ui-section-title"><span>{icon}</span><span>{title}</span></div>{caption_html}', unsafe_allow_html=True)
+    safe_icon = html_escape_text(icon)
+    safe_title = html_escape_text(title)
+    safe_caption = html_escape_text(caption)
+    caption_html = f'<div class="ui-section-caption">{safe_caption}</div>' if safe_caption else ''
+    st.markdown(f'<div class="ui-section-title"><span>{safe_icon}</span><span>{safe_title}</span></div>{caption_html}', unsafe_allow_html=True)
 
 
 def ui_card(title, body="", icon="", soft=False):
     """カード表示の共通部品。"""
     cls = "ui-card-soft" if soft else "ui-card"
-    title_html = f"<strong>{icon + ' ' if icon else ''}{title}</strong>" if title else ""
-    st.markdown(f'<div class="{cls}">{title_html}<div style="margin-top:4px; line-height:1.65; color:var(--hidamari-sub);">{body}</div></div>', unsafe_allow_html=True)
+    safe_icon = html_escape_text(icon)
+    safe_title = html_escape_text(title)
+    safe_body = html_escape_text(body)
+    title_html = f"<strong>{safe_icon + ' ' if safe_icon else ''}{safe_title}</strong>" if safe_title else ""
+    st.markdown(f'<div class="{cls}">{title_html}<div style="margin-top:4px; line-height:1.65; color:var(--hidamari-sub);">{safe_body}</div></div>', unsafe_allow_html=True)
 
 
 def ui_badges(items):
     """小さな状態表示バッジ。"""
-    html = "".join([f'<span class="ui-badge">{clean_text(x)}</span>' for x in items if clean_text(x)])
-    if html:
-        st.markdown(html, unsafe_allow_html=True)
+    badge_html = "".join([f'<span class="ui-badge">{html_escape_text(x)}</span>' for x in items if clean_text(x)])
+    if badge_html:
+        st.markdown(badge_html, unsafe_allow_html=True)
 
 
 def apply_product_ui_ux():
@@ -14807,20 +14888,23 @@ def product_ui_notice():
 
 def danger_note(text):
     """削除・復元などの危険操作用の共通表示。"""
-    st.markdown(f'<div class="danger-note">{clean_text(text)}</div>', unsafe_allow_html=True)
+    st.markdown(f'<div class="danger-note">{html_escape_text(text)}</div>', unsafe_allow_html=True)
 
 
 def safe_note(text):
     """通常の安心メッセージ用の共通表示。"""
-    st.markdown(f'<div class="safe-note">{clean_text(text)}</div>', unsafe_allow_html=True)
+    st.markdown(f'<div class="safe-note">{html_escape_text(text)}</div>', unsafe_allow_html=True)
 
 
 
 
 def os_mindset_box(title, body, icon="📝"):
     """Ver3.1 現場OSマインド共通表示。責めず、観察し、共有し、次につなぐ。"""
+    safe_icon = html_escape_text(icon)
+    safe_title = html_escape_text(title)
+    safe_body = html_escape_text(body)
     st.markdown(
-        f'<div class="mindset-box"><div class="mindset-title">{icon} {title}</div><div>{body}</div></div>',
+        f'<div class="mindset-box"><div class="mindset-title">{safe_icon} {safe_title}</div><div>{safe_body}</div></div>',
         unsafe_allow_html=True,
     )
 
@@ -15988,29 +16072,36 @@ def show_my_dashboard_blocks(target_date=None):
                     memo_lines = []
                     st.markdown("#### 確認メモ")
                     for _, row in display_df.iterrows():
-                        date_label = clean_text(row.get("日付", ""))
-                        row_user = clean_text(row.get("利用者名", ""))
-                        change_text = clean_text(row.get("気になる変化", ""))
-                        family_text = clean_text(row.get("家族共有メモ", ""))
-                        staff_text = clean_text(row.get("入力者", ""))
+                        date_label_raw = clean_text(row.get("日付", ""))
+                        row_user_raw = clean_text(row.get("利用者名", ""))
+                        change_text_raw = clean_text(row.get("気になる変化", ""))
+                        family_text_raw = clean_text(row.get("家族共有メモ", ""))
+                        staff_text_raw = clean_text(row.get("入力者", ""))
+                        date_label = html_escape_text(date_label_raw)
+                        row_user = html_escape_text(row_user_raw)
+                        change_text = html_escape_text(change_text_raw)
+                        family_text = html_escape_text(family_text_raw)
+                        staff_text = html_escape_text(staff_text_raw)
+                        family_display = family_text if family_text else "記録なし"
+                        staff_display = staff_text if staff_text else "未入力"
 
                         st.markdown(
                             f"""
                             <div style='background:#FFF8E8; border:1px solid #E5C782; border-radius:14px; padding:12px 14px; margin:8px 0;'>
                                 <b>{date_label}　{row_user}</b><br>
                                 <span style='color:#7A4A00;'>気になる変化：</span>{change_text}<br>
-                                <span style='color:#666;'>家族共有メモ：</span>{family_text if family_text else '記録なし'}<br>
-                                <span style='color:#888; font-size:0.9rem;'>入力者：{staff_text if staff_text else '未入力'}</span>
+                                <span style='color:#666;'>家族共有メモ：</span>{family_display}<br>
+                                <span style='color:#888; font-size:0.9rem;'>入力者：{staff_display}</span>
                             </div>
                             """,
                             unsafe_allow_html=True,
                         )
 
                         memo_lines.append(
-                            f"{date_label}　{row_user}\n"
-                            f"気になる変化：{change_text}\n"
-                            f"家族共有メモ：{family_text if family_text else '記録なし'}\n"
-                            f"入力者：{staff_text if staff_text else '未入力'}"
+                            f"{date_label_raw}　{row_user_raw}\n"
+                            f"気になる変化：{change_text_raw}\n"
+                            f"家族共有メモ：{family_text_raw if family_text_raw else '記録なし'}\n"
+                            f"入力者：{staff_text_raw if staff_text_raw else '未入力'}"
                         )
 
                     export_text = f"前日の気になる変化（全員）　{prev_day.strftime('%Y/%m/%d')}\n\n" + "\n\n".join(memo_lines)
@@ -17557,29 +17648,36 @@ elif menu == "管理者支援":
                     st.markdown("#### 日付ごとの確認メモ")
                     memo_lines = []
                     for _, row in display_df.iterrows():
-                        date_label = clean_text(row.get("日付", ""))
-                        row_user = clean_text(row.get("利用者名", ""))
-                        change_text = clean_text(row.get("気になる変化", ""))
-                        family_text = clean_text(row.get("家族共有メモ", ""))
-                        staff_text = clean_text(row.get("入力者", ""))
+                        date_label_raw = clean_text(row.get("日付", ""))
+                        row_user_raw = clean_text(row.get("利用者名", ""))
+                        change_text_raw = clean_text(row.get("気になる変化", ""))
+                        family_text_raw = clean_text(row.get("家族共有メモ", ""))
+                        staff_text_raw = clean_text(row.get("入力者", ""))
+                        date_label = html_escape_text(date_label_raw)
+                        row_user = html_escape_text(row_user_raw)
+                        change_text = html_escape_text(change_text_raw)
+                        family_text = html_escape_text(family_text_raw)
+                        staff_text = html_escape_text(staff_text_raw)
+                        family_display = family_text if family_text else "記録なし"
+                        staff_display = staff_text if staff_text else "未入力"
 
                         st.markdown(
                             f"""
                             <div style='background:#FFF8E8; border:1px solid #E5C782; border-radius:14px; padding:12px 14px; margin:8px 0;'>
                                 <b>{date_label}　{row_user}</b><br>
                                 <span style='color:#7A4A00;'>気になる変化：</span>{change_text}<br>
-                                <span style='color:#666;'>家族共有メモ：</span>{family_text if family_text else '記録なし'}<br>
-                                <span style='color:#888; font-size:0.9rem;'>入力者：{staff_text if staff_text else '未入力'}</span>
+                                <span style='color:#666;'>家族共有メモ：</span>{family_display}<br>
+                                <span style='color:#888; font-size:0.9rem;'>入力者：{staff_display}</span>
                             </div>
                             """,
                             unsafe_allow_html=True,
                         )
 
                         memo_lines.append(
-                            f"{date_label}　{row_user}\n"
-                            f"気になる変化：{change_text}\n"
-                            f"家族共有メモ：{family_text if family_text else '記録なし'}\n"
-                            f"入力者：{staff_text if staff_text else '未入力'}"
+                            f"{date_label_raw}　{row_user_raw}\n"
+                            f"気になる変化：{change_text_raw}\n"
+                            f"家族共有メモ：{family_text_raw if family_text_raw else '記録なし'}\n"
+                            f"入力者：{staff_text_raw if staff_text_raw else '未入力'}"
                         )
 
                     safe_user_label = re.sub(r"[\\/:*?\"<>|\s]+", "_", user_label)
