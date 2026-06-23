@@ -11364,39 +11364,94 @@ def show_daily_summary_input():
 
     user_id = get_user_id_by_name(user_name) or ensure_user_id_value("", user_name)
     now_text = format_now_jst("%Y-%m-%d %H:%M:%S")
+    context_key = hashlib.md5(f"{record_date}_{user_name}".encode("utf-8")).hexdigest()[:10]
+
+    health_df = load_health_data(start_date=record_date, end_date=record_date)
+    health_idx = find_health_index(health_df, record_date, user_name)
+    existing_health = health_df.loc[health_idx] if health_idx is not None else None
+
+    ex_df = load_excretion_data(start_date=record_date, end_date=record_date)
+    day_excretion = get_day_excretion_data(ex_df, record_date, user_name)
+
+    goal_check_df = load_short_goal_checks(start_date=record_date, end_date=record_date)
+    goal_check_df = normalize_df_columns(goal_check_df, SHORT_GOAL_CHECK_COLUMNS)
+
+    def summary_text(row, col, default=""):
+        if row is None:
+            return default
+        return clean_text(row.get(col), default)
+
+    def summary_int(row, col, default=0):
+        if row is None:
+            return default
+        return safe_int(row.get(col), default)
+
+    def summary_float(row, col, default=0.0):
+        if row is None:
+            return default
+        return safe_float(row.get(col), default)
+
+    def summary_option_index(options, value, default=0):
+        value = clean_text(value)
+        return options.index(value) if value in options else default
+
+    def summary_existing_goal_check(goal_row):
+        if goal_check_df.empty:
+            return None
+        work = goal_check_df.copy()
+        work["日付_dt"] = pd.to_datetime(work["日付"], errors="coerce")
+        mask = (
+            (work["日付_dt"].dt.date == record_date)
+            & (work["利用者名"].astype(str) == str(user_name))
+        )
+        goal_id = clean_text(goal_row.get("目標ID"))
+        if goal_id:
+            mask = mask & (work["目標ID"].astype(str) == goal_id)
+        else:
+            mask = mask & (work["短期目標"].astype(str) == clean_text(goal_row.get("短期目標")))
+        hit = work[mask].copy()
+        if hit.empty:
+            return None
+        return hit.iloc[-1]
 
     with st.expander("1. 健康チェック", expanded=True):
+        if existing_health is not None:
+            st.info("この記録日・利用者名の健康チェックデータは既にあります。\n保存するとこの内容で更新されます。前回の内容を表示しています。")
+
         h1, h2, h3 = st.columns(3)
         with h1:
-            temp = st.number_input("体温", min_value=0.0, max_value=45.0, value=0.0, step=0.1, key="daily_summary_health_temp")
-            bp_high = st.number_input("血圧上", min_value=0, max_value=250, value=0, step=1, key="daily_summary_health_bp_high")
-            bp_low = st.number_input("血圧下", min_value=0, max_value=150, value=0, step=1, key="daily_summary_health_bp_low")
+            temp = st.number_input("体温", min_value=0.0, max_value=45.0, value=summary_float(existing_health, "体温", 0.0), step=0.1, key=f"daily_summary_health_temp_{context_key}")
+            bp_high = st.number_input("血圧上", min_value=0, max_value=250, value=summary_int(existing_health, "血圧上", 0), step=1, key=f"daily_summary_health_bp_high_{context_key}")
+            bp_low = st.number_input("血圧下", min_value=0, max_value=150, value=summary_int(existing_health, "血圧下", 0), step=1, key=f"daily_summary_health_bp_low_{context_key}")
         with h2:
-            pulse = st.number_input("脈拍", min_value=0, max_value=200, value=0, step=1, key="daily_summary_health_pulse")
-            spo2 = st.number_input("SpO2", min_value=0, max_value=100, value=0, step=1, key="daily_summary_health_spo2")
-            weight_raw = st.text_input("体重（任意）", placeholder="例：56.2", key="daily_summary_health_weight")
+            pulse = st.number_input("脈拍", min_value=0, max_value=200, value=summary_int(existing_health, "脈拍", 0), step=1, key=f"daily_summary_health_pulse_{context_key}")
+            spo2 = st.number_input("SpO2", min_value=0, max_value=100, value=summary_int(existing_health, "SpO2", 0), step=1, key=f"daily_summary_health_spo2_{context_key}")
+            weight_raw = st.text_input("体重（任意）", value=format_weight_value(summary_text(existing_health, "体重")), placeholder="例：56.2", key=f"daily_summary_health_weight_{context_key}")
         with h3:
-            water_ml = st.number_input("水分摂取量ml", min_value=0, max_value=5000, value=0, step=50, key="daily_summary_health_water")
+            water_ml = st.number_input("水分摂取量ml", min_value=0, max_value=5000, value=summary_int(existing_health, "水分摂取量ml", 0), step=50, key=f"daily_summary_health_water_{context_key}")
             nutrition_options = [""] + NUTRITION_RISK_OPTIONS
-            nutrition_risk = st.selectbox("栄養リスク", nutrition_options, key="daily_summary_health_nutrition")
+            nutrition_risk = st.selectbox("栄養リスク", nutrition_options, index=summary_option_index(nutrition_options, summary_text(existing_health, "栄養リスク")), key=f"daily_summary_health_nutrition_{context_key}")
             oral_options = [""] + ORAL_STATUS_OPTIONS
-            oral_status = st.selectbox("口腔状態", oral_options, key="daily_summary_health_oral")
+            oral_status = st.selectbox("口腔状態", oral_options, index=summary_option_index(oral_options, summary_text(existing_health, "口腔状態")), key=f"daily_summary_health_oral_{context_key}")
 
         m1, m2, m3, m4 = st.columns(4)
         meal_options = [""] + MEAL_INTAKE_OPTIONS
+        breakfast_default = summary_text(existing_health, "朝食摂取区分", meal_option_from_percent(summary_int(existing_health, "朝食摂取率", 0)) if existing_health is not None else "")
+        lunch_default = summary_text(existing_health, "昼食摂取区分", meal_option_from_percent(summary_int(existing_health, "昼食摂取率", 0)) if existing_health is not None else "")
+        dinner_default = summary_text(existing_health, "夕食摂取区分", meal_option_from_percent(summary_int(existing_health, "夕食摂取率", 0)) if existing_health is not None else "")
         with m1:
-            breakfast_code = st.selectbox("朝食", meal_options, key="daily_summary_health_breakfast")
+            breakfast_code = st.selectbox("朝食", meal_options, index=summary_option_index(meal_options, breakfast_default), key=f"daily_summary_health_breakfast_{context_key}")
         with m2:
-            lunch_code = st.selectbox("昼食", meal_options, key="daily_summary_health_lunch")
+            lunch_code = st.selectbox("昼食", meal_options, index=summary_option_index(meal_options, lunch_default), key=f"daily_summary_health_lunch_{context_key}")
         with m3:
-            dinner_code = st.selectbox("夕食", meal_options, key="daily_summary_health_dinner")
+            dinner_code = st.selectbox("夕食", meal_options, index=summary_option_index(meal_options, dinner_default), key=f"daily_summary_health_dinner_{context_key}")
         with m4:
             denture_options = [""] + DENTURE_OPTIONS
-            denture_status = st.selectbox("義歯使用", denture_options, key="daily_summary_health_denture")
+            denture_status = st.selectbox("義歯使用", denture_options, index=summary_option_index(denture_options, summary_text(existing_health, "義歯使用")), key=f"daily_summary_health_denture_{context_key}")
 
-        life_memo = st.text_area("LIFE補助メモ", key="daily_summary_health_life_memo")
-        family_memo = st.text_area("家族共有メモ", key="daily_summary_health_family_memo")
-        changes = st.text_area("気になる変化・申し送り", key="daily_summary_health_changes")
+        life_memo = st.text_area("LIFE補助メモ", value=summary_text(existing_health, "LIFE補助メモ"), key=f"daily_summary_health_life_memo_{context_key}")
+        family_memo = st.text_area("家族共有メモ", value=summary_text(existing_health, "家族共有メモ"), key=f"daily_summary_health_family_memo_{context_key}")
+        changes = st.text_area("気になる変化・申し送り", value=summary_text(existing_health, "気になる変化"), key=f"daily_summary_health_changes_{context_key}")
 
     health_values = [
         temp,
@@ -11416,25 +11471,30 @@ def show_daily_summary_input():
         clean_text(family_memo),
         clean_text(changes),
     ]
-    has_health_input = any(bool(v) for v in health_values)
+    has_health_input = existing_health is not None or any(bool(v) for v in health_values)
 
     with st.expander("2. 排泄チェック", expanded=True):
+        if not day_excretion.empty:
+            st.info("この記録日・利用者名の排泄チェックデータは既にあります。\n保存するとこの内容で更新されます。前回の内容を表示しています。")
         st.caption("記録する時間帯だけチェックしてください。")
         excretion_records = []
         for i, (slot, time_label) in enumerate(EXCRETION_SLOTS):
             with st.container():
+                existing_excretion = get_excretion_row(ex_df, record_date, user_name, slot)
+                ex_key_seed = f"{context_key}_{slot}_{clean_text(existing_excretion.get('登録日時')) if existing_excretion is not None else 'new'}"
+                ex_key = hashlib.md5(ex_key_seed.encode("utf-8")).hexdigest()[:10]
                 st.markdown(f"#### {slot}（{time_label}）")
-                use_slot = st.checkbox("この時間帯を記録する", key=f"daily_summary_ex_use_{i}")
+                use_slot = st.checkbox("この時間帯を記録する", value=existing_excretion is not None, key=f"daily_summary_ex_use_{i}_{ex_key}")
                 e1, e2, e3, e4 = st.columns(4)
                 with e1:
-                    urine_amount = st.selectbox("尿量", URINE_AMOUNT_OPTIONS, index=0, key=f"daily_summary_ex_urine_amount_{i}")
+                    urine_amount = st.selectbox("尿量", URINE_AMOUNT_OPTIONS, index=get_option_index(URINE_AMOUNT_OPTIONS, summary_text(existing_excretion, "尿量", "なし")), key=f"daily_summary_ex_urine_amount_{i}_{ex_key}")
                 with e2:
-                    urine_type = st.selectbox("尿性状", URINE_TYPE_OPTIONS, index=0, key=f"daily_summary_ex_urine_type_{i}")
+                    urine_type = st.selectbox("尿性状", URINE_TYPE_OPTIONS, index=get_option_index(URINE_TYPE_OPTIONS, summary_text(existing_excretion, "尿性状", "なし")), key=f"daily_summary_ex_urine_type_{i}_{ex_key}")
                 with e3:
-                    stool_amount = st.selectbox("便量", STOOL_AMOUNT_OPTIONS, index=0, key=f"daily_summary_ex_stool_amount_{i}")
+                    stool_amount = st.selectbox("便量", STOOL_AMOUNT_OPTIONS, index=get_option_index(STOOL_AMOUNT_OPTIONS, summary_text(existing_excretion, "便量", "なし")), key=f"daily_summary_ex_stool_amount_{i}_{ex_key}")
                 with e4:
-                    stool_type = st.selectbox("便性状", STOOL_TYPE_OPTIONS, index=0, key=f"daily_summary_ex_stool_type_{i}")
-                memo = st.text_area("排泄メモ", height=70, key=f"daily_summary_ex_memo_{i}")
+                    stool_type = st.selectbox("便性状", STOOL_TYPE_OPTIONS, index=get_option_index(STOOL_TYPE_OPTIONS, summary_text(existing_excretion, "便性状", "なし")), key=f"daily_summary_ex_stool_type_{i}_{ex_key}")
+                memo = st.text_area("排泄メモ", value=summary_text(existing_excretion, "排泄メモ"), height=70, key=f"daily_summary_ex_memo_{i}_{ex_key}")
 
                 if use_slot:
                     if urine_amount == "なし":
@@ -11471,25 +11531,31 @@ def show_daily_summary_input():
                 goal_text = clean_text(goal_row.get("短期目標"))
                 goal_id = clean_text(goal_row.get("目標ID"))
                 support_text = clean_text(goal_row.get("支援内容"), "支援内容の記載はありません。")
-                key_seed = f"{i}_{goal_id}_{goal_text}"
+                existing_goal_check = summary_existing_goal_check(goal_row)
+                key_seed = f"{context_key}_{i}_{goal_id}_{goal_text}_{summary_text(existing_goal_check, '記録ID', 'new')}"
                 key_suffix = hashlib.md5(key_seed.encode("utf-8")).hexdigest()[:10]
 
                 st.markdown(f"#### 短期目標 {i}")
                 st.write(goal_text or "短期目標の内容が未入力です。")
                 st.caption("支援内容")
                 st.info(support_text)
+                if existing_goal_check is not None:
+                    st.info("この短期目標の実施チェックは既にあります。\n保存するとこの内容で更新されます。前回の内容を表示しています。")
 
-                use_goal = st.checkbox("この短期目標を記録する", key=f"daily_summary_goal_use_{key_suffix}")
+                use_goal = st.checkbox("この短期目標を記録する", value=existing_goal_check is not None, key=f"daily_summary_goal_use_{key_suffix}")
                 g1, g2, g3 = st.columns(3)
                 with g1:
-                    result = st.selectbox("実施状況", ["", "実施", "一部実施", "未実施"], key=f"daily_summary_goal_result_{key_suffix}")
+                    result_options = ["", "実施", "一部実施", "未実施"]
+                    result = st.selectbox("実施状況", result_options, index=summary_option_index(result_options, summary_text(existing_goal_check, "実施状況")), key=f"daily_summary_goal_result_{key_suffix}")
                 with g2:
-                    mood = st.selectbox("本人の様子", ["", "穏やか", "普段通り", "不安あり", "拒否あり", "疲労あり", "痛み訴えあり", "その他"], key=f"daily_summary_goal_mood_{key_suffix}")
+                    mood_options = ["", "穏やか", "普段通り", "不安あり", "拒否あり", "疲労あり", "痛み訴えあり", "その他"]
+                    mood = st.selectbox("本人の様子", mood_options, index=summary_option_index(mood_options, summary_text(existing_goal_check, "本人の様子")), key=f"daily_summary_goal_mood_{key_suffix}")
                 with g3:
-                    reflect = st.selectbox("モニタリング反映", ["", "反映する", "反映しない"], key=f"daily_summary_goal_reflect_{key_suffix}")
-                reason = st.text_input("未実施理由・一部実施の理由", key=f"daily_summary_goal_reason_{key_suffix}")
-                staff_memo = st.text_area("職員メモ", key=f"daily_summary_goal_staff_memo_{key_suffix}")
-                goal_staff = st.text_input("入力職員", value=input_staff, key=f"daily_summary_goal_staff_{key_suffix}")
+                    reflect_options = ["", "反映する", "反映しない"]
+                    reflect = st.selectbox("モニタリング反映", reflect_options, index=summary_option_index(reflect_options, summary_text(existing_goal_check, "モニタリング反映")), key=f"daily_summary_goal_reflect_{key_suffix}")
+                reason = st.text_input("未実施理由・一部実施の理由", value=summary_text(existing_goal_check, "未実施理由"), key=f"daily_summary_goal_reason_{key_suffix}")
+                staff_memo = st.text_area("職員メモ", value=summary_text(existing_goal_check, "職員メモ"), key=f"daily_summary_goal_staff_memo_{key_suffix}")
+                goal_staff = st.text_input("入力職員", value=summary_text(existing_goal_check, "入力職員", input_staff), key=f"daily_summary_goal_staff_{key_suffix}")
 
                 has_goal_detail = any([
                     clean_text(result),
@@ -11501,6 +11567,7 @@ def show_daily_summary_input():
                 if use_goal or has_goal_detail:
                     goal_entries.append({
                         "row": goal_row,
+                        "existing": existing_goal_check,
                         "result": result,
                         "mood": mood,
                         "reflect": reflect,
@@ -11516,11 +11583,15 @@ def show_daily_summary_input():
 
     if st.button("まとめて保存する", type="primary", use_container_width=True, key="daily_summary_save"):
         results = []
+        confirmation_count = 0
+        skipped_messages = []
 
         if has_health_input:
             weight, weight_error = parse_optional_weight(weight_raw)
             if weight_error:
-                results.append(("健康チェック", False, weight_error))
+                st.warning(f"健康チェック：{weight_error}")
+                confirmation_count += 1
+                skipped_messages.append("健康チェックは体重の入力内容を確認してください。")
             else:
                 health_record = {
                     "記録日": record_date,
@@ -11549,30 +11620,35 @@ def show_daily_summary_input():
                     "入力者": input_staff,
                 }
                 errors, warnings = validate_health_record(health_record)
-                for warning in warnings:
+                for warning in warnings + errors:
                     st.warning(f"健康チェック：{warning}")
+                    confirmation_count += 1
                 if errors:
-                    for error in errors:
-                        st.error(f"健康チェック：{error}")
-                    results.append(("健康チェック", False, "入力内容を確認してください"))
-                else:
+                    st.warning("健康チェックは保存します。入力値に確認が必要な項目があります。")
+                try:
                     saved = bool(upsert_health_record(health_record))
-                    results.append(("健康チェック", saved, ""))
+                    results.append(("健康チェック", "saved" if saved else "failed", ""))
+                except Exception as e:
+                    results.append(("健康チェック", "failed", str(e)))
+        else:
+            skipped_messages.append("保存する健康チェック内容はありません")
 
         if excretion_records:
             failed_slots = []
             for record in excretion_records:
                 errors, warnings = validate_excretion_record(record)
-                for warning in warnings:
+                for warning in warnings + errors:
                     st.warning(f"排泄チェック（{record.get('時間帯')}）：{warning}")
-                if errors:
+                    confirmation_count += 1
+                try:
+                    saved = bool(upsert_excretion_record(record))
+                except Exception:
+                    saved = False
+                if not saved:
                     failed_slots.append(record.get("時間帯", ""))
-                    for error in errors:
-                        st.error(f"排泄チェック（{record.get('時間帯')}）：{error}")
-                    continue
-                if not upsert_excretion_record(record):
-                    failed_slots.append(record.get("時間帯", ""))
-            results.append(("排泄チェック", not failed_slots, "、".join([x for x in failed_slots if x])))
+            results.append(("排泄チェック", "failed" if failed_slots else "saved", "、".join([x for x in failed_slots if x])))
+        else:
+            skipped_messages.append("保存する排泄チェック内容はありません")
 
         if has_goal_input:
             goal_records = []
@@ -11582,10 +11658,12 @@ def show_daily_summary_input():
                 result = clean_text(entry.get("result"))
                 if not result:
                     skipped_goal_count += 1
+                    st.warning(f"短期目標チェック：{clean_text(selected_goal.get('短期目標'))[:40]} の実施状況が未選択のため保存対象から外しました。")
+                    confirmation_count += 1
                     continue
                 uid = get_user_id_by_name(user_name) or ensure_user_id_value(clean_text(selected_goal.get("user_id")), user_name)
                 goal_records.append({
-                    "記録ID": str(uuid.uuid4()),
+                    "記録ID": summary_text(entry.get("existing"), "記録ID", str(uuid.uuid4())),
                     "日付": record_date.strftime("%Y-%m-%d"),
                     "利用者名": user_name,
                     "user_id": uid,
@@ -11601,17 +11679,19 @@ def show_daily_summary_input():
                 })
 
             if not goal_records:
-                detail = "保存対象の短期目標はありますが、実施状況が未選択です。"
-                results.append(("短期目標チェック", False, detail))
+                skipped_messages.append("保存する短期目標チェックはありません")
             else:
                 check_df = load_short_goal_checks()
                 check_df2 = pd.concat(
                     [check_df, pd.DataFrame(goal_records, columns=SHORT_GOAL_CHECK_COLUMNS)],
                     ignore_index=True,
                 )
-                saved = save_short_goal_checks(check_df2)
+                try:
+                    saved = bool(save_short_goal_checks(check_df2))
+                except Exception:
+                    saved = False
                 success_count = len(goal_records) if saved else 0
-                failed_count = len(goal_records) - success_count + skipped_goal_count
+                failed_count = len(goal_records) - success_count
                 if saved:
                     for goal_record in goal_records:
                         try:
@@ -11623,18 +11703,23 @@ def show_daily_summary_input():
                             )
                         except Exception:
                             pass
-                detail = f"{len(goal_records) + skipped_goal_count}件中{success_count}件 保存成功"
+                detail = f"{len(goal_records)}件中{success_count}件 保存成功"
                 if failed_count:
                     detail += f"、{failed_count}件保存失敗"
-                results.append(("短期目標チェック", bool(saved) and failed_count == 0, detail))
+                if skipped_goal_count:
+                    detail += f"、{skipped_goal_count}件は実施状況未選択のため未保存"
+                results.append(("短期目標チェック", "saved" if saved and failed_count == 0 else "failed", detail))
+        else:
+            skipped_messages.append("保存する短期目標チェックはありません")
 
-        if not results:
-            st.info("保存する内容がありません")
-            return
+        for message in skipped_messages:
+            st.info(message)
 
         failed = []
-        for label, ok, detail in results:
-            if ok:
+        saved = []
+        for label, status, detail in results:
+            if status == "saved":
+                saved.append(label)
                 suffix = f"：{detail}" if detail else ""
                 st.success(f"{label} 保存成功{suffix}")
             else:
@@ -11642,10 +11727,18 @@ def show_daily_summary_input():
                 suffix = f"：{detail}" if detail else ""
                 st.error(f"{label} 保存失敗{suffix}")
 
-        if failed:
+        if not saved and not failed:
+            st.info("保存する内容がありません。")
+        elif failed and saved:
             st.error("一部保存できませんでした。通信状態を確認し、続く場合は管理者へ連絡してください。")
+        elif failed:
+            st.error("保存できませんでした。通信状態を確認し、続く場合は管理者へ連絡してください。")
+        elif confirmation_count:
+            st.warning("入力された内容を保存しました。確認が必要な項目があります。")
+        elif skipped_messages:
+            st.success("入力された内容を保存しました。")
         else:
-            st.success("まとめて保存しました")
+            st.success("まとめて保存しました。")
 
 
 def show_goal_history():
