@@ -11842,6 +11842,10 @@ def show_daily_summary_input():
             total_save_targets += target_count
             total_success += success_count
             total_failed += failed_count
+
+        show_section_errors = total_success == 0 and total_failed > 0
+        for result_item in results:
+            label, status, detail, target_count, success_count, failed_count = result_item
             if status == "saved":
                 suffix = f"：{detail}" if detail else ""
                 st.success(f"{label} 保存成功{suffix}")
@@ -11850,7 +11854,10 @@ def show_daily_summary_input():
                 st.warning(f"{label} 一部保存できませんでした{suffix}")
             else:
                 suffix = f"：{detail}" if detail else ""
-                st.error(f"{label} 保存失敗{suffix}")
+                if show_section_errors:
+                    st.error(f"{label} 保存失敗{suffix}")
+                else:
+                    st.warning(f"{label} 保存できませんでした{suffix}")
 
         if total_save_targets == 0:
             st.info("保存する内容がありません。")
