@@ -11419,17 +11419,19 @@ def show_daily_summary_input():
         except Exception:
             return False
 
-    def verify_daily_summary_excretion_saved(record):
+    def verify_daily_summary_excretion_saved(record, verify_df=None):
         try:
             slot = clean_text(record.get("時間帯"))
-            verify_df = load_excretion_data(start_date=record_date, end_date=record_date)
+            if verify_df is None:
+                verify_df = load_excretion_data(start_date=record_date, end_date=record_date)
             return find_excretion_index(verify_df, record_date, user_name, slot) is not None
         except Exception:
             return False
 
-    def verify_daily_summary_short_goal_saved(goal_record):
+    def verify_daily_summary_short_goal_saved(goal_record, verify_df=None):
         try:
-            verify_df = load_short_goal_checks(start_date=record_date, end_date=record_date)
+            if verify_df is None:
+                verify_df = load_short_goal_checks(start_date=record_date, end_date=record_date)
             verify_df = normalize_df_columns(verify_df, SHORT_GOAL_CHECK_COLUMNS)
             if verify_df.empty:
                 return False
@@ -11762,6 +11764,7 @@ def show_daily_summary_input():
         if excretion_records:
             failed_slots = []
             excretion_success_count = 0
+            excretion_verify_targets = []
             for record in excretion_records:
                 errors, warnings = validate_excretion_record(record)
                 for warning in warnings + errors:
@@ -11772,11 +11775,19 @@ def show_daily_summary_input():
                 except Exception:
                     saved = False
                 if not saved:
-                    saved = verify_daily_summary_excretion_saved(record)
-                if not saved:
-                    failed_slots.append(record.get("時間帯", ""))
+                    excretion_verify_targets.append(record)
                 else:
                     excretion_success_count += 1
+            if excretion_verify_targets:
+                try:
+                    excretion_verify_df = load_excretion_data(start_date=record_date, end_date=record_date)
+                except Exception:
+                    excretion_verify_df = None
+                for record in excretion_verify_targets:
+                    if verify_daily_summary_excretion_saved(record, excretion_verify_df):
+                        excretion_success_count += 1
+                    else:
+                        failed_slots.append(record.get("時間帯", ""))
             failed_count = len(failed_slots)
             if failed_count and excretion_success_count:
                 excretion_status = "partial"
@@ -11869,7 +11880,14 @@ def show_daily_summary_input():
                 except Exception:
                     saved_all_goals = False
 
-                verified_goal_count = sum(1 for goal_record in goal_records if verify_daily_summary_short_goal_saved(goal_record))
+                try:
+                    goal_verify_df = load_short_goal_checks(start_date=record_date, end_date=record_date)
+                except Exception:
+                    goal_verify_df = None
+                verified_goal_count = sum(
+                    1 for goal_record in goal_records
+                    if verify_daily_summary_short_goal_saved(goal_record, goal_verify_df)
+                )
                 if verified_goal_count > 0:
                     success_count = verified_goal_count
                     failed_count = max(len(goal_records) - success_count, 0)
@@ -16013,7 +16031,8 @@ elif menu == "排泄チェック入力":
                 if not action:
                     failed_slots.append(record.get("時間帯", ""))
 
-            st.info(build_excretion_diff_text(load_excretion_data(), record_date, user_name))
+            saved_ex_df = load_excretion_data(start_date=record_date, end_date=record_date)
+            st.info(build_excretion_diff_text(saved_ex_df, record_date, user_name))
             if failed_slots:
                 st.error("排泄チェックを一部保存できませんでした。保存できなかった時間帯：" + "、".join([x for x in failed_slots if x]))
                 st.info("通信状態を確認し、続く場合は管理者へ連絡してください。")
@@ -16022,7 +16041,8 @@ elif menu == "排泄チェック入力":
                 st.rerun()
 
     st.subheader("この日の排泄記録")
-    day_data = get_day_excretion_data(load_excretion_data(), record_date, user_name)
+    ex_status_df = load_excretion_data(start_date=record_date, end_date=record_date)
+    day_data = get_day_excretion_data(ex_status_df, record_date, user_name)
     if day_data.empty:
         st.info("この日の排泄記録はまだありません。")
     else:
@@ -16038,7 +16058,7 @@ elif menu == "排泄チェック入力":
 
     for user in active_users:
         for slot, time_label in EXCRETION_SLOTS:
-            row = get_excretion_row(load_excretion_data(), record_date, user, slot)
+            row = get_excretion_row(ex_status_df, record_date, user, slot)
 
             if row is None:
                 missing_rows.append(
