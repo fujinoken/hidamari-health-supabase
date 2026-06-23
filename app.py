@@ -11407,6 +11407,11 @@ def show_daily_summary_input():
             return options + [value]
         return options
 
+    def summary_goal_identity(goal_row):
+        goal_id = clean_text(goal_row.get("目標ID"))
+        goal_text = clean_text(goal_row.get("短期目標"))
+        return goal_id or hashlib.md5(goal_text.encode("utf-8")).hexdigest()[:10]
+
     def summary_existing_goal_check(goal_row):
         if goal_check_df.empty:
             return None
@@ -11538,6 +11543,17 @@ def show_daily_summary_input():
             (goal_df["利用者名"].astype(str) == str(user_name))
             & (goal_df["状態"].astype(str) == "有効")
         ].copy() if not goal_df.empty else pd.DataFrame(columns=SHORT_GOAL_MASTER_COLUMNS)
+        if not user_goals.empty:
+            user_goals["_goal_identity"] = user_goals.apply(summary_goal_identity, axis=1)
+            user_goals["_goal_text_sort"] = user_goals["短期目標"].map(clean_text) if "短期目標" in user_goals.columns else ""
+            user_goals["_goal_start_sort"] = pd.to_datetime(user_goals.get("開始日", ""), errors="coerce") if "開始日" in user_goals.columns else pd.NaT
+            user_goals["_goal_registered_sort"] = pd.to_datetime(user_goals.get("登録日時", ""), errors="coerce") if "登録日時" in user_goals.columns else pd.NaT
+            user_goals = user_goals.sort_values(
+                ["_goal_identity", "_goal_start_sort", "_goal_registered_sort", "_goal_text_sort"],
+                kind="mergesort",
+            ).reset_index(drop=True)
+            user_goals["_goal_dup_no"] = user_goals.groupby("_goal_identity").cumcount()
+            user_goals["_goal_dup_count"] = user_goals.groupby("_goal_identity")["_goal_identity"].transform("count")
 
         goal_entries = []
         if user_goals.empty:
@@ -11548,8 +11564,10 @@ def show_daily_summary_input():
                 goal_id = clean_text(goal_row.get("目標ID"))
                 support_text = clean_text(goal_row.get("支援内容"), "支援内容の記載はありません。")
                 existing_goal_check = summary_existing_goal_check(goal_row)
-                goal_identity = goal_id or hashlib.md5(goal_text.encode("utf-8")).hexdigest()[:10]
-                goal_key = f"{goal_identity}_{i}"
+                goal_identity = clean_text(goal_row.get("_goal_identity")) or summary_goal_identity(goal_row)
+                goal_key = goal_identity
+                if safe_int(goal_row.get("_goal_dup_count"), 1) > 1:
+                    goal_key = f"{goal_identity}_{safe_int(goal_row.get('_goal_dup_no'), 0)}"
                 key_seed = f"{context_key}_{goal_key}"
                 key_suffix = hashlib.md5(key_seed.encode("utf-8")).hexdigest()[:10]
 
