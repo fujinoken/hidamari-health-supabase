@@ -9871,15 +9871,17 @@ def load_short_goal_checks(start_date=None, end_date=None, recent_days=None):
 def save_short_goal_checks(df):
     df = normalize_df_columns(df, SHORT_GOAL_CHECK_COLUMNS)
     df = attach_user_ids(df)
-    save_sqlite_table(
+    saved = save_sqlite_table(
         df,
         SQLITE_TABLE_SHORT_GOAL_CHECKS,
         SHORT_GOAL_CHECK_COLUMNS,
         date_cols=["日付"],
         unique_cols=["記録ID"],
     )
-    clear_hidamari_read_cache("短期目標実施チェック保存")
-    add_audit_log("保存", SQLITE_TABLE_SHORT_GOAL_CHECKS, "", "短期目標実施記録を保存しました")
+    if saved:
+        clear_hidamari_read_cache("短期目標実施チェック保存")
+        add_audit_log("保存", SQLITE_TABLE_SHORT_GOAL_CHECKS, "", "短期目標実施記録を保存しました")
+    return bool(saved)
 
 
 def load_monitoring_drafts():
@@ -11023,13 +11025,16 @@ def show_daily_goal_check():
                 "登録日時": format_now_jst("%Y-%m-%d %H:%M:%S"),
             }
             check_df2 = pd.concat([check_df, pd.DataFrame([new_row], columns=SHORT_GOAL_CHECK_COLUMNS)], ignore_index=True)
-            save_short_goal_checks(check_df2)
-            try:
-                add_audit_log("短期目標実施チェック登録", SQLITE_TABLE_SHORT_GOAL_CHECKS, new_row["記録ID"], f"{user_name} / {result} / {clean_text(selected_goal.get('短期目標'))[:80]}")
-            except Exception:
-                pass
-            st.success("実施チェックを保存しました。次回の支援・モニタリングに反映できます。")
-            st.rerun()
+            saved = save_short_goal_checks(check_df2)
+            if saved:
+                try:
+                    add_audit_log("短期目標実施チェック登録", SQLITE_TABLE_SHORT_GOAL_CHECKS, new_row["記録ID"], f"{user_name} / {result} / {clean_text(selected_goal.get('短期目標'))[:80]}")
+                except Exception:
+                    pass
+                st.success("実施チェックを保存しました。次回の支援・モニタリングに反映できます。")
+                st.rerun()
+            else:
+                st.error("実施チェックを保存できませんでした。通信状態を確認し、続く場合は管理者へ連絡してください。")
 
     # -------------------------
     # 検索・一覧
@@ -11240,18 +11245,21 @@ def show_daily_goal_check():
                                 check_df.at[idx, "モニタリング反映"] = update_reflect
                                 if not clean_text(check_df.at[idx, "登録日時"]):
                                     check_df.at[idx, "登録日時"] = format_now_jst("%Y-%m-%d %H:%M:%S")
-                                save_short_goal_checks(check_df)
-                                try:
-                                    add_audit_log(
-                                        "短期目標実施チェック更新",
-                                        SQLITE_TABLE_SHORT_GOAL_CHECKS,
-                                        selected_record_id,
-                                        f"{before_summary} → {update_date.strftime('%Y-%m-%d')} / {selected_user_for_goals} / {update_result}",
-                                    )
-                                except Exception:
-                                    pass
-                                st.success("実施チェックを更新しました。")
-                                st.rerun()
+                                saved = save_short_goal_checks(check_df)
+                                if saved:
+                                    try:
+                                        add_audit_log(
+                                            "短期目標実施チェック更新",
+                                            SQLITE_TABLE_SHORT_GOAL_CHECKS,
+                                            selected_record_id,
+                                            f"{before_summary} → {update_date.strftime('%Y-%m-%d')} / {selected_user_for_goals} / {update_result}",
+                                        )
+                                    except Exception:
+                                        pass
+                                    st.success("実施チェックを更新しました。")
+                                    st.rerun()
+                                else:
+                                    st.error("実施チェックを保存できませんでした。通信状態を確認し、続く場合は管理者へ連絡してください。")
 
     # -------------------------
     # 削除
@@ -11330,6 +11338,276 @@ def show_daily_goal_check():
                             st.rerun()
                         else:
                             st.error("削除対象が見つかりませんでした。")
+
+
+def show_daily_summary_input():
+    st.header("日々のまとめ入力")
+    st.caption("健康チェック・排泄チェック・短期目標の実施状況を、1つの画面でまとめて入力できます。")
+
+    users = get_active_user_names()
+    if not users:
+        st.warning("利用者マスタに表示中の利用者がありません。先に利用者登録を行ってください。")
+        return
+
+    c1, c2, c3 = st.columns(3)
+    with c1:
+        record_date = st.date_input("記録日", value=today_jst(), key="daily_summary_date")
+    with c2:
+        user_name = st.selectbox("利用者名", users, key="daily_summary_user")
+    with c3:
+        input_staff = st.text_input(
+            "入力者",
+            value=clean_text(st.session_state.get("user_label", "")),
+            placeholder="例：藤野",
+            key="daily_summary_staff",
+        )
+
+    user_id = get_user_id_by_name(user_name) or ensure_user_id_value("", user_name)
+    now_text = format_now_jst("%Y-%m-%d %H:%M:%S")
+
+    with st.expander("1. 健康チェック", expanded=True):
+        h1, h2, h3 = st.columns(3)
+        with h1:
+            temp = st.number_input("体温", min_value=0.0, max_value=45.0, value=0.0, step=0.1, key="daily_summary_health_temp")
+            bp_high = st.number_input("血圧上", min_value=0, max_value=250, value=0, step=1, key="daily_summary_health_bp_high")
+            bp_low = st.number_input("血圧下", min_value=0, max_value=150, value=0, step=1, key="daily_summary_health_bp_low")
+        with h2:
+            pulse = st.number_input("脈拍", min_value=0, max_value=200, value=0, step=1, key="daily_summary_health_pulse")
+            spo2 = st.number_input("SpO2", min_value=0, max_value=100, value=0, step=1, key="daily_summary_health_spo2")
+            weight_raw = st.text_input("体重（任意）", placeholder="例：56.2", key="daily_summary_health_weight")
+        with h3:
+            water_ml = st.number_input("水分摂取量ml", min_value=0, max_value=5000, value=0, step=50, key="daily_summary_health_water")
+            nutrition_options = [""] + NUTRITION_RISK_OPTIONS
+            nutrition_risk = st.selectbox("栄養リスク", nutrition_options, key="daily_summary_health_nutrition")
+            oral_options = [""] + ORAL_STATUS_OPTIONS
+            oral_status = st.selectbox("口腔状態", oral_options, key="daily_summary_health_oral")
+
+        m1, m2, m3, m4 = st.columns(4)
+        meal_options = [""] + MEAL_INTAKE_OPTIONS
+        with m1:
+            breakfast_code = st.selectbox("朝食", meal_options, key="daily_summary_health_breakfast")
+        with m2:
+            lunch_code = st.selectbox("昼食", meal_options, key="daily_summary_health_lunch")
+        with m3:
+            dinner_code = st.selectbox("夕食", meal_options, key="daily_summary_health_dinner")
+        with m4:
+            denture_options = [""] + DENTURE_OPTIONS
+            denture_status = st.selectbox("義歯使用", denture_options, key="daily_summary_health_denture")
+
+        life_memo = st.text_area("LIFE補助メモ", key="daily_summary_health_life_memo")
+        family_memo = st.text_area("家族共有メモ", key="daily_summary_health_family_memo")
+        changes = st.text_area("気になる変化・申し送り", key="daily_summary_health_changes")
+
+    health_values = [
+        temp,
+        bp_high,
+        bp_low,
+        pulse,
+        spo2,
+        water_ml,
+        clean_text(weight_raw),
+        clean_text(nutrition_risk),
+        clean_text(oral_status),
+        clean_text(denture_status),
+        clean_text(breakfast_code),
+        clean_text(lunch_code),
+        clean_text(dinner_code),
+        clean_text(life_memo),
+        clean_text(family_memo),
+        clean_text(changes),
+    ]
+    has_health_input = any(bool(v) for v in health_values)
+
+    with st.expander("2. 排泄チェック", expanded=True):
+        st.caption("記録する時間帯だけチェックしてください。")
+        excretion_records = []
+        for i, (slot, time_label) in enumerate(EXCRETION_SLOTS):
+            with st.container():
+                st.markdown(f"#### {slot}（{time_label}）")
+                use_slot = st.checkbox("この時間帯を記録する", key=f"daily_summary_ex_use_{i}")
+                e1, e2, e3, e4 = st.columns(4)
+                with e1:
+                    urine_amount = st.selectbox("尿量", URINE_AMOUNT_OPTIONS, index=0, key=f"daily_summary_ex_urine_amount_{i}")
+                with e2:
+                    urine_type = st.selectbox("尿性状", URINE_TYPE_OPTIONS, index=0, key=f"daily_summary_ex_urine_type_{i}")
+                with e3:
+                    stool_amount = st.selectbox("便量", STOOL_AMOUNT_OPTIONS, index=0, key=f"daily_summary_ex_stool_amount_{i}")
+                with e4:
+                    stool_type = st.selectbox("便性状", STOOL_TYPE_OPTIONS, index=0, key=f"daily_summary_ex_stool_type_{i}")
+                memo = st.text_area("排泄メモ", height=70, key=f"daily_summary_ex_memo_{i}")
+
+                if use_slot:
+                    if urine_amount == "なし":
+                        urine_type = "なし"
+                    if stool_amount == "なし":
+                        stool_type = "なし"
+                    excretion_records.append({
+                        "記録日": record_date,
+                        "利用者名": user_name,
+                        "user_id": user_id,
+                        "時間帯": slot,
+                        "時間帯目安": time_label,
+                        "尿量": urine_amount,
+                        "尿性状": urine_type,
+                        "便量": stool_amount,
+                        "便性状": stool_type,
+                        "排泄メモ": memo,
+                        "入力者": input_staff,
+                        "登録日時": now_text,
+                    })
+
+    with st.expander("3. 短期目標の実施チェック", expanded=True):
+        goal_df = load_short_goal_master()
+        user_goals = goal_df[
+            (goal_df["利用者名"].astype(str) == str(user_name))
+            & (goal_df["状態"].astype(str) == "有効")
+        ].copy() if not goal_df.empty else pd.DataFrame(columns=SHORT_GOAL_MASTER_COLUMNS)
+
+        goal_label_map = {}
+        for _, row in user_goals.iterrows():
+            goal_text = clean_text(row.get("短期目標"))
+            goal_id = clean_text(row.get("目標ID"))
+            if goal_text:
+                label_text = goal_text[:50] + ("…" if len(goal_text) > 50 else "")
+                goal_label_map[f"{label_text}｜{goal_id[:8]}" if goal_id else label_text] = row
+
+        if not goal_label_map:
+            st.info("この利用者の有効な短期目標がありません。必要な場合は『短期目標マスタ』で登録してください。")
+            selected_goal = None
+        else:
+            selected_goal_label = st.selectbox("短期目標", [""] + list(goal_label_map.keys()), key="daily_summary_goal_select")
+            selected_goal = goal_label_map.get(selected_goal_label)
+            if selected_goal is not None:
+                st.markdown("#### 支援内容")
+                st.info(clean_text(selected_goal.get("支援内容"), "支援内容の記載はありません。"))
+
+        g1, g2, g3 = st.columns(3)
+        with g1:
+            result = st.selectbox("実施状況", ["", "実施", "一部実施", "未実施"], key="daily_summary_goal_result")
+        with g2:
+            mood = st.selectbox("本人の様子", ["", "穏やか", "普段通り", "不安あり", "拒否あり", "疲労あり", "痛み訴えあり", "その他"], key="daily_summary_goal_mood")
+        with g3:
+            reflect = st.selectbox("モニタリング反映", ["", "反映する", "反映しない"], key="daily_summary_goal_reflect")
+        reason = st.text_input("未実施理由・一部実施の理由", key="daily_summary_goal_reason")
+        staff_memo = st.text_area("職員メモ", key="daily_summary_goal_staff_memo")
+
+    has_goal_input = any([
+        selected_goal is not None,
+        clean_text(result),
+        clean_text(mood),
+        clean_text(reflect),
+        clean_text(reason),
+        clean_text(staff_memo),
+    ])
+
+    if st.button("まとめて保存する", type="primary", use_container_width=True, key="daily_summary_save"):
+        results = []
+
+        if has_health_input:
+            weight, weight_error = parse_optional_weight(weight_raw)
+            if weight_error:
+                results.append(("健康チェック", False, weight_error))
+            else:
+                health_record = {
+                    "記録日": record_date,
+                    "利用者名": user_name,
+                    "user_id": user_id,
+                    "体温": temp,
+                    "血圧上": bp_high,
+                    "血圧下": bp_low,
+                    "脈拍": pulse,
+                    "SpO2": spo2,
+                    "体重": weight,
+                    "朝食摂取率": MEAL_INTAKE_PERCENT.get(breakfast_code, 0),
+                    "昼食摂取率": MEAL_INTAKE_PERCENT.get(lunch_code, 0),
+                    "夕食摂取率": MEAL_INTAKE_PERCENT.get(dinner_code, 0),
+                    "朝食摂取区分": breakfast_code,
+                    "昼食摂取区分": lunch_code,
+                    "夕食摂取区分": dinner_code,
+                    "水分摂取量ml": water_ml,
+                    "栄養リスク": nutrition_risk,
+                    "口腔状態": oral_status,
+                    "義歯使用": denture_status,
+                    "LIFE補助メモ": life_memo,
+                    "家族共有メモ": family_memo,
+                    "気になる変化": changes,
+                    "登録日時": now_text,
+                    "入力者": input_staff,
+                }
+                errors, warnings = validate_health_record(health_record)
+                for warning in warnings:
+                    st.warning(f"健康チェック：{warning}")
+                if errors:
+                    for error in errors:
+                        st.error(f"健康チェック：{error}")
+                    results.append(("健康チェック", False, "入力内容を確認してください"))
+                else:
+                    saved = bool(upsert_health_record(health_record))
+                    results.append(("健康チェック", saved, ""))
+
+        if excretion_records:
+            failed_slots = []
+            for record in excretion_records:
+                errors, warnings = validate_excretion_record(record)
+                for warning in warnings:
+                    st.warning(f"排泄チェック（{record.get('時間帯')}）：{warning}")
+                if errors:
+                    failed_slots.append(record.get("時間帯", ""))
+                    for error in errors:
+                        st.error(f"排泄チェック（{record.get('時間帯')}）：{error}")
+                    continue
+                if not upsert_excretion_record(record):
+                    failed_slots.append(record.get("時間帯", ""))
+            results.append(("排泄チェック", not failed_slots, "、".join([x for x in failed_slots if x])))
+
+        if has_goal_input:
+            if selected_goal is None or not clean_text(result):
+                results.append(("短期目標チェック", False, "短期目標と実施状況を選択してください"))
+            else:
+                check_df = load_short_goal_checks()
+                uid = get_user_id_by_name(user_name) or ensure_user_id_value(clean_text(selected_goal.get("user_id")), user_name)
+                goal_record = {
+                    "記録ID": str(uuid.uuid4()),
+                    "日付": record_date.strftime("%Y-%m-%d"),
+                    "利用者名": user_name,
+                    "user_id": uid,
+                    "目標ID": clean_text(selected_goal.get("目標ID")),
+                    "短期目標": clean_text(selected_goal.get("短期目標")),
+                    "実施状況": result,
+                    "本人の様子": clean_text(mood, "普段通り"),
+                    "未実施理由": clean_text(reason),
+                    "職員メモ": clean_text(staff_memo),
+                    "入力職員": clean_text(input_staff),
+                    "モニタリング反映": clean_text(reflect, "反映する"),
+                    "登録日時": now_text,
+                }
+                check_df2 = pd.concat([check_df, pd.DataFrame([goal_record], columns=SHORT_GOAL_CHECK_COLUMNS)], ignore_index=True)
+                saved = save_short_goal_checks(check_df2)
+                if saved:
+                    try:
+                        add_audit_log("短期目標実施チェック登録", SQLITE_TABLE_SHORT_GOAL_CHECKS, goal_record["記録ID"], f"{user_name} / {result} / {clean_text(selected_goal.get('短期目標'))[:80]}")
+                    except Exception:
+                        pass
+                results.append(("短期目標チェック", bool(saved), ""))
+
+        if not results:
+            st.info("保存する内容がありません")
+            return
+
+        failed = []
+        for label, ok, detail in results:
+            if ok:
+                st.success(f"{label} 保存成功")
+            else:
+                failed.append(label)
+                suffix = f"：{detail}" if detail else ""
+                st.error(f"{label} 保存失敗{suffix}")
+
+        if failed:
+            st.error("一部保存できませんでした。通信状態を確認し、続く場合は管理者へ連絡してください。")
+        else:
+            st.success("まとめて保存しました")
+
 
 def show_goal_history():
     st.header("実施履歴一覧")
@@ -15014,6 +15292,10 @@ elif menu == "LIFE登録一覧":
 
 elif menu == "写真から半自動入力":
     show_photo_import_menu()
+
+
+elif menu == "日々のまとめ入力":
+    show_daily_summary_input()
 
 
 # =========================
