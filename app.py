@@ -11693,14 +11693,15 @@ def show_daily_summary_input():
                     st.warning("健康チェックは保存します。入力値に確認が必要な項目があります。")
                 try:
                     saved = bool(upsert_health_record(health_record))
-                    results.append(("健康チェック", "saved" if saved else "failed", ""))
+                    results.append(("健康チェック", "saved" if saved else "failed", "", 1, 1 if saved else 0, 0 if saved else 1))
                 except Exception as e:
-                    results.append(("健康チェック", "failed", str(e)))
+                    results.append(("健康チェック", "failed", str(e), 1, 0, 1))
         else:
             skipped_messages.append("保存する健康チェック内容はありません")
 
         if excretion_records:
             failed_slots = []
+            excretion_success_count = 0
             for record in excretion_records:
                 errors, warnings = validate_excretion_record(record)
                 for warning in warnings + errors:
@@ -11712,7 +11713,22 @@ def show_daily_summary_input():
                     saved = False
                 if not saved:
                     failed_slots.append(record.get("時間帯", ""))
-            results.append(("排泄チェック", "failed" if failed_slots else "saved", "、".join([x for x in failed_slots if x])))
+                else:
+                    excretion_success_count += 1
+            failed_count = len(failed_slots)
+            if failed_count and excretion_success_count:
+                excretion_status = "partial"
+            elif failed_count:
+                excretion_status = "failed"
+            else:
+                excretion_status = "saved"
+            detail = f"{len(excretion_records)}件中{excretion_success_count}件保存成功"
+            if failed_count:
+                detail += f"、{failed_count}件保存失敗"
+                failed_slot_text = "、".join([x for x in failed_slots if x])
+                if failed_slot_text:
+                    detail += f"：{failed_slot_text}"
+            results.append(("排泄チェック", excretion_status, detail, len(excretion_records), excretion_success_count, failed_count))
         else:
             skipped_messages.append("保存する排泄チェック内容はありません")
 
@@ -11805,38 +11821,50 @@ def show_daily_summary_input():
                     detail += f"、{failed_count}件保存失敗"
                 if skipped_goal_count:
                     detail += f"、{skipped_goal_count}件は実施状況未選択のため未保存"
-                all_goal_records_saved = success_count == len(goal_records) and failed_count == 0
-                results.append(("短期目標チェック", "saved" if all_goal_records_saved else "failed", detail))
+                if failed_count and success_count:
+                    goal_status = "partial"
+                elif failed_count:
+                    goal_status = "failed"
+                else:
+                    goal_status = "saved"
+                results.append(("短期目標チェック", goal_status, detail, len(goal_records), success_count, failed_count))
         else:
             skipped_messages.append("保存する短期目標チェックはありません")
 
         for message in skipped_messages:
             st.info(message)
 
-        failed = []
-        saved = []
-        for label, status, detail in results:
+        total_save_targets = 0
+        total_success = 0
+        total_failed = 0
+        for result_item in results:
+            label, status, detail, target_count, success_count, failed_count = result_item
+            total_save_targets += target_count
+            total_success += success_count
+            total_failed += failed_count
             if status == "saved":
-                saved.append(label)
                 suffix = f"：{detail}" if detail else ""
                 st.success(f"{label} 保存成功{suffix}")
+            elif status == "partial":
+                suffix = f"：{detail}" if detail else ""
+                st.warning(f"{label} 一部保存できませんでした{suffix}")
             else:
-                failed.append(label)
                 suffix = f"：{detail}" if detail else ""
                 st.error(f"{label} 保存失敗{suffix}")
 
-        if not saved and not failed:
+        if total_save_targets == 0:
             st.info("保存する内容がありません。")
-        elif failed and saved:
-            st.error("一部保存できませんでした。通信状態を確認し、続く場合は管理者へ連絡してください。")
-        elif failed:
+        elif total_success == total_save_targets and total_failed == 0:
+            if confirmation_count:
+                st.warning("入力された内容を保存しました。確認が必要な項目があります。")
+            elif skipped_messages:
+                st.success("入力された内容を保存しました。")
+            else:
+                st.success("まとめて保存しました。")
+        elif total_success > 0 and total_failed > 0:
+            st.warning("一部保存しました。保存できなかった項目があります。内容を確認してください。")
+        elif total_success == 0 and total_failed > 0:
             st.error("保存できませんでした。通信状態を確認し、続く場合は管理者へ連絡してください。")
-        elif confirmation_count:
-            st.warning("入力された内容を保存しました。確認が必要な項目があります。")
-        elif skipped_messages:
-            st.success("入力された内容を保存しました。")
-        else:
-            st.success("まとめて保存しました。")
 
 
 def show_goal_history():
