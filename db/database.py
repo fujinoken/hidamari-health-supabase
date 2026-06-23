@@ -162,7 +162,9 @@ def load_sqlite_table(table_name: str, columns: Iterable[str], date_cols=None) -
             if not sqlite_table_exists(table_name):
                 _ensure_table(conn, table_name, columns)
                 return pd.DataFrame(columns=columns)
-            df = pd.read_sql_query(f"SELECT * FROM {table_name}", conn)
+            _ensure_table(conn, table_name, columns)
+            select_cols = ", ".join([f'"{str(c).replace(chr(34), chr(34) + chr(34))}"' for c in columns]) or "*"
+            df = pd.read_sql_query(f"SELECT {select_cols} FROM {table_name}", conn)
     except Exception:
         df = pd.DataFrame(columns=columns)
     df = normalize_df_columns(df, columns)

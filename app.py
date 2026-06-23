@@ -26,6 +26,7 @@ import base64
 import random
 import shutil
 import threading
+import time
 from contextlib import contextmanager
 
 try:
@@ -76,8 +77,63 @@ def cache_safe_master_read(ttl=SAFE_READ_CACHE_TTL_SEC):
             return func
     return _decorator
 
+
+def log_perf(label, elapsed_sec, detail=""):
+    try:
+        entry = {
+            "time": datetime.utcnow().isoformat(timespec="seconds"),
+            "label": str(label),
+            "elapsed_sec": round(float(elapsed_sec), 3),
+            "detail": str(detail or ""),
+        }
+        logs = st.session_state.setdefault("hidamari_perf_logs", [])
+        logs.append(entry)
+        if len(logs) > 50:
+            del logs[:-50]
+    except Exception:
+        pass
+    try:
+        print(f"[hidamari_perf] {label}: {elapsed_sec:.3f}s {detail}")
+    except Exception:
+        pass
+
+
+@contextmanager
+def perf_timer(label, detail=""):
+    start = time.perf_counter()
+    try:
+        yield
+    finally:
+        elapsed = time.perf_counter() - start
+        if elapsed >= 0.2:
+            log_perf(label, elapsed, detail)
+
+
+def _clear_cached_functions(function_names):
+    cleared = []
+    for name in function_names:
+        func = globals().get(name)
+        clear_func = getattr(func, "clear", None)
+        if callable(clear_func):
+            try:
+                clear_func()
+                cleared.append(name)
+            except Exception:
+                pass
+    return cleared
+
+
 def clear_hidamari_read_cache(reason=""):
     """Clear Streamlit read caches after saves, deletes, syncs, and restores."""
+    reason_text = str(reason or "")
+    targets = []
+    if any(key in reason_text for key in ["利用者", "マスタ", "user"]):
+        targets.extend(["load_users", "load_active_user_names", "load_user_name_aliases", "_supabase_read_table_cached"])
+    if any(key in reason_text for key in ["健康", "排泄", "申し送り", "短期", "目標", "モニタリング", "復元", "Supabase", "保存", "削除"]):
+        targets.extend(["_supabase_read_table_cached", "load_short_goal_master"])
+    cleared = _clear_cached_functions(dict.fromkeys(targets))
+    if cleared:
+        return
     try:
         st.cache_data.clear()
     except Exception:
@@ -686,12 +742,13 @@ def _supabase_read_table_cached(table_name: str, columns_tuple=(), date_field: s
     if limit and int(limit) > 0:
         params.append(("limit", str(int(limit))))
 
-    res = requests.get(
-        _supabase_endpoint(table_name),
-        headers=_supabase_headers(prefer=""),
-        params=params,
-        timeout=20,
-    )
+    with perf_timer("supabase_read", f"{table_name} {start_iso or ''}-{end_iso or ''}"):
+        res = requests.get(
+            _supabase_endpoint(table_name),
+            headers=_supabase_headers(prefer=""),
+            params=params,
+            timeout=20,
+        )
     res.raise_for_status()
     return _normalize_supabase_df_from_rows(res.json() or [], list(columns_tuple))
 
@@ -5348,16 +5405,33 @@ def ensure_user_file():
     df = pd.DataFrame(default_user_rows(), columns=USER_COLUMNS)
     save_sqlite_table(df, SQLITE_TABLE_USERS, USER_COLUMNS, unique_cols=["user_id"])
 
+USER_LIST_COLUMNS = ["user_id", "利用者名", "表示"]
+
+
+@cache_safe_master_read(ttl=SAFE_READ_CACHE_TTL_SEC)
+def load_active_user_names(include_hidden=False):
+    with perf_timer("load_active_user_names", f"include_hidden={include_hidden}"):
+        ensure_user_file()
+        df = load_sqlite_table(SQLITE_TABLE_USERS, USER_LIST_COLUMNS)
+        for col in USER_LIST_COLUMNS:
+            if col not in df.columns:
+                df[col] = ""
+        if not include_hidden:
+            df = df[df["表示"].fillna("表示") == "表示"]
+        return df["利用者名"].fillna("").astype(str).str.strip().replace("", pd.NA).dropna().tolist()
+
+
 @cache_safe_master_read(ttl=SAFE_READ_CACHE_TTL_SEC)
 def load_users(include_hidden=False):
-    ensure_user_file()
-    df = load_sqlite_table(SQLITE_TABLE_USERS, USER_COLUMNS)
-    df = normalize_users_df(df)
+    with perf_timer("load_users", f"include_hidden={include_hidden}"):
+        ensure_user_file()
+        df = load_sqlite_table(SQLITE_TABLE_USERS, USER_COLUMNS)
+        df = normalize_users_df(df)
 
-    if not include_hidden:
-        df = df[df["表示"].fillna("表示") == "表示"]
+        if not include_hidden:
+            df = df[df["表示"].fillna("表示") == "表示"]
 
-    return df.reset_index(drop=True)
+        return df.reset_index(drop=True)
 
 
 def save_users(df):
@@ -5456,22 +5530,23 @@ def ensure_health_file():
 
 def load_health_data(start_date=None, end_date=None, recent_days=None):
     """健康チェックを読み込む。start_date/end_date指定時はSupabase側で期間を絞って高速化する。"""
-    ensure_health_file()
-    if recent_days and start_date is None and end_date is None:
-        start_date = recent_start_date(recent_days)
-        end_date = today_jst()
-    if supabase_is_enabled():
-        df = supabase_read_table(SQLITE_TABLE_HEALTH, HEALTH_COLUMNS, date_field="記録日", start_date=start_date, end_date=end_date)
-    else:
-        df = load_sqlite_table(SQLITE_TABLE_HEALTH, HEALTH_COLUMNS, date_cols=["記録日"])
-        df = _filter_df_by_date_range(df, "記録日", start_date, end_date)
-    df = attach_user_ids(df)
+    with perf_timer("load_health_data", f"{start_date or ''}-{end_date or ''} recent={recent_days or ''}"):
+        ensure_health_file()
+        if recent_days and start_date is None and end_date is None:
+            start_date = recent_start_date(recent_days)
+            end_date = today_jst()
+        if supabase_is_enabled():
+            df = supabase_read_table(SQLITE_TABLE_HEALTH, HEALTH_COLUMNS, date_field="記録日", start_date=start_date, end_date=end_date)
+        else:
+            df = load_sqlite_table(SQLITE_TABLE_HEALTH, HEALTH_COLUMNS, date_cols=["記録日"])
+            df = _filter_df_by_date_range(df, "記録日", start_date, end_date)
+        df = attach_user_ids(df)
 
-    if not df.empty:
-        df["記録日"] = pd.to_datetime(df["記録日"], errors="coerce")
-        df["利用者名"] = df["利用者名"].astype(str).str.strip()
+        if not df.empty:
+            df["記録日"] = pd.to_datetime(df["記録日"], errors="coerce")
+            df["利用者名"] = df["利用者名"].astype(str).str.strip()
 
-    return df.astype("object")
+        return df.astype("object")
 
 
 def save_health_data(df):
@@ -5605,22 +5680,23 @@ def normalize_excretion_record(record):
 
 def load_excretion_data(start_date=None, end_date=None, recent_days=None):
     """排泄チェックを読み込む。start_date/end_date指定時はSupabase側で期間を絞って高速化する。"""
-    ensure_excretion_file()
-    if recent_days and start_date is None and end_date is None:
-        start_date = recent_start_date(recent_days)
-        end_date = today_jst()
-    if supabase_is_enabled():
-        df = supabase_read_table(SQLITE_TABLE_EXCRETION, EXCRETION_COLUMNS, date_field="記録日", start_date=start_date, end_date=end_date)
-    else:
-        df = load_sqlite_table(SQLITE_TABLE_EXCRETION, EXCRETION_COLUMNS, date_cols=["記録日"])
-        df = _filter_df_by_date_range(df, "記録日", start_date, end_date)
+    with perf_timer("load_excretion_data", f"{start_date or ''}-{end_date or ''} recent={recent_days or ''}"):
+        ensure_excretion_file()
+        if recent_days and start_date is None and end_date is None:
+            start_date = recent_start_date(recent_days)
+            end_date = today_jst()
+        if supabase_is_enabled():
+            df = supabase_read_table(SQLITE_TABLE_EXCRETION, EXCRETION_COLUMNS, date_field="記録日", start_date=start_date, end_date=end_date)
+        else:
+            df = load_sqlite_table(SQLITE_TABLE_EXCRETION, EXCRETION_COLUMNS, date_cols=["記録日"])
+            df = _filter_df_by_date_range(df, "記録日", start_date, end_date)
 
-    if not df.empty:
-        df["記録日"] = pd.to_datetime(df["記録日"], errors="coerce")
-        for col in ["利用者名", "時間帯", "時間帯目安", "尿量", "尿性状", "便量", "便性状", "排泄メモ", "入力者", "登録日時"]:
-            df[col] = df[col].fillna("").astype(str)
+        if not df.empty:
+            df["記録日"] = pd.to_datetime(df["記録日"], errors="coerce")
+            for col in ["利用者名", "時間帯", "時間帯目安", "尿量", "尿性状", "便量", "便性状", "排泄メモ", "入力者", "登録日時"]:
+                df[col] = df[col].fillna("").astype(str)
 
-    return df.astype("object")
+        return df.astype("object")
 
 
 def save_excretion_data(df):
@@ -6948,8 +7024,10 @@ def upsert_life_adl_record(record):
 
 
 def build_life_month_summary(user_name, target_year, target_month):
-    health_df = get_month_health_data(load_health_data(), user_name, target_year, target_month)
-    ex_df = get_month_excretion_data(load_excretion_data(), user_name, target_year, target_month)
+    month_start = date(int(target_year), int(target_month), 1)
+    month_end = (month_start.replace(day=28) + timedelta(days=4)).replace(day=1) - timedelta(days=1)
+    health_df = get_month_health_data(load_health_data(start_date=month_start, end_date=month_end), user_name, target_year, target_month)
+    ex_df = get_month_excretion_data(load_excretion_data(start_date=month_start, end_date=month_end), user_name, target_year, target_month)
 
     result = {
         "利用者名": user_name,
@@ -7607,24 +7685,25 @@ def ensure_business_handover_file():
 
 def load_business_handover_data(start_date=None, end_date=None, recent_days=None):
     """業務全体申し送りを読み込む。期間指定時はSupabase側で絞って高速化する。"""
-    ensure_business_handover_file()
-    if recent_days and start_date is None and end_date is None:
-        start_date = recent_start_date(recent_days)
-        end_date = today_jst()
-    if supabase_is_enabled():
-        df = supabase_read_table(SQLITE_TABLE_HANDOVER, BUSINESS_HANDOVER_COLUMNS, date_field="日付", start_date=start_date, end_date=end_date)
-    else:
-        df = load_sqlite_table(SQLITE_TABLE_HANDOVER, BUSINESS_HANDOVER_COLUMNS, date_cols=["日付"])
-        df = _filter_df_by_date_range(df, "日付", start_date, end_date)
+    with perf_timer("load_business_handover_data", f"{start_date or ''}-{end_date or ''} recent={recent_days or ''}"):
+        ensure_business_handover_file()
+        if recent_days and start_date is None and end_date is None:
+            start_date = recent_start_date(recent_days)
+            end_date = today_jst()
+        if supabase_is_enabled():
+            df = supabase_read_table(SQLITE_TABLE_HANDOVER, BUSINESS_HANDOVER_COLUMNS, date_field="日付", start_date=start_date, end_date=end_date)
+        else:
+            df = load_sqlite_table(SQLITE_TABLE_HANDOVER, BUSINESS_HANDOVER_COLUMNS, date_cols=["日付"])
+            df = _filter_df_by_date_range(df, "日付", start_date, end_date)
 
-    if not df.empty:
-        df["日付"] = pd.to_datetime(df["日付"], errors="coerce")
-        for col in ["記録ID", "勤務帯", "記入者", "対象区分", "user_id", "利用者名", "全体申し送り", "要確認事項", "優先度", "対応状況", "写真1", "写真2", "Excel自動抽出情報", "入力Excelファイル", "入力Excel表示情報", "記録日時"]:
-            if col not in df.columns:
-                df[col] = ""
-            df[col] = df[col].fillna("").astype(str)
+        if not df.empty:
+            df["日付"] = pd.to_datetime(df["日付"], errors="coerce")
+            for col in ["記録ID", "勤務帯", "記入者", "対象区分", "user_id", "利用者名", "全体申し送り", "要確認事項", "優先度", "対応状況", "写真1", "写真2", "Excel自動抽出情報", "入力Excelファイル", "入力Excel表示情報", "記録日時"]:
+                if col not in df.columns:
+                    df[col] = ""
+                df[col] = df[col].fillna("").astype(str)
 
-    return df.astype("object")
+        return df.astype("object")
 
 
 def save_business_handover_data(df):
@@ -10173,13 +10252,14 @@ def save_excel_safe(df: pd.DataFrame, path: Path, columns: list, sheet_name: str
 
 @cache_safe_master_read(ttl=SAFE_READ_CACHE_TTL_SEC)
 def load_short_goal_master():
-    ensure_short_goal_files()
-    df = load_sqlite_table(
-        SQLITE_TABLE_SHORT_GOAL_MASTER,
-        SHORT_GOAL_MASTER_COLUMNS,
-        date_cols=["開始日", "終了予定日"],
-    )
-    return attach_user_ids(df)
+    with perf_timer("load_short_goal_master"):
+        ensure_short_goal_files()
+        df = load_sqlite_table(
+            SQLITE_TABLE_SHORT_GOAL_MASTER,
+            SHORT_GOAL_MASTER_COLUMNS,
+            date_cols=["開始日", "終了予定日"],
+        )
+        return attach_user_ids(df)
 
 
 def save_short_goal_master(df):
@@ -10261,7 +10341,7 @@ def ym_str(d: date):
 
 
 def get_active_user_names():
-    users = load_users(include_hidden=False)["利用者名"].tolist()
+    users = load_active_user_names(include_hidden=False)
     return users if users else DEFAULT_USERS
 
 
@@ -15204,9 +15284,9 @@ def _hidamari_ai_detect_monitoring(monitoring_df):
 
 
 def _hidamari_ai_collect_records(user_name, start_date, end_date):
-    health_df = _hidamari_ai_filter_period(load_health_data(), "記録日", user_name, start_date, end_date)
-    ex_df = _hidamari_ai_filter_period(load_excretion_data(), "記録日", user_name, start_date, end_date)
-    handover_df = _hidamari_ai_filter_period(load_business_handover_data(), "日付", user_name, start_date, end_date)
+    health_df = _hidamari_ai_filter_period(load_health_data(start_date=start_date, end_date=end_date), "記録日", user_name, start_date, end_date)
+    ex_df = _hidamari_ai_filter_period(load_excretion_data(start_date=start_date, end_date=end_date), "記録日", user_name, start_date, end_date)
+    handover_df = _hidamari_ai_filter_period(load_business_handover_data(start_date=start_date, end_date=end_date), "日付", user_name, start_date, end_date)
     goal_check_df = _hidamari_ai_filter_period(load_sqlite_table(SQLITE_TABLE_SHORT_GOAL_CHECKS, SHORT_GOAL_CHECK_COLUMNS, date_cols=["日付"]), "日付", user_name, start_date, end_date)
     monitoring_df = _hidamari_ai_filter_period(load_sqlite_table(SQLITE_TABLE_MONITORING_DRAFTS, MONITORING_DRAFT_COLUMNS, date_cols=["作成日"]), "作成日", user_name, start_date, end_date)
 
@@ -15527,8 +15607,7 @@ product_ui_notice()
 # =========================
 # メニュー（Ver3.0：カテゴリ化・iPad最適化）
 # =========================
-users_df = load_users(include_hidden=False)
-active_users = users_df["利用者名"].tolist()
+active_users = load_active_user_names(include_hidden=False)
 all_users = active_users
 
 menu = render_sidebar_menu(st.session_state.role)
@@ -16013,14 +16092,33 @@ def show_my_dashboard_blocks(target_date=None):
         st.info("表示項目が選択されていません。『自分専用ダッシュボード設定』で表示項目を選んでください。")
         return
 
-    health_df = load_health_data()
-    ex_df = load_excretion_data()
+    health_cache = {}
+    ex_cache = {}
+    handover_cache = {}
+
+    def get_dashboard_health_df(start_date=None, end_date=None, recent_days=None):
+        key = (str(start_date or ""), str(end_date or ""), str(recent_days or ""))
+        if key not in health_cache:
+            health_cache[key] = load_health_data(start_date=start_date, end_date=end_date, recent_days=recent_days)
+        return health_cache[key]
+
+    def get_dashboard_ex_df(start_date=None, end_date=None, recent_days=None):
+        key = (str(start_date or ""), str(end_date or ""), str(recent_days or ""))
+        if key not in ex_cache:
+            ex_cache[key] = load_excretion_data(start_date=start_date, end_date=end_date, recent_days=recent_days)
+        return ex_cache[key]
+
+    def get_dashboard_handover_df(start_date=None, end_date=None, recent_days=None):
+        key = (str(start_date or ""), str(end_date or ""), str(recent_days or ""))
+        if key not in handover_cache:
+            handover_cache[key] = load_business_handover_data(start_date=start_date, end_date=end_date, recent_days=recent_days)
+        return handover_cache[key]
 
     if "前日の申し送り" in enabled:
         st.subheader("前日の申し送り")
         try:
             prev_day = target_date - timedelta(days=1)
-            df = load_business_handover_data()
+            df = get_dashboard_handover_df(start_date=prev_day, end_date=prev_day)
             prev_df = get_business_handover_by_date(df, prev_day)
             if prev_df.empty:
                 st.info("前日の申し送りはありません。")
@@ -16035,7 +16133,7 @@ def show_my_dashboard_blocks(target_date=None):
         st.caption("確認日の前日に、健康チェックへ入力された『気になる変化』を全利用者分まとめて表示します。")
         try:
             prev_day = target_date - timedelta(days=1)
-            change_df = health_df.copy()
+            change_df = get_dashboard_health_df(start_date=prev_day, end_date=prev_day).copy()
 
             if change_df.empty:
                 st.info("健康チェックデータがありません。")
@@ -16125,7 +16223,7 @@ def show_my_dashboard_blocks(target_date=None):
     if "未対応・至急申し送り" in enabled:
         st.subheader("未対応・至急申し送り")
         try:
-            df = load_business_handover_data()
+            df = get_dashboard_handover_df()
             alert_df = get_business_handover_alerts(df)
             if alert_df.empty:
                 st.success("未対応・至急の申し送りはありません。")
@@ -16138,7 +16236,7 @@ def show_my_dashboard_blocks(target_date=None):
     if "排便3日なし" in enabled:
         st.subheader("排便3日なし")
         try:
-            no_stool_df = build_no_stool_3days_users(ex_df, target_date)
+            no_stool_df = build_no_stool_3days_users(get_dashboard_ex_df(start_date=target_date - timedelta(days=4), end_date=target_date), target_date)
             if no_stool_df.empty:
                 st.success("3日以上の未排便該当者はいません。")
             else:
@@ -16149,7 +16247,7 @@ def show_my_dashboard_blocks(target_date=None):
     if "注意利用者" in enabled:
         st.subheader("注意利用者")
         try:
-            attention_df = build_attention_users(health_df, ex_df, target_date)
+            attention_df = build_attention_users(get_dashboard_health_df(start_date=target_date, end_date=target_date), get_dashboard_ex_df(start_date=target_date - timedelta(days=4), end_date=target_date), target_date)
             if attention_df.empty:
                 st.success("注意表示の対象者はいません。")
             else:
@@ -16159,15 +16257,15 @@ def show_my_dashboard_blocks(target_date=None):
 
     if "最新体重・未測定確認" in enabled:
         try:
-            show_latest_weight_block(health_df, active_users if "active_users" in globals() else None, target_date)
-            show_weight_overdue_block(health_df, active_users if "active_users" in globals() else None, target_date, threshold_days=14)
+            show_latest_weight_block(get_dashboard_health_df(), active_users if "active_users" in globals() else None, target_date)
+            show_weight_overdue_block(get_dashboard_health_df(), active_users if "active_users" in globals() else None, target_date, threshold_days=14)
         except Exception as e:
             st.warning(f"体重確認を表示できませんでした: {e}")
 
     if "確認日の排泄状況" in enabled:
         st.subheader("確認日の排泄状況")
         try:
-            day_ex = get_day_excretion_data(ex_df, target_date, None)
+            day_ex = get_day_excretion_data(get_dashboard_ex_df(start_date=target_date, end_date=target_date), target_date, None)
             if day_ex.empty:
                 st.info("確認日の排泄記録はありません。")
             else:
@@ -16592,7 +16690,6 @@ elif menu == "排泄チェック入力":
         st.warning("利用者マスタに表示中の利用者がいません。")
         st.stop()
 
-    ex_df = load_excretion_data()
 
     # まず日付を選ぶ。日付が変わると未入力一覧も切り替わる。
     top1, top2 = st.columns([1, 2])
@@ -16607,6 +16704,7 @@ elif menu == "排泄チェック入力":
     with col2:
         input_staff = st.text_input("入力者", placeholder="例：藤野", key="ex_input_staff")
 
+    ex_df = load_excretion_data(start_date=record_date, end_date=record_date)
     day_data = get_day_excretion_data(ex_df, record_date, user_name)
 
     if day_data.empty:
@@ -17847,7 +17945,7 @@ elif menu == "利用者マスタ管理":
     st.divider()
     st.subheader("利用者を入力候補から外す")
 
-    visible_users = load_users(include_hidden=False)["利用者名"].tolist()
+    visible_users = load_active_user_names(include_hidden=False)
 
     if visible_users:
         target_user = st.selectbox("対象利用者", visible_users, key="hide_user")
