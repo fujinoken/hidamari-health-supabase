@@ -11412,6 +11412,23 @@ def show_daily_summary_input():
         goal_text = clean_text(goal_row.get("短期目標"))
         return goal_id or hashlib.md5(goal_text.encode("utf-8")).hexdigest()[:10]
 
+    def build_daily_summary_short_goal_record(selected_goal, record_id, uid, result, mood, reason, staff_memo, goal_staff, reflect):
+        return {
+            "記録ID": record_id,
+            "日付": record_date.strftime("%Y-%m-%d"),
+            "利用者名": user_name,
+            "user_id": uid,
+            "目標ID": clean_text(selected_goal.get("目標ID")),
+            "短期目標": clean_text(selected_goal.get("短期目標")),
+            "実施状況": result,
+            "本人の様子": clean_text(mood, "普段通り"),
+            "未実施理由": clean_text(reason),
+            "職員メモ": clean_text(staff_memo),
+            "入力職員": clean_text(goal_staff, input_staff),
+            "モニタリング反映": clean_text(reflect, "反映する"),
+            "登録日時": now_text,
+        }
+
     def summary_existing_goal_check(goal_row):
         if goal_check_df.empty:
             return None
@@ -11758,53 +11775,59 @@ def show_daily_summary_input():
                     uuid.NAMESPACE_URL,
                     f"hidamari-daily-summary-short-goal:{record_date}:{uid or user_name}:{entry.get('goal_identity')}",
                 ))
-                goal_records.append({
-                    "記録ID": existing_record_id or fallback_record_id,
-                    "日付": record_date.strftime("%Y-%m-%d"),
-                    "利用者名": user_name,
-                    "user_id": uid,
-                    "目標ID": clean_text(selected_goal.get("目標ID")),
-                    "短期目標": clean_text(selected_goal.get("短期目標")),
-                    "実施状況": result,
-                    "本人の様子": clean_text(mood, "普段通り"),
-                    "未実施理由": reason,
-                    "職員メモ": staff_memo,
-                    "入力職員": clean_text(goal_staff, input_staff),
-                    "モニタリング反映": clean_text(reflect, "反映する"),
-                    "登録日時": now_text,
-                })
+                goal_records.append(build_daily_summary_short_goal_record(
+                    selected_goal,
+                    existing_record_id or fallback_record_id,
+                    uid,
+                    result,
+                    mood,
+                    reason,
+                    staff_memo,
+                    goal_staff,
+                    reflect,
+                ))
 
             if not goal_records:
                 skipped_messages.append("保存する短期目標チェックはありません")
             else:
                 success_count = 0
                 failed_count = 0
-                for goal_record in goal_records:
-                    try:
-                        check_df = load_short_goal_checks()
-                        check_df = normalize_df_columns(check_df, SHORT_GOAL_CHECK_COLUMNS)
-                        check_df = check_df.astype("object")
+                try:
+                    check_df = load_short_goal_checks()
+                    check_df = normalize_df_columns(check_df, SHORT_GOAL_CHECK_COLUMNS)
+                    check_df = check_df.astype("object")
+                    for goal_record in goal_records:
                         record_id = clean_text(goal_record.get("記録ID"))
+                        goal_id = clean_text(goal_record.get("目標ID"))
+                        goal_text = clean_text(goal_record.get("短期目標"))
                         if not check_df.empty and "記録ID" in check_df.columns:
                             mask = check_df["記録ID"].astype(str) == record_id
-                            if mask.any():
-                                idx = check_df.index[mask].tolist()[0]
-                                for col in SHORT_GOAL_CHECK_COLUMNS:
-                                    check_df.at[idx, col] = goal_record.get(col, "")
-                                check_df2 = check_df
-                            else:
-                                check_df2 = pd.concat(
-                                    [check_df, pd.DataFrame([goal_record], columns=SHORT_GOAL_CHECK_COLUMNS).astype("object")],
-                                    ignore_index=True,
-                                )
                         else:
-                            check_df2 = pd.DataFrame([goal_record], columns=SHORT_GOAL_CHECK_COLUMNS).astype("object")
-                        saved_one = bool(save_short_goal_checks(check_df2))
-                    except Exception:
-                        saved_one = False
+                            mask = pd.Series([False] * len(check_df), index=check_df.index)
+                        if not check_df.empty and not mask.any():
+                            date_mask = pd.to_datetime(check_df["日付"], errors="coerce").dt.strftime("%Y-%m-%d") == clean_text(goal_record.get("日付"))
+                            user_mask = check_df["利用者名"].astype(str) == clean_text(goal_record.get("利用者名"))
+                            if goal_id:
+                                mask = date_mask & user_mask & (check_df["目標ID"].astype(str) == goal_id)
+                            if not mask.any() and goal_text:
+                                mask = date_mask & user_mask & (check_df["短期目標"].astype(str) == goal_text)
+                        if mask.any():
+                            idx = check_df.index[mask].tolist()[-1]
+                            for col in SHORT_GOAL_CHECK_COLUMNS:
+                                check_df.at[idx, col] = goal_record.get(col, "")
+                        else:
+                            check_df = pd.concat(
+                                [check_df, pd.DataFrame([goal_record], columns=SHORT_GOAL_CHECK_COLUMNS).astype("object")],
+                                ignore_index=True,
+                            )
+                    saved_all_goals = bool(save_short_goal_checks(check_df))
+                except Exception:
+                    saved_all_goals = False
 
-                    if saved_one:
-                        success_count += 1
+                if saved_all_goals:
+                    success_count = len(goal_records)
+                    failed_count = 0
+                    for goal_record in goal_records:
                         try:
                             add_audit_log(
                                 "短期目標実施チェック登録",
@@ -11814,8 +11837,9 @@ def show_daily_summary_input():
                             )
                         except Exception:
                             pass
-                    else:
-                        failed_count += 1
+                else:
+                    success_count = 0
+                    failed_count = len(goal_records)
                 detail = f"{len(goal_records)}件中{success_count}件 保存成功"
                 if failed_count:
                     detail += f"、{failed_count}件保存失敗"
