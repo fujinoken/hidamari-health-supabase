@@ -11395,6 +11395,12 @@ def show_daily_summary_input():
         value = clean_text(value)
         return options.index(value) if value in options else default
 
+    def summary_init_state(key, value, options=None):
+        if options is not None and value not in options:
+            value = options[0] if options else ""
+        if key not in st.session_state:
+            st.session_state[key] = value
+
     def summary_existing_goal_check(goal_row):
         if goal_check_df.empty:
             return None
@@ -11548,20 +11554,36 @@ def show_daily_summary_input():
                 if existing_goal_check is not None:
                     st.info("この短期目標の実施チェックは既にあります。\n保存するとこの内容で更新されます。前回の内容を表示しています。")
 
-                use_goal = st.checkbox("この短期目標を記録する", value=existing_goal_check is not None, key=f"daily_summary_goal_use_{key_suffix}")
+                use_key = f"daily_summary_goal_use_{key_suffix}"
+                result_key = f"daily_summary_goal_result_{key_suffix}"
+                mood_key = f"daily_summary_goal_mood_{key_suffix}"
+                reflect_key = f"daily_summary_goal_reflect_{key_suffix}"
+                reason_key = f"daily_summary_goal_reason_{key_suffix}"
+                memo_key = f"daily_summary_goal_staff_memo_{key_suffix}"
+                staff_key = f"daily_summary_goal_staff_{key_suffix}"
+                result_options = ["", "実施", "一部実施", "未実施"]
+                mood_options = ["", "穏やか", "普段通り", "不安あり", "拒否あり", "疲労あり", "痛み訴えあり", "その他"]
+                reflect_options = ["", "反映する", "反映しない"]
+
+                summary_init_state(use_key, existing_goal_check is not None)
+                summary_init_state(result_key, summary_text(existing_goal_check, "実施状況"), result_options)
+                summary_init_state(mood_key, summary_text(existing_goal_check, "本人の様子"), mood_options)
+                summary_init_state(reflect_key, summary_text(existing_goal_check, "モニタリング反映"), reflect_options)
+                summary_init_state(reason_key, summary_text(existing_goal_check, "未実施理由"))
+                summary_init_state(memo_key, summary_text(existing_goal_check, "職員メモ"))
+                summary_init_state(staff_key, summary_text(existing_goal_check, "入力職員", input_staff))
+
+                use_goal = st.checkbox("この短期目標を記録する", key=use_key)
                 g1, g2, g3 = st.columns(3)
                 with g1:
-                    result_options = ["", "実施", "一部実施", "未実施"]
-                    result = st.selectbox("実施状況", result_options, index=summary_option_index(result_options, summary_text(existing_goal_check, "実施状況")), key=f"daily_summary_goal_result_{key_suffix}")
+                    result = st.selectbox("実施状況", result_options, key=result_key)
                 with g2:
-                    mood_options = ["", "穏やか", "普段通り", "不安あり", "拒否あり", "疲労あり", "痛み訴えあり", "その他"]
-                    mood = st.selectbox("本人の様子", mood_options, index=summary_option_index(mood_options, summary_text(existing_goal_check, "本人の様子")), key=f"daily_summary_goal_mood_{key_suffix}")
+                    mood = st.selectbox("本人の様子", mood_options, key=mood_key)
                 with g3:
-                    reflect_options = ["", "反映する", "反映しない"]
-                    reflect = st.selectbox("モニタリング反映", reflect_options, index=summary_option_index(reflect_options, summary_text(existing_goal_check, "モニタリング反映")), key=f"daily_summary_goal_reflect_{key_suffix}")
-                reason = st.text_input("未実施理由・一部実施の理由", value=summary_text(existing_goal_check, "未実施理由"), key=f"daily_summary_goal_reason_{key_suffix}")
-                staff_memo = st.text_area("職員メモ", value=summary_text(existing_goal_check, "職員メモ"), key=f"daily_summary_goal_staff_memo_{key_suffix}")
-                goal_staff = st.text_input("入力職員", value=summary_text(existing_goal_check, "入力職員", input_staff), key=f"daily_summary_goal_staff_{key_suffix}")
+                    reflect = st.selectbox("モニタリング反映", reflect_options, key=reflect_key)
+                reason = st.text_input("未実施理由・一部実施の理由", key=reason_key)
+                staff_memo = st.text_area("職員メモ", key=memo_key)
+                goal_staff = st.text_input("入力職員", key=staff_key)
 
                 has_goal_detail = any([
                     clean_text(result),
