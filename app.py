@@ -9718,9 +9718,9 @@ def render_business_handover_card(row):
 
 
 def show_business_handover_menu():
-    st.header("業務全体申し送り")
+    st.header("申し送りを書く・確認する")
     show_observation_perspective("handover")
-    st.caption("施設全体の出来事・注意点・次の勤務者に共有したい内容を記録します。")
+    st.caption("次の勤務者に伝える出来事・注意点・未対応を残します。")
 
     # Ver5.0.1 修正：st.tabs だと環境やCSSの影響で「選択しても画面が動かない」ことがあるため、
     # 確実に再描画される radio 方式に変更。
@@ -9747,7 +9747,7 @@ def show_business_handover_menu():
         show_business_handover_in_progress_section(df)
 
         st.divider()
-        st.subheader("業務全体申し送りに入力")
+        st.subheader("申し送りを入力")
 
         with st.form("business_handover_form", clear_on_submit=False):
             c1, c2, c3, c4 = st.columns(4)
@@ -9761,8 +9761,8 @@ def show_business_handover_menu():
                 target_options = build_handover_target_options()
                 target_selection = st.selectbox("対象", target_options, index=0, key="business_handover_target")
 
-            st.markdown("#### 事実／気づき／次に見ること")
-            st.caption("責めるためではなく、次の勤務者が動きやすくなる形で分けて残します。")
+            st.markdown("#### 1. 内容")
+            st.caption("見たこと、気づき、次に見ることを分けて残します。")
             fact_note = st.text_area(
                 "事実（見たこと・起きたこと）",
                 height=100,
@@ -9796,14 +9796,14 @@ def show_business_handover_menu():
             with c5:
                 status = st.selectbox("対応状況", ["未対応", "対応中", "対応済"], index=0, key="business_handover_status")
 
-            st.markdown("#### 写真添付")
-            st.caption("申し送りに写真を1枚添付できます。皮膚状態・物品破損・居室環境など、文章で伝わりにくい内容の共有に使います。")
+            st.markdown("#### 2. 写真添付")
+            st.caption("必要なときだけ写真を1枚添付します。")
             photo1_file = st.file_uploader("写真を1枚添付", type=["jpg", "jpeg", "png", "webp"], key="business_handover_photo1")
             photo2_file = None  # 写真1枚運用。旧カラム互換のため変数のみ残す。
             if photo1_file is not None:
                 render_photo_compression_preview(photo1_file)
 
-            st.markdown("#### 入力Excelデータ添付")
+            st.markdown("#### 3. Excel・CSV添付")
             input_excel_file = st.file_uploader(
                 "入力済みのExcel・CSVを添付して申し送り内に表示",
                 type=["xlsx", "xls", "csv"],
@@ -9819,10 +9819,10 @@ def show_business_handover_menu():
                 input_excel_display_text = ""
 
             auto_extract_text = build_business_handover_auto_extract_text(record_date)
-            st.markdown("#### Excel自動抽出情報")
+            st.markdown("#### 4. 自動抽出情報")
             st.info(auto_extract_text)
 
-            submitted = st.form_submit_button("業務全体申し送りを保存", use_container_width=True)
+            submitted = st.form_submit_button("申し送りを保存する", use_container_width=True)
 
         if submitted:
             if not clean_text(staff_name):
@@ -9830,7 +9830,7 @@ def show_business_handover_menu():
                 st.stop()
 
             if not clean_text(overall_note) and not clean_text(check_note):
-                st.warning("全体申し送り、または要確認事項を入力してください。")
+                st.warning("申し送り内容、または要確認事項を入力してください。")
                 st.stop()
 
             target_type, target_user_id, target_user_name = resolve_handover_target(target_selection)
@@ -9864,11 +9864,11 @@ def show_business_handover_menu():
 
             df = pd.concat([df, pd.DataFrame([new_record], columns=BUSINESS_HANDOVER_COLUMNS)], ignore_index=True)
             save_business_handover_data(df)
-            st.success("業務全体申し送りを保存しました。")
+            st.success("申し送りを保存しました。未対応の内容は次の勤務者にも確認してください。")
             st.rerun()
 
     if handover_mode == "検索・更新・削除":
-        st.subheader("業務全体申し送りの検索")
+        st.subheader("申し送りの検索・修正")
         df = load_business_handover_data()
 
         if df.empty:
@@ -11065,7 +11065,7 @@ def show_short_goal_top():
         st.warning("このメニューは管理者専用です。")
         return
     st.header("短期目標・モニタリング")
-    st.caption("利用者ごとの短期目標を登録し、日々の実施状況から介護計画モニタリング表の下書きを作成します。")
+    st.caption("短期目標、実施状況、モニタリング下書きを確認します。")
     goals = load_short_goal_master()
     checks = load_short_goal_checks()
     drafts = load_monitoring_drafts()
@@ -11076,11 +11076,9 @@ def show_short_goal_top():
     st.markdown(
         """
         <div class="info-box">
-        ① 短期目標を登録<br>
-        ② 職員が日々「実施／一部実施／未実施」を入力<br>
-        ③ 利用者別・月別に履歴を確認<br>
-        ④ 月末や会議前にモニタリング下書きを作成<br>
-        ⑤ 利用者・短期目標ごとの実施率と理由・職員メモ要約を確認
+        ① 目標を登録<br>
+        ② 日々の実施を入力<br>
+        ③ 月末や会議前に下書きを確認
         </div>
         """,
         unsafe_allow_html=True,
@@ -11371,8 +11369,8 @@ def show_short_goal_master():
 
 
 def show_daily_goal_check():
-    st.header("日々の短期目標 実施チェック")
-    st.caption("日々の実施チェックを登録するだけでなく、登録済み記録の検索・更新・削除もできます。")
+    st.header("短期目標の実施チェック")
+    st.caption("今日の実施状況を、利用者ごとに記録します。")
 
     users = get_active_user_names()
     goal_df = load_short_goal_master()
@@ -11437,7 +11435,7 @@ def show_daily_goal_check():
     # 新規登録
     # -------------------------
     with tab_add:
-        st.subheader("実施チェックを新規登録")
+        st.subheader("実施チェックを入力")
 
         col1, col2 = st.columns(2)
         with col1:
@@ -11467,7 +11465,7 @@ def show_daily_goal_check():
             reason = st.text_input("未実施理由・一部実施の理由", placeholder="例：眠気が強く、声かけのみ実施", key="daily_new_reason")
             staff_memo = st.text_area("職員メモ", placeholder="例：リビングへの移動はできたが、10分ほどで居室へ戻られた", key="daily_new_staff_memo")
             staff_name = st.text_input("入力職員", placeholder="例：藤野", key="daily_new_staff_name")
-            submitted = st.form_submit_button("実施チェックを保存", use_container_width=True)
+            submitted = st.form_submit_button("実施チェックを保存する", use_container_width=True)
 
         if submitted:
             uid = get_user_id_by_name(user_name) or ensure_user_id_value(clean_text(selected_goal.get("user_id")), user_name)
@@ -11492,7 +11490,7 @@ def show_daily_goal_check():
                 add_audit_log("短期目標実施チェック登録", SQLITE_TABLE_SHORT_GOAL_CHECKS, new_row["記録ID"], f"{user_name} / {result} / {clean_text(selected_goal.get('短期目標'))[:80]}")
             except Exception:
                 pass
-            st.success("実施チェックを保存しました。")
+            st.success("実施チェックを保存しました。次回の支援・モニタリングに反映できます。")
             st.rerun()
 
     # -------------------------
@@ -14311,6 +14309,61 @@ MENU_GROUPS_ADMIN = {
 MENU_GROUPS_STAFF = {"今日の入力": ["業務全体申し送り", "健康チェック入力", "排泄チェック入力", "日々の実施チェック"]}
 
 
+MENU_CATEGORY_LABELS = {
+    "朝の確認": "朝の確認（管理者）",
+    "日々の入力": "日々の入力（職員・管理者）",
+    "記録確認": "記録の確認",
+    "短期目標・LIFE": "短期目標・LIFE（管理者）",
+    "帳票・共有": "帳票・共有（管理者）",
+    "設定・保守": "設定・保守（管理者）",
+    "今日の入力": "今日の入力（職員）",
+}
+
+MENU_DISPLAY_LABELS = {
+    "自分専用ダッシュボード": "自分用ダッシュボード",
+    "管理者ダッシュボード": "管理者ダッシュボード",
+    "業務全体申し送り": "申し送りを書く・確認する",
+    "管理者支援": "管理者支援",
+    "健康チェック入力": "健康チェックを書く",
+    "写真から半自動入力": "写真から入力補助",
+    "排泄チェック入力": "排泄チェックを書く",
+    "日々の実施チェック": "短期目標の実施チェック",
+    "過去データ管理": "健康記録の確認・修正",
+    "排泄詳細管理": "排泄記録の確認・修正",
+    "実施履歴一覧": "短期目標の実施履歴",
+    "短期目標データ管理": "短期目標データ管理",
+    "短期目標・モニタリング": "短期目標・モニタリング",
+    "短期目標マスタ": "短期目標の登録・管理",
+    "LIFE入力標準化": "LIFE入力の標準化",
+    "管理者LIFE入力": "LIFE入力（管理者）",
+    "LIFE不足チェック": "LIFE不足チェック",
+    "LIFE CSV出力": "LIFE CSV出力",
+    "LIFE登録一覧": "LIFE登録一覧",
+    "加算シミュレーション": "加算シミュレーション",
+    "家族向けレポート作成": "家族向けレポート",
+    "ひだまりレポートPDF": "ひだまりPDFレポート",
+    "データダウンロード": "データダウンロード",
+    "利用者マスタ管理": "利用者情報の管理",
+    "ログイン・職員ID管理": "ログイン・職員ID管理",
+    "セキュリティ・保守管理": "セキュリティ・保守",
+    "利用者ID移行チェック": "利用者ID移行チェック",
+    "利用者名ゆれ紐づけマスタ": "利用者名ゆれの整理",
+    "自分専用ダッシュボード設定": "ダッシュボード表示設定",
+    "メニューカテゴリ設定": "メニュー表示設定",
+    "システム設定": "システム設定",
+    "現場の気づき構造化・AI管理者支援": "気づき整理・AI管理者支援",
+    "AI管理者アシスタント": "AI管理者アシスタント",
+}
+
+
+def menu_category_label(category):
+    return MENU_CATEGORY_LABELS.get(category, category)
+
+
+def menu_display_label(menu_name):
+    return MENU_DISPLAY_LABELS.get(menu_name, menu_name)
+
+
 def get_standard_menu_groups(role="admin"):
     """標準メニューカテゴリ。自己設定の初期値として使う。"""
     return MENU_GROUPS_ADMIN if role == "admin" else MENU_GROUPS_STAFF
@@ -15444,7 +15497,7 @@ def show_ai_admin_assistant_menu():
         st.warning("このメニューは管理者専用です。")
         return
 
-    ui_section("AI管理者アシスタント", "利用者と期間を指定して、健康・排泄・申し送り・短期目標・モニタリングを横断整理します。", "🧠")
+    ui_section("AI管理者アシスタント", "利用者と期間を選び、確認ポイントを整理します。", "🧠")
     ui_card(
         "基本方針",
         "診断はしません。記録を整理し、気になる変化と管理者確認ポイントを拾うための補助機能です。",
@@ -15541,6 +15594,7 @@ def render_sidebar_menu(role):
     with st.sidebar:
         st.markdown(f'<div class="sidebar-title">ひだまり</div><div class="sidebar-sub">{APP_VERSION}<br>{APP_COPY}</div>', unsafe_allow_html=True)
         st.caption(f"ログイン：{st.session_state.get('user_label', '')}")
+        st.caption("区分：管理者メニュー" if role == "admin" else "区分：職員入力メニュー")
         st.divider()
         if role != "admin":
             category_names = list(groups.keys())
@@ -15550,23 +15604,23 @@ def render_sidebar_menu(role):
             default_category = st.session_state.get("main_menu_category_staff", category_names[0])
             if default_category not in category_names:
                 default_category = category_names[0]
-            category = st.selectbox("カテゴリ", category_names, index=category_names.index(default_category), key="main_menu_category_staff")
+            category = st.selectbox("目的を選ぶ", category_names, index=category_names.index(default_category), key="main_menu_category_staff", format_func=menu_category_label)
             menu_options = [m for m in groups.get(category, []) if m in filtered_flat]
             if not menu_options:
                 menu_options = filtered_flat
-            selected = st.radio("メニュー", menu_options, key=f"main_menu_staff_{category}")
+            selected = st.radio("開く画面", menu_options, key=f"main_menu_staff_{category}", format_func=menu_display_label)
             return selected
         category_names = list(groups.keys())
         default_category = st.session_state.get("main_menu_category", category_names[0])
         if default_category not in category_names:
             default_category = category_names[0]
-        category = st.selectbox("カテゴリ", category_names, index=category_names.index(default_category), key="main_menu_category")
+        category = st.selectbox("目的を選ぶ", category_names, index=category_names.index(default_category), key="main_menu_category", format_func=menu_category_label)
         menu_options = [m for m in groups.get(category, []) if m in filtered_flat]
         if not menu_options:
             menu_options = filtered_flat
         previous_menu = st.session_state.get("main_menu_selected", menu_options[0])
         menu_index = menu_options.index(previous_menu) if previous_menu in menu_options else 0
-        selected = st.radio("メニュー", menu_options, index=menu_index, key=f"main_menu_selected_{category}")
+        selected = st.radio("開く画面", menu_options, index=menu_index, key=f"main_menu_selected_{category}", format_func=menu_display_label)
         st.session_state["main_menu_selected"] = selected
         return selected
 
@@ -16312,6 +16366,79 @@ def show_my_dashboard_blocks(target_date=None):
         except Exception as e:
             st.warning(f"短期目標実施状況を表示できませんでした: {e}")
 
+
+def _filter_records_by_date(df, date_col, target_date):
+    if df is None or df.empty or date_col not in df.columns:
+        return pd.DataFrame()
+    work = df.copy()
+    work[date_col] = pd.to_datetime(work[date_col], errors="coerce")
+    return work[work[date_col].dt.date == target_date].copy()
+
+
+def show_dashboard_today_tasks(today, health_df, ex_df):
+    st.subheader("今日やること")
+    st.caption("未入力と未対応を先に確認します。")
+
+    today_health = _filter_records_by_date(health_df, "記録日", today)
+    today_ex = get_day_excretion_data(ex_df, today, None)
+    health_users = set(today_health.get("利用者名", pd.Series(dtype=str)).dropna().astype(str)) if not today_health.empty else set()
+    ex_users = set(today_ex.get("利用者名", pd.Series(dtype=str)).dropna().astype(str)) if not today_ex.empty else set()
+    user_count = len(active_users) if "active_users" in globals() else 0
+
+    try:
+        handover_df = load_business_handover_data(start_date=today, end_date=today)
+        if handover_df.empty:
+            open_handover = 0
+        else:
+            status = handover_df.get("対応状況", pd.Series(dtype=str)).fillna("").astype(str)
+            priority = handover_df.get("優先度", pd.Series(dtype=str)).fillna("").astype(str)
+            check_note = handover_df.get("要確認事項", pd.Series(dtype=str)).fillna("").astype(str).str.strip()
+            open_handover = int(((status != "対応済") & ((priority.isin(["注意", "至急"])) | (check_note != ""))).sum())
+    except Exception:
+        open_handover = 0
+
+    c1, c2, c3, c4 = st.columns(4)
+    c1.metric("健康チェック未入力", max(user_count - len(health_users), 0))
+    c2.metric("排泄チェック未入力", max(user_count - len(ex_users), 0))
+    c3.metric("未対応の申し送り", open_handover)
+    c4.metric("今日の利用者数", user_count)
+
+
+def show_dashboard_recent_attention(target_date, health_df, ex_df):
+    st.subheader("最近の注意点")
+    st.caption("確認日を含む直近の体調・排泄・申し送りを見ます。")
+
+    try:
+        attention_df = build_attention_users(health_df, ex_df, target_date)
+    except Exception:
+        attention_df = pd.DataFrame()
+
+    recent_start = target_date - timedelta(days=2)
+    try:
+        recent_handover = load_business_handover_data(start_date=recent_start, end_date=target_date)
+    except Exception:
+        recent_handover = pd.DataFrame()
+
+    if attention_df.empty and recent_handover.empty:
+        st.success("直近の注意表示はありません。")
+        return
+
+    if not attention_df.empty:
+        show_cols = [c for c in ["利用者名", "確認ポイント", "内容"] if c in add_confirm_points_column(attention_df).columns]
+        st.dataframe(add_confirm_points_column(attention_df)[show_cols].head(8), use_container_width=True, hide_index=True)
+
+    if not recent_handover.empty:
+        for col in ["日付", "対象", "利用者名", "優先度", "対応状況", "要確認事項"]:
+            if col not in recent_handover.columns:
+                recent_handover[col] = ""
+        handover_alerts = recent_handover[
+            (recent_handover["対応状況"].astype(str) != "対応済")
+            | (recent_handover["優先度"].astype(str).isin(["注意", "至急"]))
+        ].copy()
+        if not handover_alerts.empty:
+            st.caption("未対応・注意の申し送り")
+            st.dataframe(handover_alerts[["日付", "対象", "利用者名", "優先度", "対応状況", "要確認事項"]].head(8), use_container_width=True, hide_index=True)
+
 # =========================
 # 管理者ダッシュボード
 # =========================
@@ -16331,8 +16458,8 @@ if menu == "管理者ダッシュボード":
     st.markdown(
         """
         <div class="info-box">
-            <b>出勤時の確認用ダッシュボードです。</b><br>
-            初期表示は「昨日」です。前日の申し送り・注意記録・排泄状況を確認してから、本日の対応につなげます。
+            <b>朝の確認画面です。</b><br>
+            今日の未入力・未対応と、確認日の注意点を見ます。
         </div>
         """,
         unsafe_allow_html=True,
@@ -16359,6 +16486,11 @@ if menu == "管理者ダッシュボード":
 
     ex_sum = summarize_excretion(target_excretion)
     col4.metric("確認日の排便記録", ex_sum["排便回数"])
+
+    st.markdown("---")
+    show_dashboard_today_tasks(today, health_df, ex_df)
+    st.markdown("---")
+    show_dashboard_recent_attention(target_date, health_df, ex_df)
 
     st.markdown("---")
     show_latest_weight_block(health_df, active_users, target_date)
@@ -16498,11 +16630,11 @@ elif menu == "写真から半自動入力":
 # 健康チェック入力
 # =========================
 elif menu == "健康チェック入力":
-    st.header("健康チェック入力")
+    st.header("健康チェックを書く")
     show_observation_perspective("health")
 
     if st.session_state.role == "staff":
-        st.write("バイタルと食事の様子を、今日の記録として残します。")
+        st.write("記録日・利用者・入力者を確認してから、バイタル、食事、気になる変化の順に入力します。")
 
     if not active_users:
         st.warning("利用者マスタに表示中の利用者がいません。")
@@ -16526,7 +16658,7 @@ elif menu == "健康チェック入力":
             """
             <div style='background:#EAF4FF; border:1px solid #9CC7F0; color:#174A7C; padding:12px 14px; border-radius:10px; margin:8px 0 12px 0;'>
                 <b>この記録日・利用者名の健康チェックデータはありません。</b><br>
-                登録すると新規データとして保存されます。
+                保存すると新しい記録として登録されます。
             </div>
             """,
             unsafe_allow_html=True,
@@ -16537,7 +16669,7 @@ elif menu == "健康チェック入力":
             """
             <div style='background:#FFF3E0; border:1px solid #F0B36A; color:#8A4B00; padding:12px 14px; border-radius:10px; margin:8px 0 12px 0;'>
                 <b>この記録日・利用者名の健康チェックデータは既にあります。</b><br>
-                登録すると上書き更新されます。既存データを初期表示しています。
+                保存するとこの内容で更新されます。前回の内容を表示しています。
             </div>
             """,
             unsafe_allow_html=True,
@@ -16559,7 +16691,7 @@ elif menu == "健康チェック入力":
         return clean_text(existing_row.get(col), default)
 
     with st.form("health_form", clear_on_submit=False):
-        st.subheader("バイタル")
+        st.subheader("1. バイタル")
 
         c1, c2, c3 = st.columns(3)
         with c1:
@@ -16585,8 +16717,8 @@ elif menu == "健康チェック入力":
             st.caption("※未測定の場合は空欄でOK")
 
         st.divider()
-        st.subheader("食事摂取量（LIFE向け標準化）")
-        st.caption("自由な表現ではなく、選択式で保存します。内部では従来の摂取率も自動保存します。")
+        st.subheader("2. 食事量")
+        st.caption("朝・昼・夕の食事量を選びます。")
 
         m1, m2, m3 = st.columns(3)
         with m1:
@@ -16604,7 +16736,7 @@ elif menu == "健康チェック入力":
         dinner = MEAL_INTAKE_PERCENT[dinner_code]
 
         st.divider()
-        st.subheader("LIFE補助項目")
+        st.subheader("3. 水分・口腔・メモ")
         l1, l2, l3, l4 = st.columns(4)
         with l1:
             water_ml = st.number_input("水分摂取量ml", min_value=0, max_value=5000, value=row_int("水分摂取量ml", 0), step=50)
@@ -16615,11 +16747,11 @@ elif menu == "健康チェック入力":
         with l4:
             denture_status = st.selectbox("義歯使用", DENTURE_OPTIONS, index=get_life_option_index(DENTURE_OPTIONS, row_text("義歯使用", "9: 未確認"), 3))
 
-        life_memo = st.text_area("LIFE補助メモ", value=row_text("LIFE補助メモ"), placeholder="食事・水分・口腔・栄養面で気になる点。提出前確認用の内部メモです。")
+        life_memo = st.text_area("LIFE補助メモ", value=row_text("LIFE補助メモ"), placeholder="食事・水分・口腔・栄養面で気になる点")
         family_memo = st.text_area("家族共有メモ", value=row_text("家族共有メモ"), placeholder="ご家族へ共有してよい内容を入力")
         changes = st.text_area("気になる変化", value=row_text("気になる変化"), placeholder="食事、睡眠、歩行、表情、体調など")
 
-        submitted = st.form_submit_button("登録する")
+        submitted = st.form_submit_button("健康チェックを保存する")
 
     if submitted:
         weight, weight_error = parse_optional_weight(weight_raw)
@@ -16656,12 +16788,12 @@ elif menu == "健康チェック入力":
         errors, warnings = validate_health_record(record)
 
         if errors:
-            st.error("保存できません。入力内容を確認してください。")
+            st.error("保存できません。赤い表示の項目を確認してください。")
             for msg in errors:
                 st.error(msg)
         else:
             if warnings:
-                st.warning("保存前確認があります。")
+                st.warning("保存前に確認してください。")
                 for msg in warnings:
                     st.warning(msg)
 
@@ -16669,7 +16801,7 @@ elif menu == "健康チェック入力":
             st.info(diff_text)
 
             action = upsert_health_record(record)
-            st.success(f"健康チェックを{action}しました。")
+            st.success(f"健康チェックを{action}しました。申し送りが必要な内容は共有してください。")
             st.rerun()
 
 
@@ -16678,13 +16810,13 @@ elif menu == "健康チェック入力":
 # 未入力チェック一覧＋スマホ用ワンタップ風UI
 # =========================
 elif menu == "排泄チェック入力":
-    st.header("排泄チェック入力")
+    st.header("排泄チェックを書く")
     show_observation_perspective("excretion")
-    st.caption("排泄記録は健康チェックとは別データとして保存します。キーは「記録日＋利用者名＋時間帯」です。")
+    st.caption("記録日・利用者・入力者を確認して、時間帯ごとに尿・便を入力します。")
 
     if st.session_state.role == "staff":
-        st.markdown("###  排泄チェック入力")
-        st.write("時間帯ごとに、尿・便の様子をワンタップ感覚で記録します。")
+        st.markdown("### 排泄チェックを書く")
+        st.write("日中帯、夜間帯の順に確認します。")
 
     if not active_users:
         st.warning("利用者マスタに表示中の利用者がいません。")
@@ -16712,7 +16844,7 @@ elif menu == "排泄チェック入力":
             """
             <div style='background:#EAF4FF; border:1px solid #9CC7F0; color:#174A7C; padding:12px 14px; border-radius:10px; margin:8px 0 12px 0;'>
                 <b>この記録日・利用者名の排泄データはありません。</b><br>
-                登録すると新規データとして保存されます。
+                保存すると新しい排泄記録として登録されます。
             </div>
             """,
             unsafe_allow_html=True,
@@ -16722,14 +16854,14 @@ elif menu == "排泄チェック入力":
             """
             <div style='background:#FFF3E0; border:1px solid #F0B36A; color:#8A4B00; padding:12px 14px; border-radius:10px; margin:8px 0 12px 0;'>
                 <b>この記録日・利用者名の排泄データは既にあります。</b><br>
-                登録すると時間帯ごとに上書き更新されます。
+                保存すると時間帯ごとに更新されます。
             </div>
             """,
             unsafe_allow_html=True,
         )
 
     # スマホ用ワンタップ風UI
-    st.caption("尿量・便量は横並びボタン風に選べます。スマホでも押しやすいようにしています。")
+    st.caption("尿量・便量を選び、必要な時間帯だけメモを残します。")
 
     with st.form("excretion_form", clear_on_submit=False):
         records_to_save = []
@@ -16821,21 +16953,21 @@ elif menu == "排泄チェック入力":
                 "登録日時": format_now_jst("%Y-%m-%d %H:%M:%S"),
             })
 
-        st.markdown("####  日中帯（9時〜17時）")
+        st.markdown("#### 1. 日中帯（9時〜17時）")
         day_cols = st.columns(3)
 
         for col, (slot, time_label) in zip(day_cols, EXCRETION_SLOTS[:3]):
             with col:
                 render_slot(slot, time_label, "#FFF7EC", "#E5D5BF")
 
-        st.markdown("####  夜間帯（18時〜翌8時）")
+        st.markdown("#### 2. 夜間帯（18時〜翌8時）")
         night_cols = st.columns(3)
 
         for col, (slot, time_label) in zip(night_cols, EXCRETION_SLOTS[3:]):
             with col:
                 render_slot(slot, time_label, "#EEF4FA", "#C9D8E6")
 
-        submitted = st.form_submit_button("排泄チェックを登録・更新する")
+        submitted = st.form_submit_button("排泄チェックを保存する")
 
     if submitted:
         all_errors = []
@@ -16849,12 +16981,12 @@ elif menu == "排泄チェック入力":
                 all_warnings.append(f"{record['時間帯']}：{msg}")
 
         if all_errors:
-            st.error("保存できません。排泄入力内容を確認してください。")
+            st.error("保存できません。赤い表示の時間帯を確認してください。")
             for msg in all_errors:
                 st.error(msg)
         else:
             if all_warnings:
-                st.warning("保存前確認があります。")
+                st.warning("保存前に確認してください。")
                 for msg in all_warnings:
                     st.warning(msg)
 
@@ -16862,7 +16994,7 @@ elif menu == "排泄チェック入力":
                 upsert_excretion_record(record)
 
             st.info(build_excretion_diff_text(load_excretion_data(), record_date, user_name))
-            st.success("排泄チェックを保存しました。時間帯ごとに登録・更新されています。")
+            st.success("排泄チェックを保存しました。時間帯ごとの記録を更新しました。")
             st.rerun()
 
     st.subheader("この日の排泄記録")
@@ -17538,6 +17670,7 @@ elif menu == "家族向けレポート作成":
         st.stop()
 
     st.header("家族向けレポート作成")
+    st.caption("利用者と対象月を選ぶと、家族共有用の文章を作成します。")
 
     if not all_users:
         st.warning("利用者が登録されていません。")
@@ -17576,6 +17709,7 @@ elif menu == "ひだまりレポートPDF":
         st.stop()
 
     st.header("ひだまりレポートPDF")
+    st.caption("利用者と対象月を選び、PDFを作成します。")
 
     if not all_users:
         st.warning("利用者が登録されていません。")
