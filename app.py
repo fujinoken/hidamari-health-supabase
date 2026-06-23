@@ -13,10 +13,6 @@ except Exception:
 import uuid
 from pathlib import Path
 from datetime import date, datetime, timedelta
-try:
-    from zoneinfo import ZoneInfo
-except Exception:
-    ZoneInfo = None
 from io import BytesIO
 import zipfile
 import sqlite3
@@ -28,6 +24,87 @@ import shutil
 import threading
 import time
 from contextlib import contextmanager
+
+from hidamari.config.columns import (
+    ACCOUNT_COLUMNS,
+    ALERT_CONDITION_COLUMNS,
+    APP_SETTING_COLUMNS,
+    ASSESSMENT_COLUMNS,
+    BUSINESS_HANDOVER_COLUMNS,
+    EXCRETION_COLUMNS,
+    HANDOVER_KEYWORD_COLUMNS,
+    HEALTH_COLUMNS,
+    LIFE_ADL_COLUMNS,
+    LOGIN_HISTORY_COLUMNS,
+    MONITORING_DRAFT_COLUMNS,
+    SHORT_GOAL_CHECK_COLUMNS,
+    SHORT_GOAL_MASTER_COLUMNS,
+    USER_COLUMNS,
+    USER_NAME_ALIAS_COLUMNS,
+)
+from hidamari.config.constants import (
+    ADL_LEVEL_OPTIONS,
+    COGNITIVE_OPTIONS,
+    DEFAULT_USERS,
+    DENTURE_OPTIONS,
+    EXCRETION_SHEET,
+    EXCRETION_SLOTS,
+    HEALTH_SHEET,
+    MEAL_INTAKE_OPTIONS,
+    MEAL_INTAKE_PERCENT,
+    NUTRITION_RISK_OPTIONS,
+    ORAL_STATUS_OPTIONS,
+    STOOL_AMOUNT_CODE,
+    STOOL_AMOUNT_OPTIONS,
+    STOOL_TYPE_CODE,
+    STOOL_TYPE_OPTIONS,
+    URINE_AMOUNT_CODE,
+    URINE_AMOUNT_OPTIONS,
+    URINE_TYPE_CODE,
+    URINE_TYPE_OPTIONS,
+    USER_SHEET,
+)
+from hidamari.config.menu import (
+    MENU_CATEGORY_LABELS,
+    MENU_DISPLAY_LABELS,
+    MENU_GROUPS_ADMIN,
+    MENU_GROUPS_STAFF,
+    menu_category_label,
+    menu_display_label,
+)
+from hidamari.config.paths import (
+    ACCOUNT_FILE,
+    ALERT_CONDITION_FILE,
+    BUSINESS_HANDOVER_EXCEL_DIR,
+    BUSINESS_HANDOVER_PHOTO_DIR,
+    DATA_DIR,
+    EXCRETION_FILE,
+    HANDOVER_FILE,
+    HEALTH_FILE,
+    HIDAMARI_DB_FILE,
+    LIFE_ADL_FILE,
+    LOGIN_HISTORY_FILE,
+    MENU_CATEGORY_SETTINGS_FILE,
+    MONITORING_DRAFT_FILE,
+    REPORT_DIR,
+    SHORT_GOAL_CHECK_FILE,
+    SHORT_GOAL_MASTER_FILE,
+    USER_FILE,
+)
+from hidamari.core.text_utils import (
+    clean_text,
+    get_life_option_index,
+    get_option_index,
+    html_escape_text,
+    make_date_user_key,
+    make_excretion_key,
+    meal_option_from_percent,
+    option_code,
+    safe_float,
+    safe_int,
+    to_number,
+)
+from hidamari.core.time_utils import JST, format_now_jst, now_jst, now_jst_dt, today_jst
 
 try:
     import requests
@@ -153,29 +230,6 @@ st.set_page_config(
     layout="wide",
 )
 
-# =========================
-# JST時刻統一（Ver4.3）
-# Streamlit Cloud等のUTCサーバーでも、記録日時・更新日時・監査ログ・バックアップ履歴を日本時間で統一する。
-# =========================
-JST = ZoneInfo("Asia/Tokyo") if ZoneInfo else None
-
-def now_jst_dt():
-    if JST:
-        return datetime.now(JST)
-    # zoneinfoが使えない環境向けのフォールバック
-    return datetime.utcnow() + timedelta(hours=9)
-
-def format_now_jst(fmt="%Y-%m-%d %H:%M:%S"):
-    return now_jst_dt().strftime(fmt)
-
-def now_jst():
-    return format_now_jst("%Y-%m-%d %H:%M:%S")
-
-def today_jst():
-    return now_jst_dt().date()
-
-
-
 def is_admin_user():
     role = st.session_state.get("role", "")
     user = (
@@ -257,33 +311,9 @@ USERS = {
 
 
 # =========================
-# ファイル設定
-# =========================
-DATA_DIR = Path("data")
-REPORT_DIR = Path("reports")
-BUSINESS_HANDOVER_PHOTO_DIR = DATA_DIR / "business_handover_photos"
-BUSINESS_HANDOVER_EXCEL_DIR = DATA_DIR / "business_handover_excels"
-
-HEALTH_FILE = DATA_DIR / "health_data.xlsx"
-EXCRETION_FILE = DATA_DIR / "excretion_data.xlsx"
-USER_FILE = DATA_DIR / "user_master.xlsx"
-HANDOVER_FILE = DATA_DIR / "business_handover_data.xlsx"
-SHORT_GOAL_MASTER_FILE = DATA_DIR / "short_goal_master.xlsx"
-SHORT_GOAL_CHECK_FILE = DATA_DIR / "short_goal_check_data.xlsx"
-MONITORING_DRAFT_FILE = DATA_DIR / "monitoring_draft_data.xlsx"
-LIFE_ADL_FILE = DATA_DIR / "life_adl_assessment_data.xlsx"
-ALERT_CONDITION_FILE = DATA_DIR / "handover_alert_condition_master.xlsx"
-ACCOUNT_FILE = DATA_DIR / "login_account_master.xlsx"
-LOGIN_HISTORY_FILE = DATA_DIR / "login_history.xlsx"
-MENU_CATEGORY_SETTINGS_FILE = DATA_DIR / "menu_category_settings.json"
-
-
-# =========================
 # SQLite設定（Ver3.7 DB層分離）
 # DB接続・WAL設定・保存/読込・整合性チェックは db/database.py に分離
 # =========================
-HIDAMARI_DB_FILE = DATA_DIR / "hidamari_health.db"
-
 SQLITE_TABLE_HEALTH = "health_records"
 SQLITE_TABLE_EXCRETION = "excretion_records"
 SQLITE_TABLE_HANDOVER = "handover_logs"
@@ -300,26 +330,6 @@ SQLITE_TABLE_LIFE_ADL = "life_adl_assessments"
 SQLITE_TABLE_AI_INSIGHT_LOGS = "ai_insight_logs"
 SQLITE_TABLE_USER_NAME_ALIASES = "user_name_aliases"
 SQLITE_TABLE_HANDOVER_KEYWORDS = "handover_keywords"
-
-APP_SETTING_COLUMNS = [
-    "設定キー",
-    "設定値",
-    "分類",
-    "説明",
-    "更新日時",
-    "更新者",
-]
-
-HANDOVER_KEYWORD_COLUMNS = [
-    "id",
-    "keyword",
-    "title",
-    "category",
-    "is_active",
-    "sort_order",
-    "created_at",
-    "updated_at",
-]
 
 from db import database as db_engine
 
@@ -3662,193 +3672,6 @@ key = "sb_secret_xxxxxxxxxxxxxxxxx"''', language="toml")
 
 
 
-HEALTH_SHEET = "健康チェック"
-EXCRETION_SHEET = "排泄チェック"
-USER_SHEET = "利用者マスタ"
-
-DEFAULT_USERS = [
-    "さくら様",
-    "谷様",
-    "磯崎様",
-    "川上様",
-    "和波様",
-    "桜井様",
-    "國枝様",
-    "中野様",
-    "山口様",
-]
-
-ASSESSMENT_COLUMNS = [
-    "基本情報",
-    "主訴",
-    "生活状況",
-    "ADL",
-    "IADL",
-    "認知機能",
-    "健康状態",
-    "課題",
-    "支援内容",
-]
-
-HEALTH_COLUMNS = [
-    "記録日",
-    "利用者名",
-    "user_id",
-    "体温",
-    "血圧上",
-    "血圧下",
-    "脈拍",
-    "SpO2",
-    "体重",
-    "朝食摂取率",
-    "昼食摂取率",
-    "夕食摂取率",
-    # LIFE向け標準化項目（コード化しやすい入力基準）
-    "朝食摂取区分",
-    "昼食摂取区分",
-    "夕食摂取区分",
-    "水分摂取量ml",
-    "栄養リスク",
-    "口腔状態",
-    "義歯使用",
-    "LIFE補助メモ",
-    # 現場の自由記述は残す
-    "家族共有メモ",
-    "気になる変化",
-    "登録日時",
-    "入力者",
-]
-
-EXCRETION_SLOTS = [
-    ("午前", "9時〜12時"),
-    ("午後", "12時〜15時"),
-    ("夕方", "15時〜17時"),
-    ("夜", "18時〜22時"),
-    ("深夜", "22時〜5時"),
-    ("朝方", "5時〜8時"),
-]
-
-URINE_AMOUNT_OPTIONS = ["なし", "少", "中", "大"]
-URINE_TYPE_OPTIONS = ["なし", "普通尿", "濃縮尿"]
-STOOL_AMOUNT_OPTIONS = ["なし", "少", "中", "大"]
-STOOL_TYPE_OPTIONS = ["なし", "普通便", "下痢便", "水様便"]
-
-# LIFE向けの標準化コード。画面では日本語で選び、保存時にコードも残す。
-MEAL_INTAKE_OPTIONS = [
-    "1: 全量（90%以上）",
-    "2: 7〜8割（70〜89%）",
-    "3: 半量（40〜69%）",
-    "4: 1〜3割（1〜39%）",
-    "5: 未摂取（0%）",
-]
-MEAL_INTAKE_PERCENT = {
-    "1: 全量（90%以上）": 100,
-    "2: 7〜8割（70〜89%）": 80,
-    "3: 半量（40〜69%）": 50,
-    "4: 1〜3割（1〜39%）": 30,
-    "5: 未摂取（0%）": 0,
-}
-NUTRITION_RISK_OPTIONS = ["0: 通常", "1: 注意", "2: 低下傾向あり", "3: 要確認"]
-ORAL_STATUS_OPTIONS = ["0: 通常", "1: 口腔内汚れあり", "2: むせあり", "3: 痛み・出血等あり", "9: 未確認"]
-DENTURE_OPTIONS = ["0: なし", "1: あり（問題なし）", "2: あり（不具合あり）", "9: 未確認"]
-
-URINE_AMOUNT_CODE = {"なし": "0", "少": "1", "中": "2", "大": "3"}
-URINE_TYPE_CODE = {"なし": "0", "普通尿": "1", "濃縮尿": "2"}
-STOOL_AMOUNT_CODE = {"なし": "0", "少": "1", "中": "2", "大": "3"}
-STOOL_TYPE_CODE = {"なし": "0", "普通便": "1", "硬便": "2", "下痢便": "3", "水様便": "4"}
-
-ADL_LEVEL_OPTIONS = ["1: 自立", "2: 見守り", "3: 一部介助", "4: 全介助", "9: 未確認"]
-COGNITIVE_OPTIONS = ["0: 普段通り", "1: 物忘れ・混乱あり", "2: 不安・拒否あり", "3: 昼夜逆転・不眠傾向", "9: 未確認"]
-
-EXCRETION_COLUMNS = [
-    "記録日",
-    "利用者名",
-    "user_id",
-    "時間帯",
-    "時間帯目安",
-    "尿量",
-    "尿量コード",
-    "尿性状",
-    "尿性状コード",
-    "便量",
-    "便量コード",
-    "便性状",
-    "便性状コード",
-    "排泄メモ",
-    "入力者",
-    "登録日時",
-]
-
-USER_COLUMNS = ["user_id", "利用者名", "表示"] + ASSESSMENT_COLUMNS
-
-BUSINESS_HANDOVER_COLUMNS = [
-    "記録ID",
-    "日付",
-    "勤務帯",
-    "記入者",
-    "対象区分",
-    "user_id",
-    "利用者名",
-    "全体申し送り",
-    "要確認事項",
-    "優先度",
-    "対応状況",
-    "写真1",
-    "写真2",
-    "Excel自動抽出情報",
-    "入力Excelファイル",
-    "入力Excel表示情報",
-    "記録日時",
-]
-
-ALERT_CONDITION_COLUMNS = [
-    "条件ID",
-    "使用",
-    "条件名",
-    "重要度",
-    "分類",
-    "条件種別",
-    "閾値1",
-    "閾値2",
-    "日数",
-    "キーワード",
-    "表示メッセージ",
-    "並び順",
-]
-
-ACCOUNT_COLUMNS = [
-    "ログインID",
-    "表示名",
-    "パスワードハッシュ",
-    "権限",
-    "状態",
-    "備考",
-    "作成日時",
-    "更新日時",
-    "初回パスワード変更必須",
-    "最終パスワード変更日時",
-]
-
-LOGIN_HISTORY_COLUMNS = [
-    "日時",
-    "ログインID",
-    "表示名",
-    "権限",
-    "結果",
-    "メモ",
-]
-
-USER_NAME_ALIAS_COLUMNS = [
-    "alias_id",
-    "表記ゆれ名",
-    "紐づけ先 user_id",
-    "正式利用者名",
-    "有効/無効",
-    "備考",
-    "更新日時",
-    "更新者",
-]
-
 DEFAULT_ALERT_CONDITIONS = [
     {"条件ID": "C001", "使用": True, "条件名": "未排便3日", "重要度": "注意", "分類": "排泄", "条件種別": "未排便", "閾値1": 3, "閾値2": "", "日数": 3, "キーワード": "", "表示メッセージ": "直近{日数}日間、排便記録がありません。水分・食事量・腹部症状を確認してください。", "並び順": 10},
     {"条件ID": "C002", "使用": True, "条件名": "水様便・下痢便あり", "重要度": "注意", "分類": "排泄", "条件種別": "便性状", "閾値1": "", "閾値2": "", "日数": 1, "キーワード": "水様便,下痢便", "表示メッセージ": "水様便・下痢便の記録があります。回数・腹部症状・感染症状を確認してください。", "並び順": 20},
@@ -3865,72 +3688,6 @@ DEFAULT_ALERT_CONDITIONS = [
     {"条件ID": "C013", "使用": True, "条件名": "SpO2低下＋傾眠等", "重要度": "至急", "分類": "複合", "条件種別": "複合:SpO2低下+キーワード", "閾値1": 93, "閾値2": "", "日数": 1, "キーワード": "傾眠,息苦しい,顔色,呼吸,ぐったり", "表示メッセージ": "SpO2低下と気になる変化が重なっています。呼吸状態を優先確認してください。", "並び順": 130},
 ]
 
-SHORT_GOAL_MASTER_COLUMNS = [
-    "目標ID",
-    "利用者名",
-    "user_id",
-    "短期目標",
-    "支援内容",
-    "開始日",
-    "終了予定日",
-    "状態",
-    "備考",
-    "登録日時",
-]
-
-SHORT_GOAL_CHECK_COLUMNS = [
-    "記録ID",
-    "日付",
-    "利用者名",
-    "user_id",
-    "目標ID",
-    "短期目標",
-    "実施状況",
-    "本人の様子",
-    "未実施理由",
-    "職員メモ",
-    "入力職員",
-    "モニタリング反映",
-    "登録日時",
-]
-
-MONITORING_DRAFT_COLUMNS = [
-    "下書きID",
-    "作成日",
-    "対象月",
-    "利用者名",
-    "user_id",
-    "短期目標",
-    "実施率",
-    "実施回数",
-    "一部実施回数",
-    "未実施回数",
-    "本人の様子まとめ",
-    "未実施理由まとめ",
-    "モニタリング下書き",
-    "今後の方向性",
-    "作成日時",
-]
-
-
-LIFE_ADL_COLUMNS = [
-    "評価ID",
-    "評価日",
-    "対象月",
-    "利用者名",
-    "user_id",
-    "歩行",
-    "移乗",
-    "食事動作",
-    "排泄動作",
-    "更衣",
-    "認知・行動",
-    "評価メモ",
-    "入力者",
-    "登録日時",
-]
-
-
 # =========================
 # 共通関数
 # =========================
@@ -3939,98 +3696,6 @@ def ensure_dirs():
     REPORT_DIR.mkdir(exist_ok=True)
     BUSINESS_HANDOVER_PHOTO_DIR.mkdir(parents=True, exist_ok=True)
     BUSINESS_HANDOVER_EXCEL_DIR.mkdir(parents=True, exist_ok=True)
-
-
-def clean_text(value, default=""):
-    try:
-        if pd.isna(value):
-            return default
-    except Exception:
-        pass
-
-    text = str(value).strip()
-    if text.lower() in ["nan", "none", "nat"]:
-        return default
-    return text
-
-
-def html_escape_text(value, default=""):
-    return html.escape(clean_text(value, default), quote=True)
-
-
-def safe_float(value, default=0.0):
-    try:
-        if pd.isna(value) or value == "":
-            return default
-        return float(value)
-    except Exception:
-        return default
-
-
-def safe_int(value, default=0):
-    try:
-        if pd.isna(value) or value == "":
-            return default
-        return int(float(value))
-    except Exception:
-        return default
-
-
-def to_number(series):
-    return pd.to_numeric(series, errors="coerce")
-
-
-def make_date_user_key(record_date, user_name):
-    d = pd.to_datetime(record_date, errors="coerce")
-    if pd.isna(d):
-        return ""
-    return f"{d.strftime('%Y-%m-%d')}__{clean_text(user_name)}"
-
-
-def make_excretion_key(record_date, user_name, slot):
-    d = pd.to_datetime(record_date, errors="coerce")
-    if pd.isna(d):
-        return ""
-    return f"{d.strftime('%Y-%m-%d')}__{clean_text(user_name)}__{clean_text(slot)}"
-
-
-def get_option_index(options, value, default="なし"):
-    value = clean_text(value, default)
-    if value in options:
-        return options.index(value)
-    if default in options:
-        return options.index(default)
-    return 0
-
-
-def get_life_option_index(options, value, default_index=0):
-    """保存済みの値が完全一致または先頭コード一致する場合に選択肢位置を返す。"""
-    value = clean_text(value)
-    if value in options:
-        return options.index(value)
-    if value:
-        code = value.split(":")[0].strip()
-        for i, opt in enumerate(options):
-            if opt.split(":")[0].strip() == code:
-                return i
-    return default_index
-
-
-def meal_option_from_percent(percent):
-    value = safe_int(percent, 80)
-    if value >= 90:
-        return "1: 全量（90%以上）"
-    if value >= 70:
-        return "2: 7〜8割（70〜89%）"
-    if value >= 40:
-        return "3: 半量（40〜69%）"
-    if value >= 1:
-        return "4: 1〜3割（1〜39%）"
-    return "5: 未摂取（0%）"
-
-
-def option_code(option_text):
-    return clean_text(option_text).split(":")[0].strip()
 
 
 
@@ -14296,73 +13961,6 @@ UI_COLORS = {
     "staff": {"bg": "#FFFDF7", "surface": "#FFFFFF", "surface_soft": "#FFF7EC", "accent": "#C9705C", "accent_dark": "#8F4C3E", "sub": "#6A5B52", "border": "#E8D7C5"},
     "admin": {"bg": "#F6F8F7", "surface": "#FFFFFF", "surface_soft": "#EEF4F1", "accent": "#2F6F5E", "accent_dark": "#244D43", "sub": "#52605B", "border": "#C9DAD2"},
 }
-
-MENU_GROUPS_ADMIN = {
-    "朝の確認": ["自分専用ダッシュボード", "管理者ダッシュボード", "業務全体申し送り", "管理者支援"],
-    "日々の入力": ["健康チェック入力", "写真から半自動入力", "排泄チェック入力", "日々の実施チェック"],
-    "記録確認": ["過去データ管理", "排泄詳細管理", "実施履歴一覧", "短期目標データ管理"],
-    "短期目標・LIFE": ["短期目標・モニタリング", "短期目標マスタ", "LIFE入力標準化", "管理者LIFE入力", "LIFE不足チェック", "LIFE CSV出力", "LIFE登録一覧", "加算シミュレーション"],
-    "帳票・共有": ["家族向けレポート作成", "ひだまりレポートPDF", "データダウンロード"],
-    "設定・保守": ["利用者マスタ管理", "ログイン・職員ID管理", "セキュリティ・保守管理", "利用者ID移行チェック", "利用者名ゆれ紐づけマスタ", "自分専用ダッシュボード設定", "メニューカテゴリ設定", "システム設定", "現場の気づき構造化・AI管理者支援", "AI管理者アシスタント"],
-}
-
-MENU_GROUPS_STAFF = {"今日の入力": ["業務全体申し送り", "健康チェック入力", "排泄チェック入力", "日々の実施チェック"]}
-
-
-MENU_CATEGORY_LABELS = {
-    "朝の確認": "朝の確認（管理者）",
-    "日々の入力": "日々の入力（職員・管理者）",
-    "記録確認": "記録の確認",
-    "短期目標・LIFE": "短期目標・LIFE（管理者）",
-    "帳票・共有": "帳票・共有（管理者）",
-    "設定・保守": "設定・保守（管理者）",
-    "今日の入力": "今日の入力（職員）",
-}
-
-MENU_DISPLAY_LABELS = {
-    "自分専用ダッシュボード": "自分用ダッシュボード",
-    "管理者ダッシュボード": "管理者ダッシュボード",
-    "業務全体申し送り": "申し送りを書く・確認する",
-    "管理者支援": "管理者支援",
-    "健康チェック入力": "健康チェックを書く",
-    "写真から半自動入力": "写真から入力補助",
-    "排泄チェック入力": "排泄チェックを書く",
-    "日々の実施チェック": "短期目標の実施チェック",
-    "過去データ管理": "健康記録の確認・修正",
-    "排泄詳細管理": "排泄記録の確認・修正",
-    "実施履歴一覧": "短期目標の実施履歴",
-    "短期目標データ管理": "短期目標データ管理",
-    "短期目標・モニタリング": "短期目標・モニタリング",
-    "短期目標マスタ": "短期目標の登録・管理",
-    "LIFE入力標準化": "LIFE入力の標準化",
-    "管理者LIFE入力": "LIFE入力（管理者）",
-    "LIFE不足チェック": "LIFE不足チェック",
-    "LIFE CSV出力": "LIFE CSV出力",
-    "LIFE登録一覧": "LIFE登録一覧",
-    "加算シミュレーション": "加算シミュレーション",
-    "家族向けレポート作成": "家族向けレポート",
-    "ひだまりレポートPDF": "ひだまりPDFレポート",
-    "データダウンロード": "データダウンロード",
-    "利用者マスタ管理": "利用者情報の管理",
-    "ログイン・職員ID管理": "ログイン・職員ID管理",
-    "セキュリティ・保守管理": "セキュリティ・保守",
-    "利用者ID移行チェック": "利用者ID移行チェック",
-    "利用者名ゆれ紐づけマスタ": "利用者名ゆれの整理",
-    "自分専用ダッシュボード設定": "ダッシュボード表示設定",
-    "メニューカテゴリ設定": "メニュー表示設定",
-    "システム設定": "システム設定",
-    "現場の気づき構造化・AI管理者支援": "気づき整理・AI管理者支援",
-    "AI管理者アシスタント": "AI管理者アシスタント",
-}
-
-
-def menu_category_label(category):
-    return MENU_CATEGORY_LABELS.get(category, category)
-
-
-def menu_display_label(menu_name):
-    return MENU_DISPLAY_LABELS.get(menu_name, menu_name)
-
 
 def get_standard_menu_groups(role="admin"):
     """標準メニューカテゴリ。自己設定の初期値として使う。"""
