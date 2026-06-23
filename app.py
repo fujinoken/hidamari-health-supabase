@@ -67,8 +67,8 @@ DEFAULT_QUERY_CACHE_TTL_SEC = 60
 DEFAULT_RECENT_DAYS = 7
 SAFE_READ_CACHE_TTL_SEC = 300
 
-def cache_safe_master_read(ttl=60):
-    """st.cache_data が使えない環境でもアプリを止めない安全デコレータ。"""
+def cache_safe_master_read(ttl=SAFE_READ_CACHE_TTL_SEC):
+    """Return a safe st.cache_data decorator, or the original function if caching is unavailable."""
     def _decorator(func):
         try:
             return st.cache_data(ttl=ttl, show_spinner=False)(func)
@@ -77,7 +77,7 @@ def cache_safe_master_read(ttl=60):
     return _decorator
 
 def clear_hidamari_read_cache(reason=""):
-    """保存・削除・マスタ更新後に、表示用キャッシュを安全にクリアする。"""
+    """Clear Streamlit read caches after saves, deletes, syncs, and restores."""
     try:
         st.cache_data.clear()
     except Exception:
@@ -618,17 +618,6 @@ def _df_to_supabase_payload(df: pd.DataFrame, table_name: str, unique_cols=None)
 DEFAULT_QUERY_CACHE_TTL_SEC = 60
 DEFAULT_RECENT_DAYS = 7
 
-# Ver4.8.1 起動順修正：キャッシュデコレータを使用前に定義
-def cache_safe_master_read(ttl=60):
-    """st.cache_data が使えない環境でもアプリを止めない安全デコレータ。"""
-    def _decorator(func):
-        try:
-            return st.cache_data(ttl=ttl, show_spinner=False)(func)
-        except Exception:
-            return func
-    return _decorator
-
-
 def _date_to_iso(value):
     if value in [None, ""]:
         return ""
@@ -942,23 +931,6 @@ def load_sqlite_table(table_name, columns, date_cols=None):
 # - 変化が少ない「読むだけのマスタ系」だけを短時間キャッシュする
 # - 保存・削除後はキャッシュを全消去して、古い表示を残しにくくする
 SAFE_READ_CACHE_TTL_SEC = 300
-
-def clear_hidamari_read_cache(reason=""):
-    """保存・削除・マスタ更新後に、表示用キャッシュを安全にクリアする。"""
-    try:
-        st.cache_data.clear()
-    except Exception:
-        pass
-
-def cache_safe_master_read(ttl=SAFE_READ_CACHE_TTL_SEC):
-    """st.cache_data が使えない環境でもアプリを止めない安全デコレータ。"""
-    def _decorator(func):
-        try:
-            return st.cache_data(ttl=ttl, show_spinner=False)(func)
-        except Exception:
-            return func
-    return _decorator
-
 
 def get_supabase_storage_status():
     cfg = _supabase_config()
@@ -10987,7 +10959,7 @@ def show_short_goal_master():
         st.warning("利用者マスタに表示中の利用者がありません。先に利用者登録を行ってください。")
         return
 
-    def _safe_date_value(value, fallback=None):
+    def _safe_goal_date_value(value, fallback=None):
         fallback = fallback or today_jst()
         try:
             dt = pd.to_datetime(value, errors="coerce")
@@ -11156,9 +11128,9 @@ def show_short_goal_master():
                     with col1:
                         edit_user = st.selectbox("利用者名", users, index=user_index, key=f"goal_edit_user_{edit_key}")
                     with col2:
-                        edit_start = st.date_input("開始日", value=_safe_date_value(row.get("開始日")), key=f"goal_edit_start_{edit_key}")
+                        edit_start = st.date_input("開始日", value=_safe_goal_date_value(row.get("開始日")), key=f"goal_edit_start_{edit_key}")
                     with col3:
-                        edit_end = st.date_input("終了予定日", value=_safe_date_value(row.get("終了予定日")), key=f"goal_edit_end_{edit_key}")
+                        edit_end = st.date_input("終了予定日", value=_safe_goal_date_value(row.get("終了予定日")), key=f"goal_edit_end_{edit_key}")
 
                     edit_goal = st.text_area("短期目標", value=clean_text(row.get("短期目標")), key=f"goal_edit_goal_{edit_key}")
                     edit_support = st.text_area("支援内容", value=clean_text(row.get("支援内容")), key=f"goal_edit_support_{edit_key}")
@@ -11269,7 +11241,7 @@ def show_daily_goal_check():
         st.warning("利用者マスタに表示中の利用者がありません。先に利用者登録を行ってください。")
         return
 
-    def _safe_date_value(value, fallback=None):
+    def _safe_daily_check_date_value(value, fallback=None):
         fallback = fallback or today_jst()
         try:
             dt = pd.to_datetime(value, errors="coerce")
@@ -11534,7 +11506,7 @@ def show_daily_goal_check():
                         with st.form(f"daily_check_update_form_{edit_key}"):
                             col1, col2 = st.columns(2)
                             with col1:
-                                update_date = st.date_input("日付", value=_safe_date_value(row.get("日付")), key=f"daily_check_edit_date_{edit_key}")
+                                update_date = st.date_input("日付", value=_safe_daily_check_date_value(row.get("日付")), key=f"daily_check_edit_date_{edit_key}")
                             with col2:
                                 update_goal_label = st.selectbox("短期目標", goal_labels, index=default_goal_index, key=f"daily_check_edit_goal_{edit_key}")
 
