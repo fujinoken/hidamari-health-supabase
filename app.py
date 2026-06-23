@@ -11463,42 +11463,56 @@ def show_daily_summary_input():
             & (goal_df["状態"].astype(str) == "有効")
         ].copy() if not goal_df.empty else pd.DataFrame(columns=SHORT_GOAL_MASTER_COLUMNS)
 
-        goal_label_map = {}
-        for _, row in user_goals.iterrows():
-            goal_text = clean_text(row.get("短期目標"))
-            goal_id = clean_text(row.get("目標ID"))
-            if goal_text:
-                label_text = goal_text[:50] + ("…" if len(goal_text) > 50 else "")
-                goal_label_map[f"{label_text}｜{goal_id[:8]}" if goal_id else label_text] = row
-
-        if not goal_label_map:
-            st.info("この利用者の有効な短期目標がありません。必要な場合は『短期目標マスタ』で登録してください。")
-            selected_goal = None
+        goal_entries = []
+        if user_goals.empty:
+            st.info("この利用者に登録されている短期目標はありません。")
         else:
-            selected_goal_label = st.selectbox("短期目標", [""] + list(goal_label_map.keys()), key="daily_summary_goal_select")
-            selected_goal = goal_label_map.get(selected_goal_label)
-            if selected_goal is not None:
-                st.markdown("#### 支援内容")
-                st.info(clean_text(selected_goal.get("支援内容"), "支援内容の記載はありません。"))
+            for i, (_, goal_row) in enumerate(user_goals.iterrows(), start=1):
+                goal_text = clean_text(goal_row.get("短期目標"))
+                goal_id = clean_text(goal_row.get("目標ID"))
+                support_text = clean_text(goal_row.get("支援内容"), "支援内容の記載はありません。")
+                key_seed = f"{i}_{goal_id}_{goal_text}"
+                key_suffix = hashlib.md5(key_seed.encode("utf-8")).hexdigest()[:10]
 
-        g1, g2, g3 = st.columns(3)
-        with g1:
-            result = st.selectbox("実施状況", ["", "実施", "一部実施", "未実施"], key="daily_summary_goal_result")
-        with g2:
-            mood = st.selectbox("本人の様子", ["", "穏やか", "普段通り", "不安あり", "拒否あり", "疲労あり", "痛み訴えあり", "その他"], key="daily_summary_goal_mood")
-        with g3:
-            reflect = st.selectbox("モニタリング反映", ["", "反映する", "反映しない"], key="daily_summary_goal_reflect")
-        reason = st.text_input("未実施理由・一部実施の理由", key="daily_summary_goal_reason")
-        staff_memo = st.text_area("職員メモ", key="daily_summary_goal_staff_memo")
+                st.markdown(f"#### 短期目標 {i}")
+                st.write(goal_text or "短期目標の内容が未入力です。")
+                st.caption("支援内容")
+                st.info(support_text)
 
-    has_goal_input = any([
-        selected_goal is not None,
-        clean_text(result),
-        clean_text(mood),
-        clean_text(reflect),
-        clean_text(reason),
-        clean_text(staff_memo),
-    ])
+                use_goal = st.checkbox("この短期目標を記録する", key=f"daily_summary_goal_use_{key_suffix}")
+                g1, g2, g3 = st.columns(3)
+                with g1:
+                    result = st.selectbox("実施状況", ["", "実施", "一部実施", "未実施"], key=f"daily_summary_goal_result_{key_suffix}")
+                with g2:
+                    mood = st.selectbox("本人の様子", ["", "穏やか", "普段通り", "不安あり", "拒否あり", "疲労あり", "痛み訴えあり", "その他"], key=f"daily_summary_goal_mood_{key_suffix}")
+                with g3:
+                    reflect = st.selectbox("モニタリング反映", ["", "反映する", "反映しない"], key=f"daily_summary_goal_reflect_{key_suffix}")
+                reason = st.text_input("未実施理由・一部実施の理由", key=f"daily_summary_goal_reason_{key_suffix}")
+                staff_memo = st.text_area("職員メモ", key=f"daily_summary_goal_staff_memo_{key_suffix}")
+                goal_staff = st.text_input("入力職員", value=input_staff, key=f"daily_summary_goal_staff_{key_suffix}")
+
+                has_goal_detail = any([
+                    clean_text(result),
+                    clean_text(mood),
+                    clean_text(reflect),
+                    clean_text(reason),
+                    clean_text(staff_memo),
+                ])
+                if use_goal or has_goal_detail:
+                    goal_entries.append({
+                        "row": goal_row,
+                        "result": result,
+                        "mood": mood,
+                        "reflect": reflect,
+                        "reason": reason,
+                        "staff_memo": staff_memo,
+                        "staff": goal_staff,
+                    })
+
+                if i < len(user_goals):
+                    st.divider()
+
+    has_goal_input = bool(goal_entries)
 
     if st.button("まとめて保存する", type="primary", use_container_width=True, key="daily_summary_save"):
         results = []
@@ -11561,12 +11575,16 @@ def show_daily_summary_input():
             results.append(("排泄チェック", not failed_slots, "、".join([x for x in failed_slots if x])))
 
         if has_goal_input:
-            if selected_goal is None or not clean_text(result):
-                results.append(("短期目標チェック", False, "短期目標と実施状況を選択してください"))
-            else:
-                check_df = load_short_goal_checks()
+            goal_records = []
+            skipped_goal_count = 0
+            for entry in goal_entries:
+                selected_goal = entry["row"]
+                result = clean_text(entry.get("result"))
+                if not result:
+                    skipped_goal_count += 1
+                    continue
                 uid = get_user_id_by_name(user_name) or ensure_user_id_value(clean_text(selected_goal.get("user_id")), user_name)
-                goal_record = {
+                goal_records.append({
                     "記録ID": str(uuid.uuid4()),
                     "日付": record_date.strftime("%Y-%m-%d"),
                     "利用者名": user_name,
@@ -11574,21 +11592,41 @@ def show_daily_summary_input():
                     "目標ID": clean_text(selected_goal.get("目標ID")),
                     "短期目標": clean_text(selected_goal.get("短期目標")),
                     "実施状況": result,
-                    "本人の様子": clean_text(mood, "普段通り"),
-                    "未実施理由": clean_text(reason),
-                    "職員メモ": clean_text(staff_memo),
-                    "入力職員": clean_text(input_staff),
-                    "モニタリング反映": clean_text(reflect, "反映する"),
+                    "本人の様子": clean_text(entry.get("mood"), "普段通り"),
+                    "未実施理由": clean_text(entry.get("reason")),
+                    "職員メモ": clean_text(entry.get("staff_memo")),
+                    "入力職員": clean_text(entry.get("staff"), input_staff),
+                    "モニタリング反映": clean_text(entry.get("reflect"), "反映する"),
                     "登録日時": now_text,
-                }
-                check_df2 = pd.concat([check_df, pd.DataFrame([goal_record], columns=SHORT_GOAL_CHECK_COLUMNS)], ignore_index=True)
+                })
+
+            if not goal_records:
+                detail = "保存対象の短期目標はありますが、実施状況が未選択です。"
+                results.append(("短期目標チェック", False, detail))
+            else:
+                check_df = load_short_goal_checks()
+                check_df2 = pd.concat(
+                    [check_df, pd.DataFrame(goal_records, columns=SHORT_GOAL_CHECK_COLUMNS)],
+                    ignore_index=True,
+                )
                 saved = save_short_goal_checks(check_df2)
+                success_count = len(goal_records) if saved else 0
+                failed_count = len(goal_records) - success_count + skipped_goal_count
                 if saved:
-                    try:
-                        add_audit_log("短期目標実施チェック登録", SQLITE_TABLE_SHORT_GOAL_CHECKS, goal_record["記録ID"], f"{user_name} / {result} / {clean_text(selected_goal.get('短期目標'))[:80]}")
-                    except Exception:
-                        pass
-                results.append(("短期目標チェック", bool(saved), ""))
+                    for goal_record in goal_records:
+                        try:
+                            add_audit_log(
+                                "短期目標実施チェック登録",
+                                SQLITE_TABLE_SHORT_GOAL_CHECKS,
+                                goal_record["記録ID"],
+                                f"{user_name} / {goal_record['実施状況']} / {clean_text(goal_record.get('短期目標'))[:80]}",
+                            )
+                        except Exception:
+                            pass
+                detail = f"{len(goal_records) + skipped_goal_count}件中{success_count}件 保存成功"
+                if failed_count:
+                    detail += f"、{failed_count}件保存失敗"
+                results.append(("短期目標チェック", bool(saved) and failed_count == 0, detail))
 
         if not results:
             st.info("保存する内容がありません")
@@ -11597,7 +11635,8 @@ def show_daily_summary_input():
         failed = []
         for label, ok, detail in results:
             if ok:
-                st.success(f"{label} 保存成功")
+                suffix = f"：{detail}" if detail else ""
+                st.success(f"{label} 保存成功{suffix}")
             else:
                 failed.append(label)
                 suffix = f"：{detail}" if detail else ""
