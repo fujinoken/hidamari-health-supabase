@@ -11843,7 +11843,7 @@ def show_daily_summary_input():
             total_success += success_count
             total_failed += failed_count
 
-        show_section_errors = total_success == 0 and total_failed > 0
+        show_as_error = total_success == 0 and total_failed > 0 and not skipped_messages
         for result_item in results:
             label, status, detail, target_count, success_count, failed_count = result_item
             if status == "saved":
@@ -11854,7 +11854,7 @@ def show_daily_summary_input():
                 st.warning(f"{label} 一部保存できませんでした{suffix}")
             else:
                 suffix = f"：{detail}" if detail else ""
-                if show_section_errors:
+                if show_as_error:
                     st.error(f"{label} 保存失敗{suffix}")
                 else:
                     st.warning(f"{label} 保存できませんでした{suffix}")
@@ -11870,8 +11870,10 @@ def show_daily_summary_input():
                 st.success("まとめて保存しました。")
         elif total_success > 0 and total_failed > 0:
             st.warning("一部保存しました。保存できなかった項目があります。内容を確認してください。")
-        elif total_success == 0 and total_failed > 0:
+        elif show_as_error:
             st.error("保存できませんでした。通信状態を確認し、続く場合は管理者へ連絡してください。")
+        elif total_failed > 0:
+            st.warning("保存できなかった項目があります。内容を確認してください。")
 
 
 def show_goal_history():
