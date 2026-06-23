@@ -103,4 +103,4 @@ python tools/minimal_check.py
 - Supabase設定が有効な場合でも、SQLiteバックアップは復旧補助として残します。
 - AI機能はOpenAI APIキーが未設定でも、ルールベース機能のみで利用できます。
 - 写真や添付ファイルを含むバックアップはサイズが大きくなることがあります。
-
+- 現場で使い始める前に、`docs/pre_operation_checklist.md` の実運用前チェックリストを確認してください。

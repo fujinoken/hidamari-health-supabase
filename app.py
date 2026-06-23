@@ -5142,14 +5142,16 @@ def save_health_data(df):
         df = df.drop_duplicates(subset=["_key"], keep="last")
         df = df.drop(columns=["_key"])
 
-    save_sqlite_table(
+    saved = save_sqlite_table(
         df,
         SQLITE_TABLE_HEALTH,
         HEALTH_COLUMNS,
         date_cols=["記録日"],
         unique_cols=["記録日", "利用者名"],
     )
-    clear_hidamari_read_cache("健康チェック保存")
+    if saved:
+        clear_hidamari_read_cache("健康チェック保存")
+    return bool(saved)
 
 
 def find_health_index(df, record_date, user_name):
@@ -5189,7 +5191,8 @@ def upsert_health_record(record):
             df.at[idx, col] = record.get(col, "")
         action = "更新"
 
-    save_health_data(df)
+    if not save_health_data(df):
+        return ""
     add_audit_log(action, SQLITE_TABLE_HEALTH, make_date_user_key(record["記録日"], record["利用者名"]), "健康チェックを保存しました")
 
     return action
@@ -5302,14 +5305,16 @@ def save_excretion_data(df):
         df = df.drop(columns=["_key"])
 
     df = df[EXCRETION_COLUMNS]
-    save_sqlite_table(
+    saved = save_sqlite_table(
         df,
         SQLITE_TABLE_EXCRETION,
         EXCRETION_COLUMNS,
         date_cols=["記録日"],
         unique_cols=["記録日", "利用者名", "時間帯"],
     )
-    clear_hidamari_read_cache("排泄チェック保存")
+    if saved:
+        clear_hidamari_read_cache("排泄チェック保存")
+    return bool(saved)
 
 
 def find_excretion_index(df, record_date, user_name, slot):
@@ -5371,7 +5376,8 @@ def upsert_excretion_record(record):
             df.at[idx, col] = record.get(col, "")
         action = "更新"
 
-    save_excretion_data(df)
+    if not save_excretion_data(df):
+        return ""
     add_audit_log(action, SQLITE_TABLE_EXCRETION, make_excretion_key(record["記録日"], record["利用者名"], record["時間帯"]), "排泄チェックを保存しました")
 
     return action
@@ -6460,8 +6466,16 @@ def show_photo_import_menu():
                     "内容": "／".join(errors),
                 })
                 continue
-            upsert_health_record(record)
-            saved += 1
+            action = upsert_health_record(record)
+            if action:
+                saved += 1
+            else:
+                warning_rows.append({
+                    "利用者名": record["利用者名"],
+                    "記録日": record["記録日"],
+                    "内容": "健康チェックへ保存できませんでした。通信状態や管理者画面のSupabase/SQLite診断を確認してください。",
+                })
+                continue
             if warnings:
                 warning_rows.append({
                     "利用者名": record["利用者名"],
@@ -6469,7 +6483,10 @@ def show_photo_import_menu():
                     "内容": "／".join(warnings),
                 })
 
-        st.success(f"{saved}件を健康チェックへ保存しました。")
+        if saved > 0:
+            st.success(f"{saved}件を健康チェックへ保存しました。")
+        else:
+            st.error("健康チェックへ保存できませんでした。通信状態を確認し、続く場合は管理者へ連絡してください。")
         if warning_rows:
             st.warning("確認が必要な行があります。")
             st.dataframe(pd.DataFrame(warning_rows), use_container_width=True, hide_index=True)
@@ -15174,8 +15191,11 @@ elif menu == "健康チェック入力":
             st.info(diff_text)
 
             action = upsert_health_record(record)
-            st.success(f"健康チェックを{action}しました。申し送りが必要な内容は共有してください。")
-            st.rerun()
+            if action:
+                st.success(f"健康チェックを{action}しました。申し送りが必要な内容は共有してください。")
+                st.rerun()
+            else:
+                st.error("健康チェックを保存できませんでした。通信状態を確認し、続く場合は管理者へ連絡してください。")
 
 
 # =========================
@@ -15363,12 +15383,19 @@ elif menu == "排泄チェック入力":
                 for msg in all_warnings:
                     st.warning(msg)
 
+            failed_slots = []
             for record in records_to_save:
-                upsert_excretion_record(record)
+                action = upsert_excretion_record(record)
+                if not action:
+                    failed_slots.append(record.get("時間帯", ""))
 
             st.info(build_excretion_diff_text(load_excretion_data(), record_date, user_name))
-            st.success("排泄チェックを保存しました。時間帯ごとの記録を更新しました。")
-            st.rerun()
+            if failed_slots:
+                st.error("排泄チェックを一部保存できませんでした。保存できなかった時間帯：" + "、".join([x for x in failed_slots if x]))
+                st.info("通信状態を確認し、続く場合は管理者へ連絡してください。")
+            else:
+                st.success("排泄チェックを保存しました。時間帯ごとの記録を更新しました。")
+                st.rerun()
 
     st.subheader("この日の排泄記録")
     day_data = get_day_excretion_data(load_excretion_data(), record_date, user_name)
@@ -15541,12 +15568,15 @@ elif menu == "過去データ管理":
                         "入力者": staff,
                     }
                     action = upsert_health_record(record)
-                    try:
-                        add_audit_log("健康チェック更新", SQLITE_TABLE_HEALTH, f"{key_date}_{key_user}", "過去データ管理から更新")
-                    except Exception:
-                        pass
-                    st.success(f"{action}しました。")
-                    st.rerun()
+                    if action:
+                        try:
+                            add_audit_log("健康チェック更新", SQLITE_TABLE_HEALTH, f"{key_date}_{key_user}", "過去データ管理から更新")
+                        except Exception:
+                            pass
+                        st.success(f"{action}しました。")
+                        st.rerun()
+                    else:
+                        st.error("健康チェックを保存できませんでした。Supabase/SQLite診断を確認してください。")
 
                 st.warning("削除すると元に戻せません。")
                 delete_check = st.checkbox("この健康チェックデータを削除する")
@@ -16017,8 +16047,11 @@ elif menu == "排泄詳細管理":
             "登録日時": format_now_jst("%Y-%m-%d %H:%M:%S"),
         }
         action = upsert_excretion_record(record)
-        st.success(f"排泄データを{action}しました。")
-        st.rerun()
+        if action:
+            st.success(f"排泄データを{action}しました。")
+            st.rerun()
+        else:
+            st.error("排泄データを保存できませんでした。Supabase/SQLite診断を確認してください。")
 
     if current is not None:
         delete_check = st.checkbox("この排泄データを削除する")
