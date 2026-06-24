@@ -11365,16 +11365,37 @@ def show_daily_summary_input():
     user_id = get_user_id_by_name(user_name) or ensure_user_id_value("", user_name)
     now_text = format_now_jst("%Y-%m-%d %H:%M:%S")
     context_key = hashlib.md5(f"{record_date}_{user_name}".encode("utf-8")).hexdigest()[:10]
+    daily_summary_context = f"{record_date.isoformat()}::{user_name}"
 
-    health_df = load_health_data(start_date=record_date, end_date=record_date)
+    force_reload_summary = bool(st.session_state.pop("daily_summary_force_reload", False))
+    loaded_context = st.session_state.get("daily_summary_loaded_context")
+    if force_reload_summary or loaded_context != daily_summary_context:
+        health_df = load_health_data(start_date=record_date, end_date=record_date)
+        ex_df = load_excretion_data(start_date=record_date, end_date=record_date)
+        goal_check_df = load_short_goal_checks(start_date=record_date, end_date=record_date)
+        goal_check_df = normalize_df_columns(goal_check_df, SHORT_GOAL_CHECK_COLUMNS)
+        st.session_state["daily_summary_loaded_context"] = daily_summary_context
+        st.session_state["daily_summary_health_df"] = health_df
+        st.session_state["daily_summary_ex_df"] = ex_df
+        st.session_state["daily_summary_goal_check_df"] = goal_check_df
+    else:
+        health_df = st.session_state.get("daily_summary_health_df")
+        ex_df = st.session_state.get("daily_summary_ex_df")
+        goal_check_df = st.session_state.get("daily_summary_goal_check_df")
+        if health_df is None or ex_df is None or goal_check_df is None:
+            health_df = load_health_data(start_date=record_date, end_date=record_date)
+            ex_df = load_excretion_data(start_date=record_date, end_date=record_date)
+            goal_check_df = load_short_goal_checks(start_date=record_date, end_date=record_date)
+            goal_check_df = normalize_df_columns(goal_check_df, SHORT_GOAL_CHECK_COLUMNS)
+            st.session_state["daily_summary_loaded_context"] = daily_summary_context
+            st.session_state["daily_summary_health_df"] = health_df
+            st.session_state["daily_summary_ex_df"] = ex_df
+            st.session_state["daily_summary_goal_check_df"] = goal_check_df
+
     health_idx = find_health_index(health_df, record_date, user_name)
     existing_health = health_df.loc[health_idx] if health_idx is not None else None
 
-    ex_df = load_excretion_data(start_date=record_date, end_date=record_date)
     day_excretion = get_day_excretion_data(ex_df, record_date, user_name)
-
-    goal_check_df = load_short_goal_checks(start_date=record_date, end_date=record_date)
-    goal_check_df = normalize_df_columns(goal_check_df, SHORT_GOAL_CHECK_COLUMNS)
 
     def summary_text(row, col, default=""):
         if row is None:
@@ -11967,6 +11988,8 @@ def show_daily_summary_input():
             st.error("保存できませんでした。通信状態を確認し、続く場合は管理者へ連絡してください。")
         elif total_failed > 0:
             st.warning("保存できなかった項目があります。内容を確認してください。")
+        if total_save_targets > 0:
+            st.session_state["daily_summary_force_reload"] = True
 
 
 def show_goal_history():
