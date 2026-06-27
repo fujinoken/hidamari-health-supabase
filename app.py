@@ -9941,6 +9941,15 @@ def _short_goal_text_join(values, limit=6):
 SHORT_GOAL_AUTO_MISSING_MEMO = "記録なし。未入力日のため自動的に未実施として集計。"
 
 
+def _short_goal_truncate_text(text, max_chars=110) -> str:
+    """PDF欄で長文が暴れないよう、表示用テキストだけを短く整える。"""
+    value = clean_text(text) if "clean_text" in globals() else str(text or "").strip()
+    value = re.sub(r"\s+", " ", value).strip()
+    if not value or len(value) <= max_chars:
+        return value
+    return value[:max_chars].rstrip() + "…"
+
+
 def _is_short_goal_auto_missing_row(row) -> bool:
     """短期目標モニタリング用に自動補完した未入力日かどうかを判定する。"""
     record_id = clean_text(row.get("記録ID")) if "clean_text" in globals() else str(row.get("記録ID", "") or "").strip()
@@ -9990,7 +9999,7 @@ def _build_short_goal_staff_memo_summary(view_df: pd.DataFrame, missing_count=0,
         for _, row in shown.iterrows():
             day = clean_text(row.get("日付")) if "clean_text" in globals() else str(row.get("日付", "") or "").strip()
             status = clean_text(row.get("実施状況")) if "clean_text" in globals() else str(row.get("実施状況", "") or "").strip()
-            memo = clean_text(row.get("職員メモ")) if "clean_text" in globals() else str(row.get("職員メモ", "") or "").strip()
+            memo = _short_goal_truncate_text(row.get("職員メモ"), max_chars=110)
             label = f"{day}（{status}）" if status else day
             lines.append(f"・{label}：{memo}")
         remaining = len(memo_df) - len(shown)
@@ -10004,6 +10013,56 @@ def _build_short_goal_staff_memo_summary(view_df: pd.DataFrame, missing_count=0,
             f"・記録未入力日が{missing_count}日あります。入力漏れか、実施できなかった理由の確認が必要です。",
         ])
     return "\n".join(lines)
+
+
+def _short_goal_missing_dates(view_df: pd.DataFrame) -> list:
+    """自動補完された未入力日の一覧を日付順で返す。"""
+    if view_df is None or view_df.empty:
+        return []
+    work = view_df.copy()
+    for col in ["日付", "記録ID", "職員メモ", "入力職員", "未実施理由"]:
+        if col not in work.columns:
+            work[col] = ""
+    missing = work[work.apply(_is_short_goal_auto_missing_row, axis=1)].copy()
+    if missing.empty:
+        return []
+    missing["_missing_date"] = pd.to_datetime(missing["日付"], errors="coerce")
+    missing = missing.sort_values(["_missing_date", "日付"], ascending=True)
+    dates = []
+    for value in missing["日付"].tolist():
+        day = clean_text(value) if "clean_text" in globals() else str(value or "").strip()
+        if day and day not in dates:
+            dates.append(day)
+    return dates
+
+
+def _build_short_goal_pdf_confirmation_notes(view_df: pd.DataFrame, missing_count=0, max_dates=5) -> str:
+    """PDFの今後の支援方針欄に入れる確認事項を3〜5行程度に整理する。"""
+    lines = []
+    missing_dates = _short_goal_missing_dates(view_df)
+    if not missing_count:
+        missing_count = len(missing_dates)
+
+    if missing_count:
+        lines.append(f"・記録未入力日が{missing_count}日あります。入力漏れか、実施できなかった理由の確認が必要です。")
+        shown_dates = missing_dates[:max_dates]
+        if shown_dates:
+            label = "主な未入力日" if missing_count > 3 else "未入力日"
+            suffix = " ほか" if len(missing_dates) > len(shown_dates) else ""
+            lines.append(f"・{label}：{'、'.join(shown_dates)}{suffix}")
+
+    has_partial_or_not_done = False
+    if view_df is not None and not view_df.empty and "実施状況" in view_df.columns:
+        statuses = view_df["実施状況"].fillna("").astype(str).tolist()
+        has_partial_or_not_done = any(s in ["未実施", "一部実施"] for s in statuses)
+
+    if has_partial_or_not_done:
+        lines.append("・未実施・一部実施の日は、本人の体調、拒否、時間不足、記録漏れの有無を確認してください。")
+        lines.append("・次回は、未実施理由と職員メモの入力状況を確認してください。")
+
+    if not lines:
+        lines.append("・現在の支援内容を継続し、本人の様子と職員メモを定期的に確認してください。")
+    return "\n".join(lines[:5])
 
 
 def _build_short_goal_rule_summary(view_df: pd.DataFrame) -> dict:
@@ -10318,12 +10377,11 @@ def make_short_goal_monitoring_pdf_bytes(
         return Paragraph(text, style)
 
     detail = work.copy() if work is not None else pd.DataFrame()
-    for col in ["本人の様子", "未実施理由", "職員メモ", "入力職員", "実施状況"]:
+    for col in ["本人の様子", "未実施理由", "職員メモ", "入力職員", "実施状況", "日付", "記録ID"]:
         if col not in detail.columns:
             detail[col] = ""
 
     person_notes = short_goal_join_for_pdf(detail.get("本人の様子", []), limit=4)
-    reason_summary = short_goal_pdf_text(summary.get("理由要約") if isinstance(summary, dict) else "", "記録なし")
     memo_summary = short_goal_pdf_text(summary.get("職員メモ要約") if isinstance(summary, dict) else "", "記録なし")
     general_summary = short_goal_pdf_text(summary.get("総括コメント") if isinstance(summary, dict) else "", "記録なし")
 
@@ -10344,8 +10402,9 @@ def make_short_goal_monitoring_pdf_bytes(
         f"現在の支援内容：{short_goal_pdf_text(selected_support_text, '記載なし')}\n"
         f"今後は、本人の様子と未実施・一部実施の理由を確認しながら、無理のない範囲で支援を継続する。"
     )
-    if reason_summary and reason_summary != "記録なし":
-        future_policy += f"\n確認事項：{reason_summary}"
+    confirmation_notes = _build_short_goal_pdf_confirmation_notes(detail)
+    if confirmation_notes:
+        future_policy += f"\n確認事項：\n{confirmation_notes}"
 
     staff_text = short_goal_pdf_text(staff_name, current_login_user() if "current_login_user" in globals() else "管理者")
     created_text = format_now_jst("%Y-%m-%d %H:%M") if "format_now_jst" in globals() else datetime.now().strftime("%Y-%m-%d %H:%M")
