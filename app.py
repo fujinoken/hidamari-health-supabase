@@ -9938,6 +9938,74 @@ def _short_goal_text_join(values, limit=6):
     return "\n".join([f"・{x}" for x in items[:limit]]) if items else "記録なし"
 
 
+SHORT_GOAL_AUTO_MISSING_MEMO = "記録なし。未入力日のため自動的に未実施として集計。"
+
+
+def _is_short_goal_auto_missing_row(row) -> bool:
+    """短期目標モニタリング用に自動補完した未入力日かどうかを判定する。"""
+    record_id = clean_text(row.get("記録ID")) if "clean_text" in globals() else str(row.get("記録ID", "") or "").strip()
+    memo = clean_text(row.get("職員メモ")) if "clean_text" in globals() else str(row.get("職員メモ", "") or "").strip()
+    staff = clean_text(row.get("入力職員")) if "clean_text" in globals() else str(row.get("入力職員", "") or "").strip()
+    reason = clean_text(row.get("未実施理由")) if "clean_text" in globals() else str(row.get("未実施理由", "") or "").strip()
+    return (
+        record_id.startswith("AUTO-NOTDONE-")
+        or staff == "自動判定"
+        or memo == SHORT_GOAL_AUTO_MISSING_MEMO
+        or reason == "未入力のため未実施扱い"
+    )
+
+
+def _short_goal_staff_memo_records(view_df: pd.DataFrame) -> pd.DataFrame:
+    """職員が実際に入力したメモだけを日付順で返す。"""
+    if view_df is None or view_df.empty:
+        return pd.DataFrame()
+    work = view_df.copy()
+    for col in ["日付", "実施状況", "職員メモ", "入力職員", "記録ID", "未実施理由"]:
+        if col not in work.columns:
+            work[col] = ""
+    work["_memo_text"] = work["職員メモ"].apply(lambda v: clean_text(v) if "clean_text" in globals() else str(v or "").strip())
+    work = work[work["_memo_text"].astype(str).str.strip() != ""].copy()
+    if work.empty:
+        return work
+    work = work[~work.apply(_is_short_goal_auto_missing_row, axis=1)].copy()
+    if work.empty:
+        return work
+    work["_memo_date"] = pd.to_datetime(work["日付"], errors="coerce")
+    return work.sort_values(["_memo_date", "日付"], ascending=True).copy()
+
+
+def _build_short_goal_staff_memo_summary(view_df: pd.DataFrame, missing_count=0, limit=10) -> str:
+    """PDFの職員メモ要約欄用に、実入力メモを優先し未入力日は件数でまとめる。"""
+    if not missing_count and view_df is not None and not view_df.empty:
+        try:
+            missing_count = int(view_df.apply(_is_short_goal_auto_missing_row, axis=1).sum())
+        except Exception:
+            missing_count = 0
+    memo_df = _short_goal_staff_memo_records(view_df)
+    lines = ["【職員メモ】"]
+    if memo_df is None or memo_df.empty:
+        lines.append("・職員メモは記録されていません。")
+    else:
+        shown = memo_df.head(limit)
+        for _, row in shown.iterrows():
+            day = clean_text(row.get("日付")) if "clean_text" in globals() else str(row.get("日付", "") or "").strip()
+            status = clean_text(row.get("実施状況")) if "clean_text" in globals() else str(row.get("実施状況", "") or "").strip()
+            memo = clean_text(row.get("職員メモ")) if "clean_text" in globals() else str(row.get("職員メモ", "") or "").strip()
+            label = f"{day}（{status}）" if status else day
+            lines.append(f"・{label}：{memo}")
+        remaining = len(memo_df) - len(shown)
+        if remaining > 0:
+            lines.append(f"・ほか{remaining}件")
+
+    if missing_count:
+        lines.extend([
+            "",
+            "【未入力・確認事項】",
+            f"・記録未入力日が{missing_count}日あります。入力漏れか、実施できなかった理由の確認が必要です。",
+        ])
+    return "\n".join(lines)
+
+
 def _build_short_goal_rule_summary(view_df: pd.DataFrame) -> dict:
     """AI未設定時でも止まらない、記録ベースの要約。"""
     if view_df is None or view_df.empty:
@@ -9954,14 +10022,6 @@ def _build_short_goal_rule_summary(view_df: pd.DataFrame) -> dict:
         if status in ["未実施", "一部実施"] and reason:
             day = clean_text(row.get("日付"))
             reasons.append(f"{day}（{status}）：{reason}")
-
-    memos = []
-    for _, row in view_df.iterrows():
-        memo = clean_text(row.get("職員メモ"))
-        if memo:
-            day = clean_text(row.get("日付"))
-            status = clean_text(row.get("実施状況"))
-            memos.append(f"{day}（{status}）：{memo}")
 
     total = len(view_df)
     done = int((view_df.get("実施状況", pd.Series(dtype=str)).astype(str) == "実施").sum()) if "実施状況" in view_df.columns else 0
@@ -9980,7 +10040,7 @@ def _build_short_goal_rule_summary(view_df: pd.DataFrame) -> dict:
 
     return {
         "理由要約": _short_goal_text_join(reasons, limit=8) if reasons else "未実施・一部実施の理由は記録されていません。",
-        "職員メモ要約": _short_goal_text_join(memos, limit=8) if memos else "職員メモは記録されていません。",
+        "職員メモ要約": _build_short_goal_staff_memo_summary(view_df),
         "総括コメント": general,
     }
 
@@ -9997,16 +10057,23 @@ def generate_ai_short_goal_summary(user_name, goal_text, start_date, end_date, v
         return fallback, "openaiライブラリが未インストールのため、通常要約を表示しています。"
 
     try:
-        source_cols = ["日付", "利用者名", "短期目標", "実施状況", "本人の様子", "未実施理由", "職員メモ", "入力職員"]
+        source_cols = ["日付", "利用者名", "短期目標", "実施状況", "本人の様子", "未実施理由", "入力職員"]
         work = view_df.copy()
         for col in source_cols:
             if col not in work.columns:
                 work[col] = ""
         records = work[source_cols].fillna("").astype(str).to_dict(orient="records")
+        memo_source_cols = ["日付", "実施状況", "職員メモ", "入力職員"]
+        memo_work = _short_goal_staff_memo_records(view_df)
+        for col in memo_source_cols:
+            if col not in memo_work.columns:
+                memo_work[col] = ""
+        memo_records = memo_work[memo_source_cols].fillna("").astype(str).to_dict(orient="records")
         prompt = f"""
 あなたは介護施設の短期目標モニタリング記録の文章整理係です。
 医療判断・診断・治療効果の断定は禁止です。
 記録に基づき、未実施理由・一部実施理由と職員メモを、管理者が確認しやすい短い文章に整理してください。
+職員メモ要約は【職員メモ記録】だけを使い、「記録なし」「未入力日のため自動的に未実施として集計」は含めないでください。
 推測で事実を追加しないでください。
 出力はJSONのみです。
 
@@ -10017,6 +10084,9 @@ def generate_ai_short_goal_summary(user_name, goal_text, start_date, end_date, v
 
 【記録】
 {records}
+
+【職員メモ記録】
+{memo_records}
 
 JSON形式：
 {{
@@ -10506,6 +10576,7 @@ def show_short_goal_selected_summary(goals: pd.DataFrame, checks: pd.DataFrame):
     if st.button("🤖 AI要約を作成・保存", use_container_width=True, key="short_goal_summary_ai_create_save_button"):
         with st.spinner("AI要約を作成しています..."):
             ai_summary, ai_note = generate_ai_short_goal_summary(selected_user, selected_goal_text, start_date, end_date, work)
+            ai_summary["職員メモ要約"] = _build_short_goal_staff_memo_summary(work, missing_count=auto_not_done)
             saved = save_short_goal_ai_summary(signature, ai_summary, ai_note)
         if saved:
             st.success("AI要約を作成して保存しました。")
@@ -10513,6 +10584,9 @@ def show_short_goal_selected_summary(goals: pd.DataFrame, checks: pd.DataFrame):
         else:
             summary = ai_summary
             note = "AI要約は作成しましたが、保存に失敗しました。画面上には一時表示しています。"
+
+    if isinstance(summary, dict):
+        summary["職員メモ要約"] = _build_short_goal_staff_memo_summary(work, missing_count=auto_not_done)
 
     if note:
         st.caption(note)
