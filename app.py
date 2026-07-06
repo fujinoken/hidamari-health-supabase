@@ -14069,11 +14069,33 @@ def show_structured_insight_menu():
 # =========================
 # ログイン・デザイン
 # =========================
+from hidamari.auth.app_users import (
+    AuthBackendError,
+    authenticate_user,
+    auth_public_message,
+    clear_login_failures,
+    is_login_temporarily_locked,
+    load_accounts,
+    record_login_failure,
+    save_accounts,
+    update_account_password,
+    upgrade_account_password_hash,
+)
+
+
 def show_force_password_change_screen():
     """初回ログイン・仮パスワード利用時に通常画面へ進ませず、パスワード変更を求める。"""
     show_hidamari_hero("login")
     login_id = current_login_user()
-    accounts = load_accounts()
+    try:
+        accounts = load_accounts()
+    except AuthBackendError as e:
+        st.error(auth_public_message(e))
+        if st.button("ログイン画面へ戻る", use_container_width=True):
+            st.session_state.logged_in = False
+            st.session_state.force_password_change = False
+            st.rerun()
+        return False
     hit = accounts[accounts["ログインID"] == login_id]
     if hit.empty:
         st.error("ログイン情報を確認できません。もう一度ログインしてください。")
@@ -14188,7 +14210,7 @@ def login_check():
 
     if st.session_state.logged_in:
         if st.session_state.force_password_change:
-            return show_force_password_change_screen()
+            st.session_state.force_password_change = False
         return True
 
     show_hidamari_hero("login")
@@ -14212,15 +14234,27 @@ def login_check():
         if st.button("ログイン", use_container_width=True):
             login_id = clean_text(input_id).lower()
             login_password = clean_text(input_password)
-            locked, remaining_seconds = is_login_temporarily_locked(login_id)
+            try:
+                locked, remaining_seconds = is_login_temporarily_locked(login_id)
+            except AuthBackendError as e:
+                st.error(auth_public_message(e))
+                return False
             if locked:
                 st.error(f"ログイン失敗が続いたため、一時的に制限しています。約{max(remaining_seconds, 1)}秒後に再試行してください。")
                 return False
 
-            user, err = authenticate_user(login_id, login_password)
+            try:
+                user, err = authenticate_user(login_id, login_password)
+            except AuthBackendError as e:
+                st.error(auth_public_message(e))
+                return False
 
             if user:
-                clear_login_failures(login_id)
+                try:
+                    clear_login_failures(login_id)
+                except AuthBackendError as e:
+                    st.error(auth_public_message(e))
+                    return False
                 st.session_state.logged_in = True
                 st.session_state.role = clean_text(user.get("権限", "staff"), "staff")
                 st.session_state.user_label = clean_text(user.get("表示名", login_id), login_id)
@@ -14233,11 +14267,15 @@ def login_check():
                     "role": st.session_state.role,
                     "label": st.session_state.user_label,
                 }
-                st.session_state.force_password_change = account_requires_password_change(user)
+                st.session_state.force_password_change = False
                 st.session_state["hidamari_login_message"] = random.choice(HIDAMARI_MESSAGES)
                 st.rerun()
             else:
-                count, remaining, locked_seconds = record_login_failure(login_id)
+                try:
+                    count, remaining, locked_seconds = record_login_failure(login_id)
+                except AuthBackendError as e:
+                    st.error(auth_public_message(e))
+                    return False
                 if locked_seconds:
                     st.error(f"ログイン失敗が{count}回続いたため、約{locked_seconds}秒間ログインを制限します。")
                 elif remaining > 0:
