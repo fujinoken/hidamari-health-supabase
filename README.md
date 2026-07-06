@@ -169,3 +169,44 @@ HIDAMARI_INITIAL_PASSWORD = "初回配布用の一時パスワード"
 - ロック解除後に正しいパスワードでログインでき、成功時に `failed_login_count = 0`、`locked_until = null` へ戻る。
 
 健康記録・申し送り・利用者データの既存テーブルは変更していません。
+# 認証DB設定とエラー表示
+
+ログイン認証は `app_users` テーブルを使います。認証用DB接続情報が未設定、接続不可、または `app_users` テーブル未作成の場合、ログイン画面には管理者向けの短い案内だけを表示し、利用者画面には traceback や内部ファイルパスを表示しません。
+
+## Supabase SQL Editorでの手順
+
+1. Supabase Dashboard を開きます。
+2. 対象プロジェクトの SQL Editor を開きます。
+3. `sql/app_users_auth.sql` の内容を貼り付けて実行します。
+4. `public.app_users` が作成されたことを Table Editor で確認します。
+
+## Streamlit Cloud Secretsの設定
+
+Streamlit Cloud のアプリ設定から `Secrets` を開き、PostgreSQL接続文字列を設定します。値はプロジェクトごとの実値に置き換えてください。
+
+```toml
+DATABASE_URL = "postgresql://postgres.xxxxx:YOUR_DB_PASSWORD@aws-0-ap-northeast-1.pooler.supabase.com:6543/postgres"
+```
+
+`service_role_key` を使う場合は、公開用の anon/publishable key ではなく service role key をサーバー側のSecretsにだけ保存します。
+
+```toml
+[supabase]
+enabled = true
+url = "https://YOUR_PROJECT_REF.supabase.co"
+service_role_key = "YOUR_SERVICE_ROLE_KEY"
+```
+
+`DATABASE_URL` や `service_role_key` は絶対にGitHubへコミットしないでください。READMEやコードには実値を書かず、Streamlit Cloud Secrets またはローカルの `.streamlit/secrets.toml` だけに保存します。
+
+Secretsを保存した後は、Streamlit Cloudで `Reboot app` または `Rerun` を実行してください。再起動前は古いSecretsのまま動くことがあります。
+
+## 認証まわりの確認項目
+
+- Secrets未設定時に赤いtracebackではなく、認証用DB接続情報の案内が出る。
+- `app_users` テーブル未作成時に、`sql/app_users_auth.sql` 実行案内が出る。
+- `DATABASE_URL` 設定後にログイン画面が正常に動く。
+- 初回パスワード変更後、DBに保存される。
+- ログアウト後、新パスワードで再ログインできる。
+- 旧パスワードではログインできない。
+- 5回失敗でロックされる。

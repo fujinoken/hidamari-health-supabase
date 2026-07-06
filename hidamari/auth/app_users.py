@@ -1,4 +1,5 @@
 import os
+import logging
 from datetime import datetime, timezone
 from urllib.parse import quote
 
@@ -25,6 +26,65 @@ from hidamari.core.time_utils import format_now_jst, now_jst_dt
 
 
 APP_USER_TABLE = "app_users"
+
+AUTH_CONFIG_MESSAGE = (
+    "認証用DB接続情報が未設定です。管理者は Streamlit Cloud の Secrets に "
+    "DATABASE_URL または [supabase].service_role_key を設定してください。"
+)
+AUTH_CONNECT_MESSAGE = "認証用DB接続情報が未設定または接続できません。管理者に確認してください。"
+AUTH_TABLE_MESSAGE = (
+    "認証用テーブル app_users が未作成です。管理者は Supabase SQL Editor で "
+    "sql/app_users_auth.sql を実行してください。"
+)
+INVALID_LOGIN_MESSAGE = "IDまたはパスワードが違います。"
+
+
+class AuthBackendError(Exception):
+    public_message = AUTH_CONNECT_MESSAGE
+
+
+class AuthConfigError(AuthBackendError):
+    public_message = AUTH_CONFIG_MESSAGE
+
+
+class AuthTableMissingError(AuthBackendError):
+    public_message = AUTH_TABLE_MESSAGE
+
+
+class AuthConnectionError(AuthBackendError):
+    public_message = AUTH_CONNECT_MESSAGE
+
+
+def auth_public_message(exc):
+    return getattr(exc, "public_message", AUTH_CONNECT_MESSAGE)
+
+
+def _log_auth_exception(message, exc=None):
+    logger = logging.getLogger(__name__)
+    if exc is None:
+        logger.error(message)
+    else:
+        logger.exception(message)
+
+
+def _looks_like_missing_table(exc_or_response):
+    text = ""
+    try:
+        text = getattr(exc_or_response, "text", "") or str(exc_or_response)
+    except Exception:
+        text = ""
+    text = text.lower()
+    return (
+        "app_users" in text
+        and (
+            "does not exist" in text
+            or "undefinedtable" in text
+            or "relation" in text
+            or "42p01" in text
+            or "pgrst205" in text
+            or "not found" in text
+        )
+    )
 
 COL_LOGIN_ID = ACCOUNT_COLUMNS[0]
 COL_DISPLAY_NAME = ACCOUNT_COLUMNS[1]
@@ -94,9 +154,13 @@ def _pg_conn():
     url = _database_url()
     if not url or psycopg2 is None:
         return None
-    if "sslmode=" in url:
-        return psycopg2.connect(url, cursor_factory=RealDictCursor)
-    return psycopg2.connect(url, sslmode=os.environ.get("PGSSLMODE", "require"), cursor_factory=RealDictCursor)
+    try:
+        if "sslmode=" in url:
+            return psycopg2.connect(url, cursor_factory=RealDictCursor)
+        return psycopg2.connect(url, sslmode=os.environ.get("PGSSLMODE", "require"), cursor_factory=RealDictCursor)
+    except Exception as exc:
+        _log_auth_exception("Failed to connect to authentication database.", exc)
+        raise AuthConnectionError() from exc
 
 
 def _has_direct_db():
@@ -106,7 +170,7 @@ def _has_direct_db():
 def _rest_headers(prefer="return=representation"):
     cfg = _supabase_config()
     if not cfg:
-        raise RuntimeError("Supabase service role key is not configured.")
+        raise AuthConfigError()
     return {
         "apikey": cfg["key"],
         "Authorization": f"Bearer {cfg['key']}",
@@ -118,7 +182,7 @@ def _rest_headers(prefer="return=representation"):
 def _rest_endpoint(query=""):
     cfg = _supabase_config()
     if not cfg:
-        raise RuntimeError("Supabase service role key is not configured.")
+        raise AuthConfigError()
     return f"{cfg['url']}/rest/v1/{APP_USER_TABLE}{query}"
 
 
@@ -127,10 +191,7 @@ def _require_auth_backend():
         return "postgres"
     if requests is not None and _supabase_config():
         return "rest"
-    raise RuntimeError(
-        "ログインDB接続情報が未設定です。Streamlit secrets に DATABASE_URL "
-        "または [supabase].service_role_key を設定してください。"
-    )
+    raise AuthConfigError()
 
 
 def ensure_app_users_table():
@@ -139,25 +200,15 @@ def ensure_app_users_table():
         conn = _pg_conn()
         cur = conn.cursor()
         try:
-            cur.execute(
-                f"""
-                CREATE TABLE IF NOT EXISTS public.{APP_USER_TABLE} (
-                    id BIGSERIAL PRIMARY KEY,
-                    login_id TEXT NOT NULL UNIQUE,
-                    display_name TEXT NOT NULL,
-                    password_hash TEXT NOT NULL,
-                    role TEXT NOT NULL DEFAULT 'staff',
-                    must_change_password BOOLEAN NOT NULL DEFAULT true,
-                    failed_login_count INTEGER NOT NULL DEFAULT 0,
-                    locked_until TIMESTAMPTZ,
-                    last_login_at TIMESTAMPTZ,
-                    created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
-                    updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
-                )
-                """
-            )
-            cur.execute(f"CREATE INDEX IF NOT EXISTS idx_{APP_USER_TABLE}_login_id ON public.{APP_USER_TABLE}(login_id)")
-            conn.commit()
+            cur.execute(f"SELECT 1 FROM public.{APP_USER_TABLE} LIMIT 1")
+        except AuthBackendError:
+            raise
+        except Exception as exc:
+            conn.rollback()
+            _log_auth_exception("Failed to prepare authentication table.", exc)
+            if _looks_like_missing_table(exc):
+                raise AuthTableMissingError() from exc
+            raise AuthConnectionError() from exc
         finally:
             cur.close()
             conn.close()
@@ -226,15 +277,29 @@ def load_accounts_raw():
                 """
             )
             return [_normalize_row(row) for row in cur.fetchall()]
-        except Exception:
-            return []
+        except AuthBackendError:
+            raise
+        except Exception as exc:
+            _log_auth_exception("Failed to read authentication users.", exc)
+            if _looks_like_missing_table(exc):
+                raise AuthTableMissingError() from exc
+            raise AuthConnectionError() from exc
         finally:
             cur.close()
             conn.close()
 
-    res = requests.get(_rest_endpoint("?select=*&order=login_id.asc"), headers=_rest_headers(prefer=""), timeout=20)
+    try:
+        res = requests.get(_rest_endpoint("?select=*&order=login_id.asc"), headers=_rest_headers(prefer=""), timeout=20)
+    except AuthBackendError:
+        raise
+    except Exception as exc:
+        _log_auth_exception("Failed to read authentication users through Supabase REST.", exc)
+        raise AuthConnectionError() from exc
     if res.status_code >= 400:
-        return []
+        _log_auth_exception(f"Supabase REST returned {res.status_code} while reading app_users.")
+        if _looks_like_missing_table(res):
+            raise AuthTableMissingError()
+        raise AuthConnectionError()
     return [_normalize_row(row) for row in (res.json() or [])]
 
 
@@ -260,15 +325,33 @@ def get_app_user(login_id):
             )
             row = cur.fetchone()
             return _normalize_row(row) if row else None
+        except AuthBackendError:
+            raise
+        except Exception as exc:
+            _log_auth_exception("Failed to read authentication user.", exc)
+            if _looks_like_missing_table(exc):
+                raise AuthTableMissingError() from exc
+            raise AuthConnectionError() from exc
         finally:
             cur.close()
             conn.close()
 
-    res = requests.get(
-        _rest_endpoint(f"?login_id=eq.{quote(login_id, safe='')}&select=*&limit=1"),
-        headers=_rest_headers(prefer=""),
-        timeout=20,
-    )
+    try:
+        res = requests.get(
+            _rest_endpoint(f"?login_id=eq.{quote(login_id, safe='')}&select=*&limit=1"),
+            headers=_rest_headers(prefer=""),
+            timeout=20,
+        )
+    except AuthBackendError:
+        raise
+    except Exception as exc:
+        _log_auth_exception("Failed to read authentication user through Supabase REST.", exc)
+        raise AuthConnectionError() from exc
+    if res.status_code >= 400:
+        _log_auth_exception(f"Supabase REST returned {res.status_code} while reading app_user.")
+        if _looks_like_missing_table(res):
+            raise AuthTableMissingError()
+        raise AuthConnectionError()
     rows = res.json() if res.status_code < 400 else []
     return _normalize_row(rows[0]) if rows else None
 
@@ -315,18 +398,37 @@ def upsert_app_user(row):
                 {**payload, "created_at": payload.get("created_at")},
             )
             conn.commit()
+        except AuthBackendError:
+            raise
+        except Exception as exc:
+            conn.rollback()
+            _log_auth_exception("Failed to save authentication user.", exc)
+            if _looks_like_missing_table(exc):
+                raise AuthTableMissingError() from exc
+            raise AuthConnectionError() from exc
         finally:
             cur.close()
             conn.close()
         return True
 
-    res = requests.post(
-        _rest_endpoint("?on_conflict=login_id"),
-        headers=_rest_headers(prefer="resolution=merge-duplicates,return=minimal"),
-        json=[payload],
-        timeout=20,
-    )
-    return res.status_code < 400
+    try:
+        res = requests.post(
+            _rest_endpoint("?on_conflict=login_id"),
+            headers=_rest_headers(prefer="resolution=merge-duplicates,return=minimal"),
+            json=[payload],
+            timeout=20,
+        )
+    except AuthBackendError:
+        raise
+    except Exception as exc:
+        _log_auth_exception("Failed to save authentication user through Supabase REST.", exc)
+        raise AuthConnectionError() from exc
+    if res.status_code >= 400:
+        _log_auth_exception(f"Supabase REST returned {res.status_code} while saving app_user.")
+        if _looks_like_missing_table(res):
+            raise AuthTableMissingError()
+        raise AuthConnectionError()
+    return True
 
 
 def delete_app_user(login_id):
@@ -341,15 +443,34 @@ def delete_app_user(login_id):
             cur.execute(f"DELETE FROM public.{APP_USER_TABLE} WHERE login_id = %s", (login_id,))
             conn.commit()
             return cur.rowcount > 0
+        except AuthBackendError:
+            raise
+        except Exception as exc:
+            conn.rollback()
+            _log_auth_exception("Failed to delete authentication user.", exc)
+            if _looks_like_missing_table(exc):
+                raise AuthTableMissingError() from exc
+            raise AuthConnectionError() from exc
         finally:
             cur.close()
             conn.close()
-    res = requests.delete(
-        _rest_endpoint(f"?login_id=eq.{quote(login_id, safe='')}"),
-        headers=_rest_headers(prefer="return=minimal"),
-        timeout=20,
-    )
-    return res.status_code < 400
+    try:
+        res = requests.delete(
+            _rest_endpoint(f"?login_id=eq.{quote(login_id, safe='')}"),
+            headers=_rest_headers(prefer="return=minimal"),
+            timeout=20,
+        )
+    except AuthBackendError:
+        raise
+    except Exception as exc:
+        _log_auth_exception("Failed to delete authentication user through Supabase REST.", exc)
+        raise AuthConnectionError() from exc
+    if res.status_code >= 400:
+        _log_auth_exception(f"Supabase REST returned {res.status_code} while deleting app_user.")
+        if _looks_like_missing_table(res):
+            raise AuthTableMissingError()
+        raise AuthConnectionError()
+    return True
 
 
 def _legacy_account_row(row):
@@ -492,9 +613,14 @@ def authenticate_user(login_id, password):
     password = clean_text(password)
     user = get_app_user(login_id)
     if not user:
-        return None, "IDまたはパスワードが違います。"
-    if not verify_password(password, user.get("password_hash", "")):
-        return None, "IDまたはパスワードが違います。"
+        return None, INVALID_LOGIN_MESSAGE
+    try:
+        password_ok = verify_password(password, user.get("password_hash", ""))
+    except Exception as exc:
+        _log_auth_exception("Password verification failed unexpectedly.", exc)
+        raise AuthConnectionError() from exc
+    if not password_ok:
+        return None, INVALID_LOGIN_MESSAGE
     if uses_initial_password(login_id, password):
         user["must_change_password"] = True
     if password_hash_needs_upgrade(user.get("password_hash", "")):
