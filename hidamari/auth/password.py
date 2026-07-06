@@ -43,7 +43,7 @@ def hash_password(password: str) -> str:
     password = clean_text(password)
     if is_bcrypt_available():
         return bcrypt.hashpw(password.encode("utf-8"), bcrypt.gensalt(rounds=12)).decode("utf-8")
-    raise RuntimeError("bcrypt is required for saving passwords.")
+    return make_sha256_hash(password)
 
 
 def verify_password(password: str, password_hash: str) -> bool:
@@ -79,16 +79,8 @@ def uses_initial_password(login_id, password) -> bool:
 
 
 def account_requires_password_change(account_row) -> bool:
-    """アカウントが初回パスワード変更必須か判定する。"""
-    if not isinstance(account_row, dict):
-        try:
-            account_row = account_row.to_dict()
-        except Exception:
-            return False
-    if "must_change_password" in account_row:
-        return bool(account_row.get("must_change_password"))
-    value = clean_text(account_row.get("初回パスワード変更必須"))
-    return value in ["はい", "必須", "1", "true", "True", "TRUE"]
+    """初回パスワード変更の強制は現在使わない。"""
+    return False
 
 
 def validate_new_password(login_id, new_password, confirm_password, current_hash=""):
