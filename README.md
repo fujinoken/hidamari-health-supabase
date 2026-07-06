@@ -104,3 +104,68 @@ python tools/minimal_check.py
 - AI機能はOpenAI APIキーが未設定でも、ルールベース機能のみで利用できます。
 - 写真や添付ファイルを含むバックアップはサイズが大きくなることがあります。
 - 現場で使い始める前に、`docs/pre_operation_checklist.md` の実運用前チェックリストを確認してください。
+# ログインユーザー管理をSupabase/PostgreSQLへ移行
+
+## 変更ファイルと理由
+
+- `hidamari/auth/app_users.py`: `app_users` テーブルでログインユーザー、パスワードハッシュ、初回変更フラグ、失敗回数、ロック期限、最終ログイン日時を管理します。
+- `app.py`: 既存のログイン画面・初回パスワード変更画面・ログインID管理画面のUIを維持し、裏側の認証関数だけDB版へ差し替えました。
+- `hidamari/auth/password.py`: 新規保存・変更時のパスワード保存をbcrypt必須にし、DB列 `must_change_password` でも初回変更判定できるようにしました。
+- `requirements.txt`: PostgreSQLへ直接接続するため `psycopg2-binary` を追加しました。
+- `sql/app_users_auth.sql`: Supabase SQL Editorで実行できる認証テーブル作成SQLです。
+
+## 必要なSecrets
+
+推奨はPostgreSQL直接接続です。Streamlit secrets または `.streamlit/secrets.toml` に次のいずれかを設定します。
+
+```toml
+DATABASE_URL = "postgresql://postgres.xxxxx:YOUR_DB_PASSWORD@aws-0-ap-northeast-1.pooler.supabase.com:6543/postgres"
+```
+
+既存のSupabase REST設定を使う場合は、`app_users` がパスワードハッシュを含むため、公開用キーではなくサーバー側だけで使う service role key を設定してください。
+
+```toml
+[supabase]
+enabled = true
+url = "https://YOUR_PROJECT_REF.supabase.co"
+service_role_key = "YOUR_SERVICE_ROLE_KEY"
+```
+
+本番パスワード、DB接続文字列、service role key はGitHubへコミットしないでください。
+
+## 初期テーブル作成
+
+Supabase SQL Editorで `sql/app_users_auth.sql` を実行します。アプリ起動時に `app_users` が空の場合、初期ユーザーを自動作成します。
+
+- `kanri` / 初期パスワードは `HIDAMARI_INITIAL_PASSWORD`、未設定時は既存どおり `rui`
+- `staff` / 初期パスワードは `HIDAMARI_INITIAL_PASSWORD`、未設定時は既存どおり `rui`
+- どちらも `must_change_password = true`
+
+初期パスワードを変更したい場合は、Streamlit secrets または環境変数に次を設定します。
+
+```toml
+HIDAMARI_INITIAL_PASSWORD = "初回配布用の一時パスワード"
+```
+
+## 初期ユーザー作成手順
+
+1. `sql/app_users_auth.sql` をSupabase SQL Editorで実行します。
+2. `DATABASE_URL` または `[supabase].service_role_key` をStreamlit secretsに設定します。
+3. `pip install -r requirements.txt` を実行します。
+4. `streamlit run app.py` で起動します。
+5. `kanri` と初期パスワードでログインします。
+6. 初回パスワード変更画面で新しいパスワードを設定します。
+7. 管理画面の「ログイン・職員ID管理」から必要な職員IDを追加します。
+
+## 改修後の確認項目
+
+- 初期パスワードでログインできる。
+- 初回パスワード変更後、`app_users.password_hash` が更新され、`must_change_password` が `false` になる。
+- ログアウト後、新パスワードで再ログインできる。
+- アプリを再起動しても新パスワードが維持される。
+- 旧パスワードではログインできない。
+- 5回失敗すると `failed_login_count` が5になり、`locked_until` に現在時刻+300秒が保存される。
+- ロック中はログインできない。
+- ロック解除後に正しいパスワードでログインでき、成功時に `failed_login_count = 0`、`locked_until = null` へ戻る。
+
+健康記録・申し送り・利用者データの既存テーブルは変更していません。

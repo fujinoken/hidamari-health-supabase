@@ -14069,6 +14069,18 @@ def show_structured_insight_menu():
 # =========================
 # ログイン・デザイン
 # =========================
+from hidamari.auth.app_users import (
+    authenticate_user,
+    clear_login_failures,
+    is_login_temporarily_locked,
+    load_accounts,
+    record_login_failure,
+    save_accounts,
+    update_account_password,
+    upgrade_account_password_hash,
+)
+
+
 def show_force_password_change_screen():
     """初回ログイン・仮パスワード利用時に通常画面へ進ませず、パスワード変更を求める。"""
     show_hidamari_hero("login")
