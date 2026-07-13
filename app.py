@@ -178,11 +178,6 @@ except Exception:
     requests = None
 
 try:
-    import matplotlib.pyplot as plt
-except Exception:
-    plt = None
-
-try:
     from PIL import Image, ImageOps
 except Exception:
     Image = None
@@ -208,6 +203,15 @@ except Exception:
 DEFAULT_QUERY_CACHE_TTL_SEC = 60
 DEFAULT_RECENT_DAYS = 7
 SAFE_READ_CACHE_TTL_SEC = 300
+
+
+def diagnostic_log(stage, event, **safe_fields):
+    """Cloud上の処理境界を記録する（認証情報・個人情報は記録しない）。"""
+    try:
+        fields = " ".join(f"{key}={value}" for key, value in safe_fields.items())
+        print(f"[{stage}] {event}{(' ' + fields) if fields else ''}", flush=True)
+    except Exception:
+        pass
 
 def cache_safe_master_read(ttl=SAFE_READ_CACHE_TTL_SEC):
     """Return a safe st.cache_data decorator, or the original function if caching is unavailable."""
@@ -242,10 +246,12 @@ def log_perf(label, elapsed_sec, detail=""):
 @contextmanager
 def perf_timer(label, detail=""):
     start = time.perf_counter()
+    diagnostic_log("PERF", "before", operation=label, detail=detail)
     try:
         yield
     finally:
         elapsed = time.perf_counter() - start
+        diagnostic_log("PERF", "after", operation=label, elapsed_sec=f"{elapsed:.3f}")
         if elapsed >= 0.2:
             log_perf(label, elapsed, detail)
 
@@ -819,7 +825,9 @@ def _supabase_read_table_cached(table_name: str, columns_tuple=(), date_field: s
             timeout=20,
         )
     res.raise_for_status()
-    return _normalize_supabase_df_from_rows(res.json() or [], list(columns_tuple))
+    rows = res.json() or []
+    diagnostic_log("DB", "supabase response received", table=table_name, rows=len(rows))
+    return _normalize_supabase_df_from_rows(rows, list(columns_tuple))
 
 def supabase_read_table(table_name: str, columns=None, date_field: str = "", start_date=None, end_date=None, limit: int = 0) -> pd.DataFrame:
     if not supabase_is_enabled() or table_name not in SUPABASE_CORE_TABLES:
@@ -1805,6 +1813,15 @@ def ensure_hidamari_db():
     """
     ensure_dirs()
     initialize_sqlite_engine()
+
+    # Avoid rebuilding every table with pandas on each post-login rerun.
+    # Feature loaders retain their own lazy Excel/table initialization.
+    if st.session_state.get("hidamari_schema_checked"):
+        diagnostic_log("DB", "startup schema already checked")
+        return
+    st.session_state["hidamari_schema_checked"] = True
+    diagnostic_log("DB", "startup schema check completed; deferred table migrations")
+    return
 
     init_jobs = [
         lambda: save_sqlite_table(load_sqlite_table(SQLITE_TABLE_HEALTH, HEALTH_COLUMNS, date_cols=["記録日"]), SQLITE_TABLE_HEALTH, HEALTH_COLUMNS, date_cols=["記録日"], unique_cols=["記録日", "利用者名"]),
@@ -14201,6 +14218,7 @@ def login_check():
         if st.button("ログイン", use_container_width=True):
             login_id = clean_text(input_id).lower()
             login_password = clean_text(input_password)
+            diagnostic_log("LOGIN", "authentication started")
             locked, remaining_seconds = is_login_temporarily_locked(login_id)
             if locked:
                 st.error(f"ログイン失敗が続いたため、一時的に制限しています。約{max(remaining_seconds, 1)}秒後に再試行してください。")
@@ -14209,6 +14227,7 @@ def login_check():
             user, err = authenticate_user(login_id, login_password)
 
             if user:
+                diagnostic_log("LOGIN", "authentication success")
                 clear_login_failures(login_id)
                 st.session_state.logged_in = True
                 st.session_state.role = clean_text(user.get("権限", "staff"), "staff")
@@ -14224,8 +14243,10 @@ def login_check():
                 }
                 st.session_state.force_password_change = False
                 st.session_state["hidamari_login_message"] = random.choice(HIDAMARI_MESSAGES)
+                diagnostic_log("LOGIN", "session initialized; rerun requested", role=st.session_state.role)
                 st.rerun()
             else:
+                diagnostic_log("LOGIN", "authentication failed")
                 count, remaining, locked_seconds = record_login_failure(login_id)
                 if locked_seconds:
                     st.error(f"ログイン失敗が{count}回続いたため、約{locked_seconds}秒間ログインを制限します。")
@@ -14804,22 +14825,29 @@ apply_product_ui_ux()
 if not login_check():
     st.stop()
 
+diagnostic_log("STARTUP", "post-login initialization started", role=st.session_state.get("role", ""))
+
 # 画面を開いている間のスリープ対策
 # 接続維持の表示・通信・手動操作は管理者だけに限定する。
 if is_admin_user():
+    diagnostic_log("STARTUP", "before keep-alive widget")
     render_keep_alive_widget(interval_seconds=240, show_status=True)
+    diagnostic_log("STARTUP", "after keep-alive widget")
 
 logout_button()
 
 # 起動時DB安全チェック（異常時は管理者復元画面で停止）
+diagnostic_log("STARTUP", "before database guard")
 if not run_startup_database_guard():
     st.stop()
+diagnostic_log("STARTUP", "after database guard")
 
 # SQLite・セキュリティテーブル初期化と1日1回自動バックアップ
+diagnostic_log("STARTUP", "before database initialization")
 ensure_hidamari_db()
 ensure_security_tables()
-run_daily_auto_backup()
-run_daily_photo_retention_cleanup()
+diagnostic_log("STARTUP", "after database initialization")
+diagnostic_log("STARTUP", "heavy daily maintenance deferred; manual operations remain available")
 
 if st.session_state.role == "admin":
     show_hidamari_hero("admin")
@@ -14834,10 +14862,13 @@ product_ui_notice()
 # =========================
 # メニュー（Ver3.0：カテゴリ化・iPad最適化）
 # =========================
+diagnostic_log("HOME", "before loading active residents")
 active_users = load_active_user_names(include_hidden=False)
 all_users = active_users
+diagnostic_log("HOME", "after loading active residents", rows=len(active_users))
 
 menu = render_sidebar_menu(st.session_state.role, APP_VERSION, APP_COPY)
+diagnostic_log("HOME", "initial screen selected", screen=menu)
 
 
 # =========================
