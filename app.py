@@ -276,7 +276,9 @@ def clear_hidamari_read_cache(reason=""):
     targets = []
     if any(key in reason_text for key in ["利用者", "マスタ", "user"]):
         targets.extend(["load_users", "load_active_user_names", "load_user_name_aliases", "_supabase_read_table_cached"])
-    if any(key in reason_text for key in ["健康", "排泄", "申し送り", "短期", "目標", "モニタリング", "復元", "Supabase", "保存", "削除"]):
+    if any(key in reason_text for key in ["健康", "排泄"]):
+        targets.append("_supabase_read_table_cached")
+    elif any(key in reason_text for key in ["申し送り", "短期", "目標", "モニタリング", "復元", "Supabase", "保存", "削除"]):
         targets.extend(["_supabase_read_table_cached", "load_short_goal_master"])
     cleared = _clear_cached_functions(dict.fromkeys(targets))
     if cleared:
@@ -812,7 +814,12 @@ def _supabase_read_table_cached(table_name: str, columns_tuple=(), date_field: s
     if date_field and start_iso:
         params.append((f"data->>{date_field}", f"gte.{start_iso}"))
     if date_field and end_iso:
-        params.append((f"data->>{date_field}", f"lte.{end_iso}"))
+        # 保存値が YYYY-MM-DDT00:00:00 でも同日分に含めるため、翌日未満で絞る。
+        end_dt = pd.to_datetime(end_iso, errors="coerce")
+        if not pd.isna(end_dt):
+            params.append((f"data->>{date_field}", f"lt.{(end_dt + timedelta(days=1)).strftime('%Y-%m-%d')}"))
+        else:
+            params.append((f"data->>{date_field}", f"lte.{end_iso}"))
     params.append(("order", "updated_at.desc"))
     if limit and int(limit) > 0:
         params.append(("limit", str(int(limit))))
@@ -5207,19 +5214,63 @@ def save_health_data(df):
     return bool(saved)
 
 
-def find_health_index(df, record_date, user_name):
+def _normalize_record_date(value):
+    """保存値を変更せず、記録日の比較に使うdateだけを返す。"""
+    parsed = pd.to_datetime(value, errors="coerce")
+    if pd.isna(parsed):
+        return None
+    return parsed.date()
+
+
+def _normalize_user_id(value):
+    """None/NaNや数値型を含むuser_idを比較用文字列へ揃える。"""
+    if value is None or (not isinstance(value, str) and pd.isna(value)):
+        return ""
+    text = str(value).strip()
+    if text.lower() in ["", "nan", "none", "nat"]:
+        return ""
+    if re.fullmatch(r"[+-]?\d+\.0+", text):
+        text = text.split(".", 1)[0]
+    return text
+
+
+def _normalize_user_name(value):
+    """旧記録の後方互換照合にだけ使う利用者名を返す。"""
+    if value is None or (not isinstance(value, str) and pd.isna(value)):
+        return ""
+    return normalize_user_name_for_match(str(value).strip())
+
+
+def _record_user_mask(df, user_name, user_id=""):
+    """user_idを優先し、IDがない旧行だけ利用者名で照合する。"""
+    target_id = _normalize_user_id(user_id) or _normalize_user_id(get_user_id_by_name(user_name))
+    target_name = _normalize_user_name(user_name)
+    if "user_id" in df.columns:
+        row_ids = df["user_id"].map(_normalize_user_id)
+    else:
+        row_ids = pd.Series("", index=df.index, dtype="object")
+    if "利用者名" in df.columns:
+        row_names = df["利用者名"].map(_normalize_user_name)
+    else:
+        row_names = pd.Series("", index=df.index, dtype="object")
+
+    name_match = (row_names == target_name) if target_name else pd.Series(False, index=df.index)
+    if target_id:
+        return (row_ids == target_id) | ((row_ids == "") & name_match)
+    return name_match
+
+
+def find_health_index(df, record_date, user_name, user_id=""):
     if df.empty:
         return None
 
     work = df.copy()
-    work["記録日"] = pd.to_datetime(work["記録日"], errors="coerce")
-    work["利用者名"] = work["利用者名"].astype(str).str.strip()
-
-    target_date = pd.to_datetime(record_date, errors="coerce")
-    if pd.isna(target_date):
+    target_date = _normalize_record_date(record_date)
+    if target_date is None or "記録日" not in work.columns:
         return None
 
-    mask = (work["記録日"].dt.date == target_date.date()) & (work["利用者名"] == clean_text(user_name))
+    date_mask = work["記録日"].map(_normalize_record_date) == target_date
+    mask = date_mask & _record_user_mask(work, user_name, user_id)
     matches = work.index[mask].tolist()
 
     if not matches:
@@ -5233,7 +5284,7 @@ def upsert_health_record(record):
     df = load_health_data()
     df = df.astype("object")
 
-    idx = find_health_index(df, record["記録日"], record["利用者名"])
+    idx = find_health_index(df, record["記録日"], record["利用者名"], record["user_id"])
 
     if idx is None:
         new_df = pd.DataFrame([record], columns=HEALTH_COLUMNS).astype("object")
@@ -5326,6 +5377,8 @@ def load_excretion_data(start_date=None, end_date=None, recent_days=None):
             df = load_sqlite_table(SQLITE_TABLE_EXCRETION, EXCRETION_COLUMNS, date_cols=["記録日"])
             df = _filter_df_by_date_range(df, "記録日", start_date, end_date)
 
+        df = attach_user_ids(df)
+
         if not df.empty:
             df["記録日"] = pd.to_datetime(df["記録日"], errors="coerce")
             for col in ["利用者名", "時間帯", "時間帯目安", "尿量", "尿性状", "便量", "便性状", "排泄メモ", "入力者", "登録日時"]:
@@ -5370,26 +5423,27 @@ def save_excretion_data(df):
     return bool(saved)
 
 
-def find_excretion_index(df, record_date, user_name, slot):
-    if df.empty:
-        return None
+def _filter_excretion_records(df, record_date, user_name, user_id="", slot=None):
+    if df is None or df.empty:
+        return pd.DataFrame(columns=EXCRETION_COLUMNS)
 
     work = df.copy()
-    work["記録日"] = pd.to_datetime(work["記録日"], errors="coerce")
-    work["利用者名"] = work["利用者名"].astype(str).str.strip()
-    work["時間帯"] = work["時間帯"].astype(str).str.strip()
+    target_date = _normalize_record_date(record_date)
+    if target_date is None or "記録日" not in work.columns:
+        return work.iloc[0:0]
 
-    target_date = pd.to_datetime(record_date, errors="coerce")
-    if pd.isna(target_date):
+    mask = (work["記録日"].map(_normalize_record_date) == target_date) & _record_user_mask(work, user_name, user_id)
+    if slot is not None:
+        if "時間帯" not in work.columns:
+            return work.iloc[0:0]
+        mask &= work["時間帯"].map(clean_text) == clean_text(slot)
+    return work.loc[mask]
+
+
+def find_excretion_index(df, record_date, user_name, slot, user_id=""):
+    if df.empty:
         return None
-
-    mask = (
-        (work["記録日"].dt.date == target_date.date())
-        & (work["利用者名"] == clean_text(user_name))
-        & (work["時間帯"] == clean_text(slot))
-    )
-
-    matches = work.index[mask].tolist()
+    matches = _filter_excretion_records(df, record_date, user_name, user_id, slot).index.tolist()
 
     if not matches:
         return None
@@ -5397,8 +5451,8 @@ def find_excretion_index(df, record_date, user_name, slot):
     return matches[0]
 
 
-def get_excretion_row(df, record_date, user_name, slot):
-    idx = find_excretion_index(df, record_date, user_name, slot)
+def get_excretion_row(df, record_date, user_name, slot, user_id=""):
+    idx = find_excretion_index(df, record_date, user_name, slot, user_id)
 
     if idx is None:
         return None
@@ -5416,6 +5470,7 @@ def upsert_excretion_record(record):
         record["記録日"],
         record["利用者名"],
         record["時間帯"],
+        record["user_id"],
     )
 
     if idx is None:
@@ -5436,27 +5491,47 @@ def upsert_excretion_record(record):
     return action
 
 
-def get_day_excretion_data(df, record_date, user_name=None):
+def get_day_excretion_data(df, record_date, user_name=None, user_id=""):
     if df.empty:
         return df
 
-    work = df.copy()
-    work["記録日"] = pd.to_datetime(work["記録日"], errors="coerce")
-
-    target_date = pd.to_datetime(record_date, errors="coerce")
-    if pd.isna(target_date):
-        return pd.DataFrame(columns=EXCRETION_COLUMNS)
-
-    work = work[work["記録日"].dt.date == target_date.date()]
-
     if user_name and user_name != "全員":
-        work = work[work["利用者名"] == user_name]
+        work = _filter_excretion_records(df, record_date, user_name, user_id)
+    else:
+        target_date = _normalize_record_date(record_date)
+        if target_date is None or "記録日" not in df.columns:
+            return pd.DataFrame(columns=EXCRETION_COLUMNS)
+        work = df.loc[df["記録日"].map(_normalize_record_date) == target_date].copy()
 
     slot_order = {slot: i for i, (slot, _) in enumerate(EXCRETION_SLOTS)}
     work["_slot_order"] = work["時間帯"].map(slot_order).fillna(99)
     work = work.sort_values(["利用者名", "_slot_order"]).drop(columns=["_slot_order"])
 
     return work
+
+
+def load_health_record_for_user_date(record_date, user_name, user_id=""):
+    """選択日の記録を読み、旧日付表記をSupabase絞り込みが落とした時だけ全件へ戻る。"""
+    df = load_health_data(start_date=record_date, end_date=record_date)
+    idx = find_health_index(df, record_date, user_name, user_id)
+    if idx is None and supabase_is_enabled():
+        fallback = load_health_data()
+        fallback_idx = find_health_index(fallback, record_date, user_name, user_id)
+        if fallback_idx is not None:
+            return fallback, fallback_idx
+    return df, idx
+
+
+def load_excretion_records_for_user_date(record_date, user_name, user_id=""):
+    """選択日の排泄記録を読み、旧日付表記の場合だけ全件読込結果へ戻る。"""
+    df = load_excretion_data(start_date=record_date, end_date=record_date)
+    records = _filter_excretion_records(df, record_date, user_name, user_id)
+    if records.empty and supabase_is_enabled():
+        fallback = load_excretion_data()
+        fallback_records = _filter_excretion_records(fallback, record_date, user_name, user_id)
+        if not fallback_records.empty:
+            return fallback, fallback_records
+    return df, records
 
 
 def get_month_excretion_data(df, user_name, year, month):
@@ -11556,8 +11631,8 @@ def show_daily_summary_input():
     force_reload_summary = bool(st.session_state.pop("daily_summary_force_reload", False))
     loaded_context = st.session_state.get("daily_summary_loaded_context")
     if force_reload_summary or loaded_context != daily_summary_context:
-        health_df = load_health_data(start_date=record_date, end_date=record_date)
-        ex_df = load_excretion_data(start_date=record_date, end_date=record_date)
+        health_df, _ = load_health_record_for_user_date(record_date, user_name, user_id)
+        ex_df, _ = load_excretion_records_for_user_date(record_date, user_name, user_id)
         goal_check_df = load_short_goal_checks(start_date=record_date, end_date=record_date)
         goal_check_df = normalize_df_columns(goal_check_df, SHORT_GOAL_CHECK_COLUMNS)
         st.session_state["daily_summary_loaded_context"] = daily_summary_context
@@ -11569,8 +11644,8 @@ def show_daily_summary_input():
         ex_df = st.session_state.get("daily_summary_ex_df")
         goal_check_df = st.session_state.get("daily_summary_goal_check_df")
         if health_df is None or ex_df is None or goal_check_df is None:
-            health_df = load_health_data(start_date=record_date, end_date=record_date)
-            ex_df = load_excretion_data(start_date=record_date, end_date=record_date)
+            health_df, _ = load_health_record_for_user_date(record_date, user_name, user_id)
+            ex_df, _ = load_excretion_records_for_user_date(record_date, user_name, user_id)
             goal_check_df = load_short_goal_checks(start_date=record_date, end_date=record_date)
             goal_check_df = normalize_df_columns(goal_check_df, SHORT_GOAL_CHECK_COLUMNS)
             st.session_state["daily_summary_loaded_context"] = daily_summary_context
@@ -11578,10 +11653,10 @@ def show_daily_summary_input():
             st.session_state["daily_summary_ex_df"] = ex_df
             st.session_state["daily_summary_goal_check_df"] = goal_check_df
 
-    health_idx = find_health_index(health_df, record_date, user_name)
+    health_idx = find_health_index(health_df, record_date, user_name, user_id)
     existing_health = health_df.loc[health_idx] if health_idx is not None else None
 
-    day_excretion = get_day_excretion_data(ex_df, record_date, user_name)
+    day_excretion = get_day_excretion_data(ex_df, record_date, user_name, user_id)
 
     def summary_text(row, col, default=""):
         if row is None:
@@ -11621,8 +11696,8 @@ def show_daily_summary_input():
 
     def verify_daily_summary_health_saved():
         try:
-            verify_df = load_health_data(start_date=record_date, end_date=record_date)
-            return find_health_index(verify_df, record_date, user_name) is not None
+            _, verify_idx = load_health_record_for_user_date(record_date, user_name, user_id)
+            return verify_idx is not None
         except Exception:
             return False
 
@@ -11630,8 +11705,8 @@ def show_daily_summary_input():
         try:
             slot = clean_text(record.get("時間帯"))
             if verify_df is None:
-                verify_df = load_excretion_data(start_date=record_date, end_date=record_date)
-            return find_excretion_index(verify_df, record_date, user_name, slot) is not None
+                verify_df, _ = load_excretion_records_for_user_date(record_date, user_name, user_id)
+            return find_excretion_index(verify_df, record_date, user_name, slot, user_id) is not None
         except Exception:
             return False
 
@@ -15690,6 +15765,89 @@ def show_dashboard_recent_attention(target_date, health_df, ex_df):
             st.caption("未対応・注意の申し送り")
             st.dataframe(handover_alerts[["日付", "対象", "利用者名", "優先度", "対応状況", "要確認事項"]].head(8), use_container_width=True, hide_index=True)
 
+
+def show_record_confirmation():
+    """職員が健康・排泄記録を参照するための閲覧専用画面。"""
+    st.header("記録の確認")
+    st.caption("利用者様の日々の健康チェック・排泄チェック記録を確認できます。")
+
+    users = get_active_user_names()
+    if not users:
+        st.warning("利用者マスタに表示中の利用者がありません。")
+        return
+
+    with st.form("staff_record_confirmation_form"):
+        c1, c2, c3 = st.columns(3)
+        with c1:
+            record_date = st.date_input("記録日", value=today_jst(), key="record_confirmation_date")
+        with c2:
+            user_name = st.selectbox("利用者名", users, key="record_confirmation_user")
+        with c3:
+            record_type = st.selectbox("記録種別", ["健康チェック", "排泄チェック", "両方"], key="record_confirmation_type")
+        submitted = st.form_submit_button("記録を表示", type="primary", use_container_width=True)
+
+    if submitted:
+        user_id = get_user_id_by_name(user_name)
+        health_result = pd.DataFrame(columns=HEALTH_COLUMNS)
+        excretion_result = pd.DataFrame(columns=EXCRETION_COLUMNS)
+        if record_type in ["健康チェック", "両方"]:
+            health_df, health_idx = load_health_record_for_user_date(record_date, user_name, user_id)
+            if health_idx is not None:
+                health_result = health_df.loc[[health_idx]].copy()
+        if record_type in ["排泄チェック", "両方"]:
+            _, excretion_result = load_excretion_records_for_user_date(record_date, user_name, user_id)
+            excretion_result = excretion_result.copy()
+        st.session_state["record_confirmation_result"] = {
+            "record_date": record_date,
+            "user_name": user_name,
+            "record_type": record_type,
+            "health": health_result,
+            "excretion": excretion_result,
+        }
+
+    result = st.session_state.get("record_confirmation_result")
+    if not result:
+        return
+
+    record_type = result.get("record_type", "両方")
+    searched_date = _normalize_record_date(result.get("record_date"))
+    searched_user = clean_text(result.get("user_name"))
+    health_result = result.get("health", pd.DataFrame())
+    excretion_result = result.get("excretion", pd.DataFrame())
+    st.caption(f"検索条件：{searched_date.isoformat() if searched_date else ''} ／ {searched_user} ／ {record_type}")
+
+    if record_type in ["健康チェック", "両方"]:
+        st.subheader("健康チェック記録")
+        if health_result is None or health_result.empty:
+            st.info("指定した日付・利用者様の健康チェック記録はありません。")
+        else:
+            show_columns = [col for col in HEALTH_COLUMNS if col != "user_id" and col in health_result.columns]
+            display_health = health_result[show_columns].copy()
+            if "記録日" in display_health.columns:
+                display_health["記録日"] = display_health["記録日"].map(lambda x: _normalize_record_date(x).isoformat() if _normalize_record_date(x) else "")
+            st.dataframe(display_health, use_container_width=True, hide_index=True)
+
+    if record_type in ["排泄チェック", "両方"]:
+        st.subheader("排泄チェック記録")
+        if excretion_result is None or excretion_result.empty:
+            st.info("指定した日付・利用者様の排泄チェック記録はありません。")
+        else:
+            slot_order = [slot for slot, _ in EXCRETION_SLOTS]
+            saved_slots = [clean_text(value) for value in excretion_result["時間帯"].tolist()]
+            for slot in slot_order + [slot for slot in saved_slots if slot and slot not in slot_order]:
+                slot_df = excretion_result[excretion_result["時間帯"].map(clean_text) == slot].copy()
+                if slot_df.empty:
+                    continue
+                st.markdown(f"#### {slot}")
+                show_columns = [
+                    col for col in ["記録日", "利用者名", "時間帯目安", "尿量", "尿性状", "便量", "便性状", "排泄メモ", "入力者", "登録日時"]
+                    if col in slot_df.columns
+                ]
+                display_excretion = slot_df[show_columns].copy()
+                if "記録日" in display_excretion.columns:
+                    display_excretion["記録日"] = display_excretion["記録日"].map(lambda x: _normalize_record_date(x).isoformat() if _normalize_record_date(x) else "")
+                st.dataframe(display_excretion, use_container_width=True, hide_index=True)
+
 # =========================
 # 管理者ダッシュボード
 # =========================
@@ -15903,9 +16061,9 @@ elif menu == "健康チェック入力":
     with col3:
         input_staff = st.text_input("入力者", placeholder="例：藤野", key="health_staff")
 
-    # 入力画面では選択日の前後だけ読む。既存データ確認のために全件取得しない。
-    health_df = load_health_data(start_date=record_date, end_date=record_date)
-    idx = find_health_index(health_df, record_date, user_name)
+    # 選択日を先に絞り、旧日付表記を取りこぼした場合だけキャッシュ済み全件読込へ戻る。
+    selected_user_id = get_user_id_by_name(user_name)
+    health_df, idx = load_health_record_for_user_date(record_date, user_name, selected_user_id)
 
     if idx is None:
         existing_row = None
@@ -16085,8 +16243,8 @@ elif menu == "排泄チェック入力":
     with col2:
         input_staff = st.text_input("入力者", placeholder="例：藤野", key="ex_input_staff")
 
-    ex_df = load_excretion_data(start_date=record_date, end_date=record_date)
-    day_data = get_day_excretion_data(ex_df, record_date, user_name)
+    selected_user_id = get_user_id_by_name(user_name)
+    ex_df, day_data = load_excretion_records_for_user_date(record_date, user_name, selected_user_id)
 
     if day_data.empty:
         st.markdown(
@@ -16125,7 +16283,7 @@ elif menu == "排泄チェック入力":
             )
 
         def render_slot(slot, time_label, card_color, border_color):
-            existing = get_excretion_row(ex_df, record_date, user_name, slot)
+            existing = get_excretion_row(ex_df, record_date, user_name, slot, selected_user_id)
             sig = "new" if existing is None else hashlib.md5(str(existing.to_dict()).encode("utf-8")).hexdigest()[:8]
             key_base = f"ex_{record_date}_{user_name}_{slot}_{sig}"
 
@@ -16256,7 +16414,7 @@ elif menu == "排泄チェック入力":
 
     st.subheader("この日の排泄記録")
     ex_status_df = load_excretion_data(start_date=record_date, end_date=record_date)
-    day_data = get_day_excretion_data(ex_status_df, record_date, user_name)
+    day_data = get_day_excretion_data(ex_status_df, record_date, user_name, selected_user_id)
     if day_data.empty:
         st.info("この日の排泄記録はまだありません。")
     else:
@@ -16326,6 +16484,13 @@ elif menu == "排泄チェック入力":
 
 
 # =========================
+# 職員向け記録確認（閲覧専用）
+# =========================
+elif menu == "記録の確認":
+    show_record_confirmation()
+
+
+# =========================
 # 過去データ管理
 # =========================
 elif menu == "過去データ管理":
@@ -16347,6 +16512,9 @@ elif menu == "過去データ管理":
 
         # 過去データ管理の初期表示は直近7日だけ読む。一覧検索では選択月だけ読み直す。
         health_df = load_health_data(recent_days=7)
+        if health_df.empty:
+            # 直近7日より前にだけ記録がある場合も、管理画面自体を利用できるようにする。
+            health_df = load_health_data()
 
         if health_df.empty:
             st.info("まだ健康チェックデータがありません。")
@@ -16357,7 +16525,8 @@ elif menu == "過去データ管理":
             with col2:
                 key_user = st.selectbox("利用者名", all_users, key="past_health_user")
 
-            idx = find_health_index(health_df, key_date, key_user)
+            selected_user_id = get_user_id_by_name(key_user)
+            health_df, idx = load_health_record_for_user_date(key_date, key_user, selected_user_id)
 
             if idx is None:
                 st.info("この記録日・利用者名の健康チェックデータはありません。")
