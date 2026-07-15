@@ -3194,10 +3194,14 @@ def run_startup_database_guard():
     ログイン後・本体初期化前に実行する。
     Trueなら通常起動、Falseならst.stop()前提。
     """
+    if st.session_state.get("_startup_database_guard_completed"):
+        return True
+
     try:
         check_result = check_startup_database_health()
         st.session_state["startup_db_check_result"] = check_result
         if check_result.get("ok", True):
+            st.session_state["_startup_database_guard_completed"] = True
             return True
         show_startup_recovery_panel(check_result)
         return False
