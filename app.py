@@ -1913,31 +1913,58 @@ def ensure_security_dirs():
 
 
 def ensure_security_tables():
-    """セキュリティ関連テーブルを作成する。"""
+    """セキュリティ関連テーブルをセッション初回だけ安全に初期化する。"""
+    if st.session_state.get("_security_tables_initialized"):
+        return
+
     ensure_security_dirs()
-    save_sqlite_table(
-        load_sqlite_table(SQLITE_TABLE_AUDIT_LOGS, AUDIT_LOG_COLUMNS),
-        SQLITE_TABLE_AUDIT_LOGS,
-        AUDIT_LOG_COLUMNS,
-        unique_cols=["監査ID"],
-        sort_cols=["日時"],
-    )
-    perms = load_sqlite_table(SQLITE_TABLE_ROLE_PERMISSIONS, ROLE_PERMISSION_COLUMNS)
-    if perms.empty:
-        perms = pd.DataFrame(DEFAULT_ROLE_PERMISSIONS, columns=ROLE_PERMISSION_COLUMNS)
-    save_sqlite_table(
-        perms,
-        SQLITE_TABLE_ROLE_PERMISSIONS,
-        ROLE_PERMISSION_COLUMNS,
-        unique_cols=["権限", "機能"],
-    )
-    save_sqlite_table(
-        load_sqlite_table(SQLITE_TABLE_BACKUP_HISTORY, BACKUP_HISTORY_COLUMNS),
-        SQLITE_TABLE_BACKUP_HISTORY,
-        BACKUP_HISTORY_COLUMNS,
-        unique_cols=["バックアップID"],
-        sort_cols=["日時"],
-    )
+
+    table_definitions = {
+        SQLITE_TABLE_AUDIT_LOGS: AUDIT_LOG_COLUMNS,
+        SQLITE_TABLE_ROLE_PERMISSIONS: ROLE_PERMISSION_COLUMNS,
+        SQLITE_TABLE_BACKUP_HISTORY: BACKUP_HISTORY_COLUMNS,
+    }
+    missing_tables = {
+        table_name
+        for table_name in table_definitions
+        if not sqlite_table_exists(table_name)
+    }
+
+    def quoted_identifier(value):
+        return '"' + str(value).replace('"', '""') + '"'
+
+    with hidamari_write_transaction() as conn:
+        for table_name in missing_tables:
+            safe_table_name = validate_sqlite_identifier(table_name)
+            column_sql = ", ".join(
+                f"{quoted_identifier(column)} TEXT"
+                for column in table_definitions[table_name]
+            )
+            conn.execute(f"CREATE TABLE IF NOT EXISTS {safe_table_name} ({column_sql});")
+
+        permission_table = validate_sqlite_identifier(SQLITE_TABLE_ROLE_PERMISSIONS)
+        permission_columns_sql = ", ".join(
+            quoted_identifier(column) for column in ROLE_PERMISSION_COLUMNS
+        )
+        placeholders = ", ".join(["?"] * len(ROLE_PERMISSION_COLUMNS))
+        insert_missing_permission_sql = f"""
+            INSERT INTO {permission_table} ({permission_columns_sql})
+            SELECT {placeholders}
+            WHERE NOT EXISTS (
+                SELECT 1
+                FROM {permission_table}
+                WHERE {quoted_identifier('権限')} = ?
+                  AND {quoted_identifier('機能')} = ?
+            )
+        """
+        permission_rows = [
+            tuple(row.get(column, "") for column in ROLE_PERMISSION_COLUMNS)
+            + (row.get("権限", ""), row.get("機能", ""))
+            for row in DEFAULT_ROLE_PERMISSIONS
+        ]
+        conn.executemany(insert_missing_permission_sql, permission_rows)
+
+    st.session_state["_security_tables_initialized"] = True
 
 
 def get_current_user_info_for_log():
