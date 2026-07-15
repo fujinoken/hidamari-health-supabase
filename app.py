@@ -15909,15 +15909,6 @@ elif menu == "健康チェック入力":
 
     if idx is None:
         existing_row = None
-        st.markdown(
-            """
-            <div style='background:#EAF4FF; border:1px solid #9CC7F0; color:#174A7C; padding:12px 14px; border-radius:10px; margin:8px 0 12px 0;'>
-                <b>この記録日・利用者名の健康チェックデータはありません。</b><br>
-                保存すると新しい記録として登録されます。
-            </div>
-            """,
-            unsafe_allow_html=True,
-        )
     else:
         existing_row = health_df.loc[idx]
         st.markdown(
