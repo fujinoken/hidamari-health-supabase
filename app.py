@@ -1591,14 +1591,26 @@ def _json_loads_safe(value, default=None):
         return default
 
 
+@cache_safe_master_read(ttl=DEFAULT_QUERY_CACHE_TTL_SEC)
+def _load_app_settings_cached():
+    """app_settings全体を短時間キャッシュして、設定ごとの重複読込を防ぐ。"""
+    ensure_app_settings_table()
+    return load_sqlite_table(SQLITE_TABLE_APP_SETTINGS, APP_SETTING_COLUMNS)
+
+
+def _clear_app_settings_cache():
+    clear_func = getattr(_load_app_settings_cached, "clear", None)
+    if callable(clear_func):
+        clear_func()
+
+
 def get_app_setting(setting_key, default=None):
     """SQLite app_settings から設定値を取得する。値はJSONとして保存・復元する。"""
     setting_key = clean_text(setting_key)
     if not setting_key:
         return default
     try:
-        ensure_app_settings_table()
-        df = load_sqlite_table(SQLITE_TABLE_APP_SETTINGS, APP_SETTING_COLUMNS)
+        df = _load_app_settings_cached()
         hit = df[df["設定キー"].astype(str) == setting_key]
         if hit.empty:
             return default
@@ -1626,7 +1638,9 @@ def set_app_setting(setting_key, value, category="一般設定", description="")
             "更新者": current_login_user() if "current_login_user" in globals() else "",
         }
         df = pd.concat([df, pd.DataFrame([row], columns=APP_SETTING_COLUMNS)], ignore_index=True)
-        save_sqlite_table(df, SQLITE_TABLE_APP_SETTINGS, APP_SETTING_COLUMNS, unique_cols=["設定キー"])
+        save_result = save_sqlite_table(df, SQLITE_TABLE_APP_SETTINGS, APP_SETTING_COLUMNS, unique_cols=["設定キー"])
+        if save_result is not False:
+            _clear_app_settings_cache()
     except Exception:
         pass
 
@@ -1637,7 +1651,9 @@ def delete_app_setting(setting_key):
         ensure_app_settings_table()
         df = load_sqlite_table(SQLITE_TABLE_APP_SETTINGS, APP_SETTING_COLUMNS)
         df = df[df["設定キー"].astype(str) != setting_key].copy()
-        save_sqlite_table(df, SQLITE_TABLE_APP_SETTINGS, APP_SETTING_COLUMNS, unique_cols=["設定キー"])
+        save_result = save_sqlite_table(df, SQLITE_TABLE_APP_SETTINGS, APP_SETTING_COLUMNS, unique_cols=["設定キー"])
+        if save_result is not False:
+            _clear_app_settings_cache()
     except Exception:
         pass
 
