@@ -1,6 +1,7 @@
 MENU_GROUPS_ADMIN = {
     "日常管理": [
         "管理者ダッシュボード",
+        "記録確認・修正統合",
         "業務全体申し送り",
         "利用者マスタ管理",
         "ログイン・職員ID管理",
@@ -78,6 +79,7 @@ MENU_CATEGORY_LABELS = {
 MENU_DISPLAY_LABELS = {
     "自分専用ダッシュボード": "自分用ダッシュボード",
     "管理者ダッシュボード": "管理者ダッシュボード",
+    "記録確認・修正統合": "記録確認・修正",
     "業務全体申し送り": "申し送りを書く・確認する",
     "管理者支援": "分析・確認支援",
     "日々のまとめ入力": "日々のまとめ入力",
@@ -127,6 +129,7 @@ LEGACY_ADMIN_CATEGORIES = {
 }
 
 MENU_KEY_COMPAT_ALIASES = {
+    "記録確認・修正": "記録確認・修正統合",
     "健康記録の確認・修正": "過去データ管理",
     "排泄記録の確認・修正": "排泄詳細管理",
     "分析・確認支援": "管理者支援",
@@ -136,6 +139,27 @@ MENU_KEY_COMPAT_ALIASES = {
     "利用者情報の管理": "利用者マスタ管理",
     "利用者名ゆれの整理": "利用者名ゆれ紐づけマスタ",
 }
+
+ADMIN_RECORD_MANAGEMENT_OPTIONS = (
+    "健康記録",
+    "排泄記録",
+    "短期目標の実施記録",
+    "申し送り",
+    "未入力・注意記録",
+)
+
+ADMIN_RECORD_MANAGEMENT_TARGETS = {
+    "健康記録": "過去データ管理",
+    "排泄記録": "排泄詳細管理",
+    "短期目標の実施記録": "実施履歴一覧",
+    "申し送り": "業務全体申し送り",
+    "未入力・注意記録": "未入力・注意記録",
+}
+
+
+def admin_record_management_target(record_type):
+    """共通入口の選択値を、既存画面の内部キーへ解決する。"""
+    return ADMIN_RECORD_MANAGEMENT_TARGETS.get(str(record_type or "").strip(), "過去データ管理")
 
 
 def canonical_menu_key(menu_name):

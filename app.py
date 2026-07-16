@@ -76,12 +76,14 @@ from hidamari.config.constants import (
     USER_SHEET,
 )
 from hidamari.config.menu import (
+    ADMIN_RECORD_MANAGEMENT_OPTIONS,
     MENU_CATEGORY_LABELS,
     MENU_DISPLAY_LABELS,
     MENU_GROUPS_ADMIN,
     MENU_GROUPS_STAFF,
     canonical_menu_category,
     canonical_menu_key,
+    admin_record_management_target,
     menu_category_label,
     menu_display_label,
     valid_saved_menu_rows,
@@ -372,6 +374,20 @@ def guard_selected_menu(menu_name):
     if menu_name in ADMIN_ONLY_MENUS:
         return require_admin_access(menu_name)
     return True
+
+
+def show_admin_record_management_entry():
+    """管理者が記録種別を選び、既存の管理画面へ進むための共通入口。"""
+    if not require_admin_access("記録確認・修正統合"):
+        return ""
+    st.header("記録確認・修正")
+    st.caption("確認する記録の種類を選択してください。既存の記録内容や保存方法は変更されません。")
+    record_type = st.selectbox(
+        "確認する記録",
+        ADMIN_RECORD_MANAGEMENT_OPTIONS,
+        key="admin_record_management_type",
+    )
+    return admin_record_management_target(record_type)
 
 
 
@@ -15040,14 +15056,27 @@ if not guard_selected_menu(menu):
 # 新しい入口は既存画面へ安全に案内し、保存・DB処理は従来の分岐をそのまま使う。
 selected_menu_entry = menu
 previous_menu_entry = st.session_state.get("resolved_menu_entry", "")
-if selected_menu_entry == "未入力・注意記録":
-    if previous_menu_entry != selected_menu_entry:
+resolved_menu_entry = selected_menu_entry
+if selected_menu_entry == "記録確認・修正統合":
+    resolved_menu_entry = show_admin_record_management_entry()
+    if not resolved_menu_entry:
+        st.stop()
+
+if selected_menu_entry == "記録確認・修正統合" and previous_menu_entry != resolved_menu_entry:
+    if resolved_menu_entry == "過去データ管理":
+        st.session_state["past_data_mode"] = "健康チェック"
+    elif resolved_menu_entry == "未入力・注意記録":
         st.session_state["past_data_mode"] = "入力状況"
+elif resolved_menu_entry == "未入力・注意記録" and previous_menu_entry != resolved_menu_entry:
+    st.session_state["past_data_mode"] = "入力状況"
+
+menu = resolved_menu_entry
+if resolved_menu_entry == "未入力・注意記録":
     menu = "過去データ管理"
-elif selected_menu_entry in {"バックアップ管理", "監査ログ"}:
+elif resolved_menu_entry in {"バックアップ管理", "監査ログ"}:
     menu = "セキュリティ・保守管理"
-st.session_state["resolved_menu_entry"] = selected_menu_entry
-diagnostic_log("HOME", "initial screen selected", screen=selected_menu_entry, resolved_screen=menu)
+st.session_state["resolved_menu_entry"] = resolved_menu_entry
+diagnostic_log("HOME", "initial screen selected", screen=selected_menu_entry, resolved_entry=resolved_menu_entry, resolved_screen=menu)
 
 
 # =========================
@@ -16551,7 +16580,7 @@ elif menu == "記録の確認":
 # 過去データ管理
 # =========================
 elif menu == "過去データ管理":
-    st.header("未入力・注意記録" if selected_menu_entry == "未入力・注意記録" else "健康記録の確認・修正")
+    st.header("未入力・注意記録" if resolved_menu_entry == "未入力・注意記録" else "健康記録の確認・修正")
     st.caption("健康チェックだけでなく、入力状況・注意記録・業務全体申し送りを切り替えて確認できます。")
 
     data_mode = st.selectbox(

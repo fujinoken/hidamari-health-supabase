@@ -10,6 +10,8 @@ import pandas as pd
 
 ROOT = Path(__file__).resolve().parents[1]
 FUNCTIONS = {
+    "_date_to_iso",
+    "_filter_df_by_date_range",
     "_normalize_record_date",
     "_normalize_user_id",
     "_normalize_user_name",
@@ -52,6 +54,22 @@ exec(compile(ast.Module(body=selected, type_ignores=[]), str(ROOT / "app.py"), "
 find_health_index = namespace["find_health_index"]
 filter_excretion_records = namespace["_filter_excretion_records"]
 find_excretion_index = namespace["find_excretion_index"]
+filter_df_by_date_range = namespace["_filter_df_by_date_range"]
+
+for date_value in [
+    "2026-07-01T09:00:00",
+    "2026-07-02",
+    "2026/07/03",
+    date(2026, 7, 4),
+    pd.Timestamp("2026-07-05 18:30"),
+]:
+    single_date_df = pd.DataFrame({"記録日": [date_value]})
+    filtered_date = filter_df_by_date_range(single_date_df, "記録日", date(2026, 7, 1), "2026/07/05")
+    assert filtered_date.index.tolist() == [0]
+
+inclusive_end_df = pd.DataFrame({"記録日": ["2026-07-04", "2026-07-05", "2026-07-06"]})
+inclusive_end = filter_df_by_date_range(inclusive_end_df, "記録日", "2026-07-04", "2026-07-05")
+assert inclusive_end.index.tolist() == [0, 1]
 
 health = pd.DataFrame(
     [
