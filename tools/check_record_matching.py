@@ -84,7 +84,24 @@ assert find_excretion_index(excretion, "2026-07-02", "山田", "夜間", "offici
 assert find_excretion_index(excretion, "2026-07-02", "山田", "午後", "official-u") is None
 
 menu_source = (ROOT / "hidamari" / "config" / "menu.py").read_text(encoding="utf-8")
-assert menu_source.index('"排泄チェック入力", "記録の確認", "日々の実施チェック"') >= 0
+menu_tree = ast.parse(menu_source)
+staff_menu_node = next(
+    node
+    for node in menu_tree.body
+    if isinstance(node, ast.Assign)
+    and any(isinstance(target, ast.Name) and target.id == "MENU_GROUPS_STAFF" for target in node.targets)
+)
+staff_menu_groups = ast.literal_eval(staff_menu_node.value)
+assert staff_menu_groups == {
+    "今日の入力": [
+        "業務全体申し送り",
+        "日々のまとめ入力",
+        "健康チェック入力",
+        "排泄チェック入力",
+        "記録の確認",
+        "日々の実施チェック",
+    ]
+}
 confirmation_node = next(node for node in tree.body if isinstance(node, ast.FunctionDef) and node.name == "show_record_confirmation")
 confirmation_source = ast.get_source_segment(app_source, confirmation_node)
 assert 'st.form("staff_record_confirmation_form")' in confirmation_source

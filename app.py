@@ -80,8 +80,11 @@ from hidamari.config.menu import (
     MENU_DISPLAY_LABELS,
     MENU_GROUPS_ADMIN,
     MENU_GROUPS_STAFF,
+    canonical_menu_category,
+    canonical_menu_key,
     menu_category_label,
     menu_display_label,
+    valid_saved_menu_rows,
 )
 from hidamari.config.paths import (
     ACCOUNT_FILE,
@@ -318,23 +321,24 @@ def is_admin_user():
 
 
 # 管理者専用メニュー制御
-ADMIN_ONLY_MENUS = [
-    "自分専用ダッシュボード",
-    "データダウンロード",
-    "LIFE入力標準化",
-    "短期目標・モニタリング",
-    "モニタリング下書き作成",
-    "管理者LIFE入力",
-    "LIFE不足チェック",
-    "LIFE CSV出力",
-    "LIFE登録一覧",
-    "加算シミュレーション",
-    "現場の気づき構造化・AI管理者支援",
-    "AI管理者アシスタント",
-    "セキュリティ・保守管理",
-    "利用者ID移行チェック",
-    "利用者名ゆれ紐づけマスタ",
-]
+# 管理者標準メニューから、職員にも許可する日常入力だけを明示的に除外する。
+# 将来メニューが追加された場合も、職員用として明示しない限り管理者専用になる。
+SHARED_OPERATION_MENUS = {
+    "業務全体申し送り",
+    "日々のまとめ入力",
+    "健康チェック入力",
+    "排泄チェック入力",
+    "日々の実施チェック",
+}
+ADMIN_ONLY_MENUS = sorted(
+    {
+        menu_name
+        for menu_names in MENU_GROUPS_ADMIN.values()
+        for menu_name in menu_names
+        if menu_name not in SHARED_OPERATION_MENUS
+    }
+    | {"モニタリング下書き作成"}
+)
 
 # =========================
 # 非表示メニュー制御
@@ -352,6 +356,22 @@ def filter_admin_menus(menu_list):
     if is_admin_user():
         return [m for m in menu_list if m not in hidden]
     return [m for m in menu_list if m not in ADMIN_ONLY_MENUS and m not in hidden]
+
+
+def require_admin_access(screen_name="管理者画面"):
+    """管理者処理の実行直前に使う最小限の共通ガード。"""
+    if is_admin_user():
+        return True
+    st.error(f"「{menu_display_label(screen_name)}」は管理者専用です。管理者でログインしてください。")
+    return False
+
+
+def guard_selected_menu(menu_name):
+    """サイドバー設定や状態値が改変されても管理者画面を実行させない。"""
+    menu_name = canonical_menu_key(menu_name)
+    if menu_name in ADMIN_ONLY_MENUS:
+        return require_admin_access(menu_name)
+    return True
 
 
 
@@ -3445,7 +3465,7 @@ def show_security_maintenance_menu():
         return
 
     ensure_security_tables()
-    st.header("セキュリティ・保守管理")
+    st.header("セキュリティ・保守")
     st.caption("DBバックアップ・復元・監査ログ・権限管理を、この画面にまとめています。")
 
     tab1, tab2, tab3, tab4, tab5, tab6, tab7 = st.tabs(["バックアップ", "監査ログ", "権限管理", "データ復元", "DB整合性", "Supabase設定", "写真設定"])
@@ -6793,7 +6813,7 @@ def show_life_standardization_menu():
     if not is_admin_user():
         st.warning("このメニューは管理者専用です。")
         return
-    st.header("LIFE入力標準化")
+    st.header("LIFE管理")
     st.caption("日々の記録をLIFE提出補助へつなげるため、自由入力ではなく選択式・コード化した項目を増やします。")
 
     if not active_users:
@@ -14528,13 +14548,14 @@ def make_menu_category_rows_from_groups(groups, role="admin"):
 
 def get_standard_menu_category_df(role="admin"):
     groups = get_standard_menu_groups(role)
-    return normalize_menu_category_df(pd.DataFrame(make_menu_category_rows_from_groups(groups, role=role)))
+    return normalize_menu_category_df(pd.DataFrame(make_menu_category_rows_from_groups(groups, role=role)), role=role)
 
 
-def normalize_menu_category_df(df):
+def normalize_menu_category_df(df, role="admin"):
     """メニューカテゴリ自己設定の列・型・並びを整える。"""
     columns = ["表示", "カテゴリ", "メニュー", "並び順", "備考"]
-    if df is None or df.empty:
+    role = "admin" if role == "admin" else "staff"
+    if not isinstance(df, pd.DataFrame) or df.empty:
         df = pd.DataFrame(columns=columns)
     work = df.copy()
     for col in columns:
@@ -14542,8 +14563,15 @@ def normalize_menu_category_df(df):
             work[col] = ""
     work = work[columns].copy()
     work["表示"] = work["表示"].map(lambda x: str(x).lower() in ["true", "1", "yes", "有", "表示", "on"] if not isinstance(x, bool) else x)
-    work["カテゴリ"] = work["カテゴリ"].map(lambda x: clean_text(x, "その他"))
-    work["メニュー"] = work["メニュー"].map(lambda x: clean_text(x))
+    work["メニュー"] = work["メニュー"].map(lambda x: canonical_menu_key(clean_text(x)))
+    work["カテゴリ"] = work.apply(
+        lambda row: canonical_menu_category(
+            clean_text(row.get("カテゴリ"), "その他"),
+            clean_text(row.get("メニュー")),
+            role=role,
+        ),
+        axis=1,
+    )
     work["並び順"] = pd.to_numeric(work["並び順"], errors="coerce").fillna(9999)
     work["備考"] = work["備考"].map(lambda x: clean_text(x))
     work = work[work["メニュー"] != ""].copy()
@@ -14574,11 +14602,18 @@ def load_menu_category_settings(role="admin"):
     if not isinstance(settings_all, dict):
         settings_all = {}
 
-    rows = settings_all.get(role, [])
+    rows = valid_saved_menu_rows(settings_all.get(role, []))
     if rows:
-        df = normalize_menu_category_df(pd.DataFrame(rows))
+        try:
+            df = normalize_menu_category_df(pd.DataFrame(rows), role=role)
+        except Exception:
+            df = standard_df.copy()
     else:
         df = standard_df.copy()
+
+    # 壊れた設定や手入力された未知の画面名は採用せず、実在する標準画面だけに戻す。
+    valid_menu_names = set(standard_df["メニュー"].astype(str).tolist())
+    df = df[df["メニュー"].astype(str).isin(valid_menu_names)].copy()
 
     # 新機能追加時に自己設定へ自動追記する。既存のカテゴリ変更は維持する。
     existing_menus = set(df["メニュー"].astype(str).tolist())
@@ -14596,14 +14631,20 @@ def load_menu_category_settings(role="admin"):
                     df = pd.concat([df, add], ignore_index=True)
                 df.loc[df["メニュー"] == required_menu, "表示"] = True
 
-    return normalize_menu_category_df(df)
+    normalized = normalize_menu_category_df(df, role=role)
+    return normalized if not normalized.empty else standard_df.copy()
 
 
 def save_menu_category_settings(df, role="admin"):
     """メニューカテゴリ自己設定をSQLiteへ保存する。"""
     ensure_dirs()
     role = "admin" if role == "admin" else "staff"
-    clean_df = normalize_menu_category_df(df)
+    clean_df = normalize_menu_category_df(df, role=role)
+    standard_df = get_standard_menu_category_df(role)
+    valid_menu_names = set(standard_df["メニュー"].astype(str).tolist())
+    clean_df = clean_df[clean_df["メニュー"].astype(str).isin(valid_menu_names)].copy()
+    if clean_df.empty:
+        clean_df = standard_df.copy()
     if role == "admin":
         for required_menu in ["メニューカテゴリ設定", "システム設定"]:
             if required_menu in clean_df["メニュー"].tolist():
@@ -14990,7 +15031,23 @@ all_users = active_users
 diagnostic_log("HOME", "after loading active residents", rows=len(active_users))
 
 menu = render_sidebar_menu(st.session_state.role, APP_VERSION, APP_COPY)
-diagnostic_log("HOME", "initial screen selected", screen=menu)
+if not menu:
+    st.stop()
+menu = canonical_menu_key(menu)
+if not guard_selected_menu(menu):
+    st.stop()
+
+# 新しい入口は既存画面へ安全に案内し、保存・DB処理は従来の分岐をそのまま使う。
+selected_menu_entry = menu
+previous_menu_entry = st.session_state.get("resolved_menu_entry", "")
+if selected_menu_entry == "未入力・注意記録":
+    if previous_menu_entry != selected_menu_entry:
+        st.session_state["past_data_mode"] = "入力状況"
+    menu = "過去データ管理"
+elif selected_menu_entry in {"バックアップ管理", "監査ログ"}:
+    menu = "セキュリティ・保守管理"
+st.session_state["resolved_menu_entry"] = selected_menu_entry
+diagnostic_log("HOME", "initial screen selected", screen=selected_menu_entry, resolved_screen=menu)
 
 
 # =========================
@@ -16494,7 +16551,7 @@ elif menu == "記録の確認":
 # 過去データ管理
 # =========================
 elif menu == "過去データ管理":
-    st.header("過去データ管理")
+    st.header("未入力・注意記録" if selected_menu_entry == "未入力・注意記録" else "健康記録の確認・修正")
     st.caption("健康チェックだけでなく、入力状況・注意記録・業務全体申し送りを切り替えて確認できます。")
 
     data_mode = st.selectbox(
@@ -16920,7 +16977,7 @@ elif menu == "排泄詳細管理":
         st.error("この画面は管理者専用です。")
         st.stop()
 
-    st.header("排泄詳細管理")
+    st.header("排泄記録の確認・修正")
     st.caption("排泄チェックデータを、記録日＋利用者名＋時間帯で管理します。")
 
     ex_df = load_excretion_data()
@@ -17181,7 +17238,7 @@ elif menu == "管理者支援":
         st.error("この画面は管理者専用です。")
         st.stop()
 
-    st.header("管理者支援")
+    st.header("分析・確認支援")
     health_df = load_health_data()
     ex_df = load_excretion_data()
 
