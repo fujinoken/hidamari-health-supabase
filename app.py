@@ -36,6 +36,14 @@ from hidamari.auth.password import (
     verify_password,
 )
 from hidamari.auth.permissions import is_admin_identity
+from hidamari.dashboard_settings import (
+    DASHBOARD_SETTINGS_TABLE,
+    SQLiteDashboardSettingsStore,
+    decode_dashboard_settings,
+    encode_dashboard_settings,
+    normalize_dashboard_items,
+    normalize_dashboard_user_id,
+)
 from hidamari.config.columns import (
     ACCOUNT_COLUMNS,
     ALERT_CONDITION_COLUMNS,
@@ -1205,6 +1213,13 @@ create table if not exists public.monitoring_drafts (
   record_key text primary key,
   data jsonb not null default '{}'::jsonb,
   updated_at timestamptz default now()
+);
+
+create table if not exists public.dashboard_user_settings (
+  user_id text primary key,
+  settings_json jsonb not null default '{"schema_version":1,"enabled_items":[]}'::jsonb,
+  created_at timestamptz not null default now(),
+  updated_at timestamptz not null default now()
 );
 """.strip()
 
@@ -14427,6 +14442,14 @@ def clear_login_session():
     st.session_state.login_user_info = {}
     st.session_state.force_password_change = False
     st.session_state.pop("hidamari_login_message", None)
+    st.session_state.pop("dashboard_enabled_items", None)
+    for key in list(st.session_state.keys()):
+        if (
+            str(key).startswith("dashboard_enabled_items::")
+            or str(key).startswith("dashboard_supabase_read_warning::")
+            or str(key).startswith("dashboard_setting::")
+        ):
+            st.session_state.pop(key, None)
 
 
 def render_keep_alive_widget(interval_seconds: int = 240, show_status: bool = False):
@@ -15441,48 +15464,186 @@ DEFAULT_DASHBOARD_ITEMS = [
     "最新体重・未測定確認",
 ]
 
-def load_dashboard_settings(username=None):
-    ensure_dirs()
-    username = username or current_login_user()
-    if "dashboard_enabled_items" in st.session_state:
-        return set([x for x in st.session_state["dashboard_enabled_items"] if x in DASHBOARD_ITEMS])
+def _dashboard_local_store():
+    return SQLiteDashboardSettingsStore(HIDAMARI_DB_FILE, DASHBOARD_ITEMS.keys(), DEFAULT_DASHBOARD_ITEMS)
 
-    data = get_app_setting("dashboard_settings_all", None)
-    if data is None:
-        data = migrate_json_file_setting_to_db(
+
+def _dashboard_cache_key(user_id):
+    return f"dashboard_enabled_items::{normalize_dashboard_user_id(user_id)}"
+
+
+def _dashboard_widget_key(user_id, item):
+    return f"dashboard_setting::{normalize_dashboard_user_id(user_id)}::{item}"
+
+
+def _load_dashboard_settings_from_supabase(user_id):
+    """Supabase専用テーブルから本人の1行だけを読む。"""
+    if requests is None or not supabase_is_enabled():
+        return None
+    res = requests.get(
+        _supabase_endpoint(DASHBOARD_SETTINGS_TABLE),
+        headers=_supabase_headers(prefer=""),
+        params={"select": "user_id,settings_json", "user_id": f"eq.{user_id}", "limit": "1"},
+        timeout=20,
+    )
+    res.raise_for_status()
+    rows = res.json() or []
+    if not rows:
+        return None
+    return decode_dashboard_settings(rows[0].get("settings_json"), DASHBOARD_ITEMS.keys(), DEFAULT_DASHBOARD_ITEMS)
+
+
+def _upsert_dashboard_settings_to_supabase(user_id, enabled_items):
+    """user_id主キーでINSERTまたはUPDATEする。"""
+    if requests is None or not supabase_is_enabled():
+        return False
+    payload = {
+        "user_id": user_id,
+        "settings_json": json.loads(
+            encode_dashboard_settings(enabled_items, DASHBOARD_ITEMS.keys(), DEFAULT_DASHBOARD_ITEMS)
+        ),
+        "updated_at": now_jst_dt().isoformat(),
+    }
+    res = requests.post(
+        _supabase_endpoint(DASHBOARD_SETTINGS_TABLE, "?on_conflict=user_id"),
+        headers=_supabase_headers(prefer="resolution=merge-duplicates,return=minimal"),
+        json=payload,
+        timeout=20,
+    )
+    res.raise_for_status()
+    return True
+
+
+def _cache_dashboard_settings(user_id, enabled_items):
+    clean_items = normalize_dashboard_items(enabled_items, DASHBOARD_ITEMS.keys(), DEFAULT_DASHBOARD_ITEMS)
+    st.session_state[_dashboard_cache_key(user_id)] = clean_items
+    # 旧版の利用者共通キャッシュが残っていても参照しない。
+    st.session_state.pop("dashboard_enabled_items", None)
+    return clean_items
+
+
+def _legacy_dashboard_items_for_user(data, user_id):
+    """旧保存値は、正規化後も本人と一致するキーだけを移行する。"""
+    if not isinstance(data, dict):
+        return None
+    for legacy_user_id, items in data.items():
+        if normalize_dashboard_user_id(legacy_user_id) == user_id:
+            return items
+    return None
+
+
+def load_dashboard_settings(username=None, force_reload=False):
+    """本人の設定をDBから読み、接続障害・不正値ではSQLiteまたは標準値へ戻す。"""
+    ensure_dirs()
+    user_id = normalize_dashboard_user_id(username or current_login_user())
+    cache_key = _dashboard_cache_key(user_id)
+    if not force_reload and cache_key in st.session_state:
+        return set(normalize_dashboard_items(
+            st.session_state[cache_key], DASHBOARD_ITEMS.keys(), DEFAULT_DASHBOARD_ITEMS
+        ))
+
+    local_items = None
+    try:
+        local_items = _dashboard_local_store().load(user_id)
+    except Exception:
+        local_items = None
+
+    if supabase_is_enabled():
+        try:
+            remote_items = _load_dashboard_settings_from_supabase(user_id)
+            if remote_items is not None:
+                try:
+                    _dashboard_local_store().upsert(user_id, remote_items)
+                except Exception:
+                    pass
+                return set(_cache_dashboard_settings(user_id, remote_items))
+            if local_items is not None:
+                # 既存SQLite保存値をSupabaseへ初回移行する。
+                try:
+                    _upsert_dashboard_settings_to_supabase(user_id, local_items)
+                except Exception:
+                    pass
+                return set(_cache_dashboard_settings(user_id, local_items))
+        except Exception as e:
+            warning_key = f"dashboard_supabase_read_warning::{user_id}"
+            if not st.session_state.get(warning_key):
+                st.warning("ダッシュボード設定を外部DBから読み込めませんでした。安全な設定で表示します。")
+                st.session_state[warning_key] = str(e)
+            if local_items is not None:
+                return set(_cache_dashboard_settings(user_id, local_items))
+    elif local_items is not None:
+        return set(_cache_dashboard_settings(user_id, local_items))
+
+    legacy = get_app_setting("dashboard_settings_all", None)
+    if legacy is None:
+        legacy = migrate_json_file_setting_to_db(
             "dashboard_settings_all",
             DASHBOARD_SETTINGS_FILE,
             category="ダッシュボード設定",
             default={},
         )
-    if not isinstance(data, dict):
-        data = {}
+    legacy_items = _legacy_dashboard_items_for_user(legacy, user_id)
+    if legacy_items is not None:
+        clean_legacy_items = normalize_dashboard_items(
+            legacy_items, DASHBOARD_ITEMS.keys(), DEFAULT_DASHBOARD_ITEMS
+        )
+        result = save_dashboard_settings(user_id, clean_legacy_items)
+        if result.get("local_ok") or result.get("remote_ok"):
+            return set(_cache_dashboard_settings(user_id, clean_legacy_items))
 
-    items = data.get(username)
-    if items is None:
-        # kanriで保存したものを他キーでも拾えるようにする
-        items = data.get("kanri", DEFAULT_DASHBOARD_ITEMS)
+    # 未保存利用者、DB接続失敗、不正な旧データでは標準設定を表示する。
+    return set(_cache_dashboard_settings(user_id, DEFAULT_DASHBOARD_ITEMS))
 
-    return set([x for x in items if x in DASHBOARD_ITEMS])
 
 def save_dashboard_settings(username, enabled_items):
+    """本人の設定をuser_id一意キーでUPSERTし、保存結果を返す。"""
     ensure_dirs()
-    data = get_app_setting("dashboard_settings_all", {})
-    if not isinstance(data, dict):
-        data = {}
+    user_id = normalize_dashboard_user_id(username)
+    clean_items = normalize_dashboard_items(enabled_items, DASHBOARD_ITEMS.keys(), DEFAULT_DASHBOARD_ITEMS)
+    if not user_id:
+        return {
+            "ok": False,
+            "remote_ok": False,
+            "local_ok": False,
+            "items": clean_items,
+            "message": "ログイン利用者を確認できないため保存できませんでした。",
+        }
 
-    # ログインキーの揺れで反映されないのを防ぐため、管理者はkanriにも保存
-    clean_items = [x for x in enabled_items if x in DASHBOARD_ITEMS]
-    data[username] = clean_items
-    if username == "kanri" or is_admin_user():
-        data["kanri"] = clean_items
+    local_ok = False
+    remote_ok = False
+    remote_error = ""
+    try:
+        _dashboard_local_store().upsert(user_id, clean_items)
+        local_ok = True
+    except Exception:
+        local_ok = False
 
-    set_app_setting(
-        "dashboard_settings_all",
-        data,
-        category="ダッシュボード設定",
-        description="自分専用ダッシュボードの表示項目設定",
-    )
+    if supabase_is_enabled():
+        try:
+            remote_ok = _upsert_dashboard_settings_to_supabase(user_id, clean_items)
+        except Exception as e:
+            remote_error = str(e)
+            remote_ok = False
+
+    # Supabase有効時は端末横断保存が成功した場合だけ成功扱いにする。
+    ok = remote_ok if supabase_is_enabled() else local_ok
+    if local_ok or remote_ok:
+        _cache_dashboard_settings(user_id, clean_items)
+
+    if ok:
+        message = "設定を保存しました。"
+    elif local_ok and supabase_is_enabled():
+        message = "外部DBへの保存に失敗しました。SQLiteには一時保存しましたが、別端末には反映されません。"
+    else:
+        message = "設定を保存できませんでした。標準設定で安全に表示します。"
+    return {
+        "ok": ok,
+        "remote_ok": remote_ok,
+        "local_ok": local_ok,
+        "items": clean_items,
+        "message": message,
+        "error": remote_error,
+    }
 
 
 def show_custom_dashboard_page():
@@ -15504,6 +15665,13 @@ def show_custom_dashboard_settings():
     st.header("自分専用ダッシュボード設定")
     st.caption("管理者ダッシュボードに表示する項目を選べます。保存後、管理者ダッシュボードへ戻ると反映されます。")
 
+    notice = st.session_state.pop("dashboard_settings_notice", None)
+    if isinstance(notice, dict):
+        if notice.get("ok"):
+            st.success(notice.get("message", "設定を保存しました。"))
+        else:
+            st.error(notice.get("message", "設定を保存できませんでした。"))
+
     username = current_login_user()
     current = load_dashboard_settings(username)
 
@@ -15514,7 +15682,7 @@ def show_custom_dashboard_settings():
             item,
             value=item in current,
             help=desc,
-            key=f"dashboard_setting_{item}"
+            key=_dashboard_widget_key(username, item),
         )
         if checked:
             enabled_items.append(item)
@@ -15523,16 +15691,24 @@ def show_custom_dashboard_settings():
 
     with c1:
         if st.button("自分設定を保存", type="primary", use_container_width=True):
-            save_dashboard_settings(username, enabled_items)
-            st.session_state["dashboard_settings_saved"] = True
-            st.session_state["dashboard_enabled_items"] = enabled_items
-            st.success("設定を保存しました。管理者ダッシュボードに戻ると反映されます。")
-            st.rerun()
+            result = save_dashboard_settings(username, enabled_items)
+            if result.get("local_ok") or result.get("remote_ok"):
+                st.session_state["dashboard_settings_notice"] = result
+                st.session_state["dashboard_settings_saved"] = True
+                st.rerun()
+            else:
+                st.error(result.get("message"))
 
     with c2:
         if st.button("標準設定に戻す", use_container_width=True):
-            save_dashboard_settings(username, DEFAULT_DASHBOARD_ITEMS)
-            st.success("標準設定に戻しました。")
+            result = save_dashboard_settings(username, DEFAULT_DASHBOARD_ITEMS)
+            # DB障害時にも画面上は直ちに標準設定へ安全に戻す。
+            _cache_dashboard_settings(username, DEFAULT_DASHBOARD_ITEMS)
+            for item in DASHBOARD_ITEMS:
+                st.session_state.pop(_dashboard_widget_key(username, item), None)
+            if result.get("ok"):
+                result["message"] = "標準設定に戻しました。"
+            st.session_state["dashboard_settings_notice"] = result
             st.rerun()
 
     st.divider()
