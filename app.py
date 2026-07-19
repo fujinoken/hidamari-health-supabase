@@ -44,6 +44,16 @@ from hidamari.dashboard_settings import (
     normalize_dashboard_items,
     normalize_dashboard_user_id,
 )
+from hidamari.menu_settings import (
+    MENU_SETTINGS_TABLE,
+    SQLiteMenuRoleSettingsStore,
+    decode_menu_settings,
+    encode_menu_settings,
+    get_legacy_role_rows,
+    menu_settings_cache_key,
+    normalize_menu_scope,
+    normalize_menu_setting_rows,
+)
 from hidamari.config.columns import (
     ACCOUNT_COLUMNS,
     ALERT_CONDITION_COLUMNS,
@@ -738,6 +748,40 @@ def _supabase_endpoint(table_name: str, query: str = ""):
     return f"{cfg['url']}/rest/v1/{table_name}" + query
 
 
+def _load_json_setting_from_supabase(table_name, json_column, filters):
+    """JSON設定テーブルから、指定キーに一致する1行だけを読む。"""
+    if requests is None or not supabase_is_enabled():
+        return None
+    safe_filters = {str(key): str(value) for key, value in (filters or {}).items() if str(key) and str(value)}
+    select_columns = list(safe_filters.keys()) + [str(json_column)]
+    params = {"select": ",".join(select_columns), "limit": "1"}
+    params.update({key: f"eq.{value}" for key, value in safe_filters.items()})
+    res = requests.get(
+        _supabase_endpoint(table_name),
+        headers=_supabase_headers(prefer=""),
+        params=params,
+        timeout=20,
+    )
+    res.raise_for_status()
+    rows = res.json() or []
+    return rows[0].get(json_column) if rows else None
+
+
+def _upsert_json_setting_to_supabase(table_name, payload, conflict_columns):
+    """JSON設定を指定した一意キーでUPSERTする。"""
+    if requests is None or not supabase_is_enabled():
+        return False
+    conflict = ",".join(str(column) for column in conflict_columns if str(column))
+    res = requests.post(
+        _supabase_endpoint(table_name, f"?on_conflict={conflict}"),
+        headers=_supabase_headers(prefer="resolution=merge-duplicates,return=minimal"),
+        json=payload,
+        timeout=20,
+    )
+    res.raise_for_status()
+    return True
+
+
 def _make_supabase_record_key(row: dict, table_name: str, unique_cols=None):
     cols = unique_cols or SUPABASE_CORE_TABLES.get(table_name, [])
 
@@ -1218,6 +1262,14 @@ create table if not exists public.monitoring_drafts (
 create table if not exists public.dashboard_user_settings (
   user_id text primary key,
   settings_json jsonb not null default '{"schema_version":1,"enabled_items":[]}'::jsonb,
+  created_at timestamptz not null default now(),
+  updated_at timestamptz not null default now()
+);
+
+create table if not exists public.menu_role_settings (
+  menu_scope text primary key check (menu_scope in ('admin', 'staff')),
+  settings_json jsonb not null default '{"schema_version":1,"rows":[]}'::jsonb,
+  updated_by text,
   created_at timestamptz not null default now(),
   updated_at timestamptz not null default now()
 );
@@ -1743,18 +1795,6 @@ def get_all_app_settings_df():
 def initialize_default_app_settings():
     """商品化前提の標準設定をSQLiteへ初期投入する。既存設定は維持する。"""
     ensure_app_settings_table()
-
-    # メニューカテゴリ設定：旧JSONがあれば初回移行
-    try:
-        if "MENU_CATEGORY_SETTINGS_FILE" in globals():
-            migrate_json_file_setting_to_db(
-                "menu_category_settings_all",
-                MENU_CATEGORY_SETTINGS_FILE,
-                category="メニュー設定",
-                default={},
-            )
-    except Exception:
-        pass
 
     # 自分専用ダッシュボード設定：旧JSONがあれば初回移行
     try:
@@ -14448,6 +14488,11 @@ def clear_login_session():
             str(key).startswith("dashboard_enabled_items::")
             or str(key).startswith("dashboard_supabase_read_warning::")
             or str(key).startswith("dashboard_setting::")
+            or str(key).startswith("menu_role_settings::")
+            or str(key).startswith("menu_supabase_read_warning::")
+            or str(key) == "menu_settings_notice"
+            or str(key).startswith("menu_category_")
+            or str(key).startswith("main_menu_")
         ):
             st.session_state.pop(key, None)
 
@@ -14624,95 +14669,227 @@ def normalize_menu_category_df(df, role="admin"):
     return work.sort_values(["カテゴリ", "並び順", "メニュー"]).reset_index(drop=True)
 
 
-def load_menu_category_settings(role="admin"):
-    """管理者が編集したメニューカテゴリ設定をSQLiteから読み込む。なければ標準設定を使う。"""
+def _menu_required_keys(role):
+    return ("メニューカテゴリ設定", "システム設定") if role == "admin" else ()
+
+
+def _menu_df_to_setting_rows(df, role="admin"):
+    clean_df = normalize_menu_category_df(df, role=role)
+    return [
+        {
+            "menu_key": canonical_menu_key(row.get("メニュー")),
+            "visible": bool(row.get("表示")),
+            "category": clean_text(row.get("カテゴリ"), "その他"),
+            "sort_order": row.get("並び順", 9999),
+            "note": clean_text(row.get("備考")),
+        }
+        for _, row in clean_df.iterrows()
+    ]
+
+
+def _menu_setting_rows_to_df(rows, role="admin"):
+    data = [
+        {
+            "表示": row.get("visible", True),
+            "カテゴリ": row.get("category", "その他"),
+            "メニュー": canonical_menu_key(row.get("menu_key")),
+            "並び順": row.get("sort_order", 9999),
+            "備考": row.get("note", ""),
+        }
+        for row in rows or []
+        if isinstance(row, dict)
+    ]
+    return normalize_menu_category_df(pd.DataFrame(data), role=role)
+
+
+def _menu_standard_setting_rows(role):
+    return _menu_df_to_setting_rows(get_standard_menu_category_df(role), role=role)
+
+
+def _menu_local_store():
+    return SQLiteMenuRoleSettingsStore(HIDAMARI_DB_FILE)
+
+
+def _menu_settings_cache_key(menu_scope):
+    return menu_settings_cache_key(menu_scope)
+
+
+def _cache_menu_settings(menu_scope, rows, standard_rows):
+    clean_rows = normalize_menu_setting_rows(rows, standard_rows, _menu_required_keys(menu_scope))
+    st.session_state[_menu_settings_cache_key(menu_scope)] = clean_rows
+    return clean_rows
+
+
+def _load_menu_settings_from_supabase(menu_scope, standard_rows):
+    raw = _load_json_setting_from_supabase(
+        MENU_SETTINGS_TABLE,
+        "settings_json",
+        {"menu_scope": menu_scope},
+    )
+    if raw is None:
+        return None
+    return decode_menu_settings(raw, standard_rows, _menu_required_keys(menu_scope))
+
+
+def _upsert_menu_settings_to_supabase(menu_scope, updated_by, rows, standard_rows):
+    payload = {
+        "menu_scope": menu_scope,
+        "settings_json": json.loads(encode_menu_settings(rows, standard_rows, _menu_required_keys(menu_scope))),
+        "updated_by": normalize_dashboard_user_id(updated_by) or None,
+        "updated_at": now_jst_dt().isoformat(),
+    }
+    return _upsert_json_setting_to_supabase(
+        MENU_SETTINGS_TABLE,
+        payload,
+        ("menu_scope",),
+    )
+
+
+def load_menu_category_settings(role="admin", force_reload=False):
+    """ロール共通設定をSupabase、SQLite、旧共通設定、標準値の順に読む。"""
     ensure_dirs()
-    role = "admin" if role == "admin" else "staff"
-    standard_df = get_standard_menu_category_df(role)
+    menu_scope = normalize_menu_scope(role)
+    standard_df = get_standard_menu_category_df(menu_scope)
+    standard_rows = _menu_standard_setting_rows(menu_scope)
+    cache_key = _menu_settings_cache_key(menu_scope)
+    if not force_reload and cache_key in st.session_state:
+        return _menu_setting_rows_to_df(st.session_state[cache_key], role=menu_scope)
+
+    local_rows = None
+    try:
+        local_rows = _menu_local_store().load(menu_scope, standard_rows, _menu_required_keys(menu_scope))
+    except Exception:
+        local_rows = None
+
+    if supabase_is_enabled():
+        try:
+            remote_rows = _load_menu_settings_from_supabase(menu_scope, standard_rows)
+            if remote_rows is not None:
+                try:
+                    _menu_local_store().upsert(
+                        menu_scope, "", remote_rows, standard_rows, _menu_required_keys(menu_scope)
+                    )
+                except Exception:
+                    pass
+                cached = _cache_menu_settings(menu_scope, remote_rows, standard_rows)
+                return _menu_setting_rows_to_df(cached, role=menu_scope)
+            if local_rows is not None:
+                cached = _cache_menu_settings(menu_scope, local_rows, standard_rows)
+                return _menu_setting_rows_to_df(cached, role=menu_scope)
+        except Exception as e:
+            warning_key = f"menu_supabase_read_warning::{menu_scope}"
+            if not st.session_state.get(warning_key):
+                st.warning("メニュー設定を外部DBから読み込めませんでした。安全な設定で表示します。")
+                st.session_state[warning_key] = str(e)
+            if local_rows is not None:
+                cached = _cache_menu_settings(menu_scope, local_rows, standard_rows)
+                return _menu_setting_rows_to_df(cached, role=menu_scope)
+    elif local_rows is not None:
+        cached = _cache_menu_settings(menu_scope, local_rows, standard_rows)
+        return _menu_setting_rows_to_df(cached, role=menu_scope)
 
     settings_all = get_app_setting("menu_category_settings_all", None)
     if settings_all is None:
-        settings_all = migrate_json_file_setting_to_db(
-            "menu_category_settings_all",
-            MENU_CATEGORY_SETTINGS_FILE,
-            category="メニュー設定",
-            default={},
-        )
-    if not isinstance(settings_all, dict):
-        settings_all = {}
-
-    rows = valid_saved_menu_rows(settings_all.get(role, []))
-    if rows:
         try:
-            df = normalize_menu_category_df(pd.DataFrame(rows), role=role)
+            legacy_path = Path(MENU_CATEGORY_SETTINGS_FILE)
+            settings_all = json.loads(legacy_path.read_text(encoding="utf-8")) if legacy_path.exists() else {}
         except Exception:
-            df = standard_df.copy()
-    else:
-        df = standard_df.copy()
+            settings_all = {}
+    legacy_rows = valid_saved_menu_rows(get_legacy_role_rows(settings_all, menu_scope))
+    if legacy_rows:
+        legacy_df = normalize_menu_category_df(pd.DataFrame(legacy_rows), role=menu_scope)
+        legacy_clean = normalize_menu_setting_rows(
+            _menu_df_to_setting_rows(legacy_df, role=menu_scope),
+            standard_rows,
+            _menu_required_keys(menu_scope),
+        )
+        cached = _cache_menu_settings(menu_scope, legacy_clean, standard_rows)
+        return _menu_setting_rows_to_df(cached, role=menu_scope)
 
-    # 壊れた設定や手入力された未知の画面名は採用せず、実在する標準画面だけに戻す。
-    valid_menu_names = set(standard_df["メニュー"].astype(str).tolist())
-    df = df[df["メニュー"].astype(str).isin(valid_menu_names)].copy()
-
-    # 新機能追加時に自己設定へ自動追記する。既存のカテゴリ変更は維持する。
-    existing_menus = set(df["メニュー"].astype(str).tolist())
-    missing = standard_df[~standard_df["メニュー"].astype(str).isin(existing_menus)]
-    if not missing.empty:
-        df = pd.concat([df, missing], ignore_index=True)
-
-    # 管理者が設定画面を非表示にしても復帰できるよう、必ず表示する。
-    required_admin_menus = ["メニューカテゴリ設定", "システム設定"]
-    if role == "admin":
-        for required_menu in required_admin_menus:
-            if required_menu in standard_df["メニュー"].tolist():
-                if required_menu not in df["メニュー"].tolist():
-                    add = standard_df[standard_df["メニュー"] == required_menu]
-                    df = pd.concat([df, add], ignore_index=True)
-                df.loc[df["メニュー"] == required_menu, "表示"] = True
-
-    normalized = normalize_menu_category_df(df, role=role)
-    return normalized if not normalized.empty else standard_df.copy()
+    standard_cached = _cache_menu_settings(menu_scope, standard_rows, standard_rows)
+    standard_result = _menu_setting_rows_to_df(standard_cached, role=menu_scope)
+    return standard_result if not standard_result.empty else standard_df.copy()
 
 
-def save_menu_category_settings(df, role="admin"):
-    """メニューカテゴリ自己設定をSQLiteへ保存する。"""
+def save_menu_category_settings(df, role="admin", updated_by=None):
+    """ロール共通設定をSQLiteへミラーし、SupabaseへUPSERTする。"""
     ensure_dirs()
-    role = "admin" if role == "admin" else "staff"
-    clean_df = normalize_menu_category_df(df, role=role)
-    standard_df = get_standard_menu_category_df(role)
-    valid_menu_names = set(standard_df["メニュー"].astype(str).tolist())
-    clean_df = clean_df[clean_df["メニュー"].astype(str).isin(valid_menu_names)].copy()
-    if clean_df.empty:
-        clean_df = standard_df.copy()
-    if role == "admin":
-        for required_menu in ["メニューカテゴリ設定", "システム設定"]:
-            if required_menu in clean_df["メニュー"].tolist():
-                clean_df.loc[clean_df["メニュー"] == required_menu, "表示"] = True
+    menu_scope = normalize_menu_scope(role)
+    updated_by = normalize_dashboard_user_id(updated_by or current_login_user())
+    standard_rows = _menu_standard_setting_rows(menu_scope)
+    input_rows = _menu_df_to_setting_rows(df, role=menu_scope)
+    clean_rows = normalize_menu_setting_rows(input_rows, standard_rows, _menu_required_keys(menu_scope))
+    if not updated_by:
+        return {
+            "ok": False, "remote_ok": False, "local_ok": False, "rows": clean_rows,
+            "message": "保存操作を行った管理者を確認できないため保存できませんでした。",
+        }
 
-    settings_all = get_app_setting("menu_category_settings_all", {})
-    if not isinstance(settings_all, dict):
-        settings_all = {}
-    settings_all[role] = clean_df.to_dict(orient="records")
-    set_app_setting(
-        "menu_category_settings_all",
-        settings_all,
-        category="メニュー設定",
-        description="管理者・職員のメニューカテゴリ自己設定",
-    )
+    local_ok = False
+    remote_ok = False
+    remote_error = ""
     try:
-        add_audit_log("メニューカテゴリ設定更新", "app_settings", role, "メニューカテゴリ自己設定をSQLiteへ保存")
+        _menu_local_store().upsert(
+            menu_scope, updated_by, clean_rows, standard_rows, _menu_required_keys(menu_scope)
+        )
+        local_ok = True
     except Exception:
-        pass
+        local_ok = False
+
+    if supabase_is_enabled():
+        try:
+            remote_ok = _upsert_menu_settings_to_supabase(menu_scope, updated_by, clean_rows, standard_rows)
+        except Exception as e:
+            remote_error = str(e)
+            remote_ok = False
+
+    ok = remote_ok if supabase_is_enabled() else local_ok
+    if local_ok or remote_ok:
+        _cache_menu_settings(menu_scope, clean_rows, standard_rows)
+        try:
+            add_audit_log(
+                "メニューカテゴリ設定更新",
+                MENU_SETTINGS_TABLE,
+                menu_scope,
+                f"ロール共通設定を保存（更新者：{updated_by}）",
+            )
+        except Exception:
+            pass
+
+    if ok:
+        message = "メニューカテゴリ設定を保存しました。左メニューに反映します。"
+    elif local_ok and supabase_is_enabled():
+        message = "外部DBへの保存に失敗しました。この端末では利用できますが、別端末には反映されません。"
+    else:
+        message = "メニューカテゴリ設定を保存できませんでした。標準設定で安全に表示します。"
+    return {
+        "ok": ok,
+        "remote_ok": remote_ok,
+        "local_ok": local_ok,
+        "rows": clean_rows,
+        "message": message,
+        "error": remote_error,
+    }
 
 
-def reset_menu_category_settings(role="admin"):
-    """自己設定を標準設定に戻す。"""
-    df = get_standard_menu_category_df(role)
-    save_menu_category_settings(df, role=role)
+def reset_menu_category_settings(role="admin", updated_by=None):
+    """ロール共通設定を標準設定でUPSERTする。"""
+    menu_scope = normalize_menu_scope(role)
+    updated_by = normalize_dashboard_user_id(updated_by or current_login_user())
+    standard_df = get_standard_menu_category_df(menu_scope)
+    result = save_menu_category_settings(
+        standard_df,
+        role=menu_scope,
+        updated_by=updated_by,
+    )
+    # DB全面障害時でも、現在の画面とサイドバーは直ちに標準設定へ戻す。
+    standard_rows = _menu_standard_setting_rows(menu_scope)
+    result["rows"] = _cache_menu_settings(menu_scope, standard_rows, standard_rows)
+    return result
 
 
 def build_menu_groups_from_settings(role="admin"):
-    """自己設定からサイドバー用カテゴリ辞書を作る。"""
+    """選択ロールの共通設定からサイドバー用カテゴリ辞書を作る。"""
     df = load_menu_category_settings(role)
     df = df[df["表示"] == True].copy()
     if df.empty:
@@ -14733,18 +14910,32 @@ def build_menu_groups_from_settings(role="admin"):
 
 
 def show_menu_category_settings_menu():
-    """管理者がサイドバーのカテゴリ・表示順・表示有無を自己設定する画面。"""
+    """管理者が管理者・職員それぞれのロール共通メニューを設定する画面。"""
     if not is_admin_user():
         st.warning("このメニューは管理者専用です。")
         return
 
-    ui_section("メニューカテゴリ設定", "標準設定をもとに、管理者自身でサイドバーのカテゴリ名・並び順・表示有無を調整できます。", "🧭")
-    ui_card("使い方", "カテゴリ名を書き換えると、左メニューのカテゴリ分けが変わります。表示チェックを外すとメニューを一時的に隠せます。『メニューカテゴリ設定』は復帰用として常に表示されます。", "", soft=True)
+    ui_section(
+        "メニューカテゴリ設定",
+        "管理者が、管理者メニュー・職員メニューそれぞれのカテゴリー、並び順、表示項目を共通設定として管理できます。保存内容は、選択した区分の利用者全員に反映されます。",
+        "🧭",
+    )
+    ui_card("使い方", "カテゴリ名を書き換えると、選択した区分の全利用者で左メニューのカテゴリ分けが変わります。表示チェックを外すとメニューを非表示にできます。『メニューカテゴリ設定』は復帰用として常に表示されます。", "", soft=True)
+
+    notice = st.session_state.pop("menu_settings_notice", None)
+    if isinstance(notice, dict):
+        if notice.get("ok"):
+            st.success(notice.get("message", "メニューカテゴリ設定を保存しました。"))
+        else:
+            st.error(notice.get("message", "メニューカテゴリ設定を保存できませんでした。"))
 
     role_target = st.radio("設定対象", ["管理者メニュー", "職員メニュー"], horizontal=True, key="menu_category_role_target")
     role_key = "admin" if role_target == "管理者メニュー" else "staff"
+    updated_by = normalize_dashboard_user_id(current_login_user())
+    role_label = "管理者" if role_key == "admin" else "職員"
 
     df = load_menu_category_settings(role_key)
+    editor_key = f"menu_category_editor::{updated_by}::{role_key}"
     edited = st.data_editor(
         df,
         use_container_width=True,
@@ -14757,19 +14948,27 @@ def show_menu_category_settings_menu():
             "並び順": st.column_config.NumberColumn("並び順", step=1, help="小さい数字ほど上に表示されます。"),
             "備考": st.column_config.TextColumn("備考"),
         },
-        key=f"menu_category_editor_{role_key}",
+        key=editor_key,
     )
 
     col1, col2 = st.columns(2)
     with col1:
-        if st.button("自分設定を保存", type="primary", use_container_width=True):
-            save_menu_category_settings(edited, role=role_key)
-            st.success("メニューカテゴリ設定を保存しました。左メニューに反映します。")
-            st.rerun()
+        if st.button(f"{role_label}共通設定を保存", type="primary", use_container_width=True):
+            result = save_menu_category_settings(edited, role=role_key, updated_by=updated_by)
+            if result.get("local_ok") or result.get("remote_ok"):
+                st.session_state.pop(editor_key, None)
+                st.session_state["menu_settings_notice"] = result
+                st.rerun()
+            else:
+                st.error(result.get("message"))
     with col2:
-        if st.button("標準設定に戻す", use_container_width=True):
-            reset_menu_category_settings(role=role_key)
-            st.success("標準設定に戻しました。")
+        st.caption(f"標準設定への復元は、{role_label}全員のメニューに反映されます。")
+        if st.button(f"{role_label}全員を標準設定に戻す", use_container_width=True):
+            result = reset_menu_category_settings(role=role_key, updated_by=updated_by)
+            st.session_state.pop(editor_key, None)
+            if result.get("ok"):
+                result["message"] = f"{role_label}共通メニューを標準設定に戻しました。"
+            st.session_state["menu_settings_notice"] = result
             st.rerun()
 
     st.divider()
@@ -15478,19 +15677,14 @@ def _dashboard_widget_key(user_id, item):
 
 def _load_dashboard_settings_from_supabase(user_id):
     """Supabase専用テーブルから本人の1行だけを読む。"""
-    if requests is None or not supabase_is_enabled():
-        return None
-    res = requests.get(
-        _supabase_endpoint(DASHBOARD_SETTINGS_TABLE),
-        headers=_supabase_headers(prefer=""),
-        params={"select": "user_id,settings_json", "user_id": f"eq.{user_id}", "limit": "1"},
-        timeout=20,
+    raw = _load_json_setting_from_supabase(
+        DASHBOARD_SETTINGS_TABLE,
+        "settings_json",
+        {"user_id": user_id},
     )
-    res.raise_for_status()
-    rows = res.json() or []
-    if not rows:
+    if raw is None:
         return None
-    return decode_dashboard_settings(rows[0].get("settings_json"), DASHBOARD_ITEMS.keys(), DEFAULT_DASHBOARD_ITEMS)
+    return decode_dashboard_settings(raw, DASHBOARD_ITEMS.keys(), DEFAULT_DASHBOARD_ITEMS)
 
 
 def _upsert_dashboard_settings_to_supabase(user_id, enabled_items):
@@ -15504,14 +15698,11 @@ def _upsert_dashboard_settings_to_supabase(user_id, enabled_items):
         ),
         "updated_at": now_jst_dt().isoformat(),
     }
-    res = requests.post(
-        _supabase_endpoint(DASHBOARD_SETTINGS_TABLE, "?on_conflict=user_id"),
-        headers=_supabase_headers(prefer="resolution=merge-duplicates,return=minimal"),
-        json=payload,
-        timeout=20,
+    return _upsert_json_setting_to_supabase(
+        DASHBOARD_SETTINGS_TABLE,
+        payload,
+        ("user_id",),
     )
-    res.raise_for_status()
-    return True
 
 
 def _cache_dashboard_settings(user_id, enabled_items):
