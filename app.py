@@ -14,6 +14,7 @@ import sqlite3
 import re
 import os
 import base64
+import math
 import random
 import shutil
 import threading
@@ -975,7 +976,8 @@ def _supabase_read_table_uncached(table_name: str, columns_tuple=(), date_field:
             params.append((f"data->>{date_field}", f"lt.{exclusive_end}"))
         else:
             params.append((f"data->>{date_field}", f"lte.{end_iso}"))
-    order_value = "updated_at.desc,record_key.asc" if table_name == SQLITE_TABLE_HEALTH else "updated_at.desc"
+    paged_tables = {SQLITE_TABLE_HEALTH, "excretion_records"}
+    order_value = "updated_at.desc,record_key.asc" if table_name in paged_tables else "updated_at.desc"
     params.append(("order", order_value))
     if limit and int(limit) > 0:
         params.append(("limit", str(int(limit))))
@@ -983,7 +985,7 @@ def _supabase_read_table_uncached(table_name: str, columns_tuple=(), date_field:
     rows = []
     page_size = 1000
     offset = 0
-    should_page = table_name == SQLITE_TABLE_HEALTH and not limit
+    should_page = table_name in paged_tables and not limit
     seen_page_signatures = set()
     with perf_timer("supabase_read", f"{table_name} {start_iso or ''}-{end_iso or ''}"):
         while True:
@@ -5738,7 +5740,7 @@ def load_excretion_data(start_date=None, end_date=None, recent_days=None):
         df = attach_user_ids(df)
 
         if not df.empty:
-            df["記録日"] = pd.to_datetime(df["記録日"], errors="coerce")
+            df["記録日"] = _record_datetime_series(df["記録日"])
             for col in ["利用者名", "時間帯", "時間帯目安", "尿量", "尿性状", "便量", "便性状", "排泄メモ", "入力者", "登録日時"]:
                 df[col] = df[col].fillna("").astype(str)
 
@@ -5925,6 +5927,21 @@ def is_present_excretion_value(value, none_words=None):
     return text.lower() not in {str(v).lower() for v in none_words}
 
 
+def _excretion_value_count(value):
+    """量欄を回数へ変換する。通常の量区分は1回、旧数値値はその回数として扱う。"""
+    if not is_present_excretion_value(value):
+        return 0
+    text = str(value).strip().translate(str.maketrans("０１２３４５６７８９．", "0123456789."))
+    try:
+        numeric = float(text)
+        if not math.isfinite(numeric) or numeric <= 0 or not numeric.is_integer():
+            return 0
+        return int(numeric)
+    except Exception:
+        positive_values = {"少", "中", "大", "多", "普", "普通", "あり", "有", "有り", "排尿あり", "排便あり"}
+        return 1 if text in positive_values else 0
+
+
 def is_stool_present_row(row):
     """1行の排泄データから、排便ありかを判定する。
 
@@ -5985,14 +6002,27 @@ def count_stool_records(df):
     """実際に排便ありとみなせる行数を数える。"""
     if df is None or df.empty:
         return 0
-    return int(df.apply(is_stool_present_row, axis=1).sum())
+    total = 0
+    for _, row in df.iterrows():
+        amount = row.get("便量", "")
+        text = str(amount).strip().translate(str.maketrans("０１２３４５６７８９．", "0123456789."))
+        try:
+            numeric = float(text)
+            if math.isfinite(numeric) and numeric > 0 and numeric.is_integer():
+                total += int(numeric)
+                continue
+        except Exception:
+            pass
+        if is_stool_present_row(row):
+            total += 1
+    return int(total)
 
 
 def count_urine_records(df):
     """尿量をもとに、実際に排尿ありとみなせる行数を数える。"""
     if df is None or df.empty or "尿量" not in df.columns:
         return 0
-    return int(df["尿量"].apply(is_present_excretion_value).sum())
+    return int(df["尿量"].map(_excretion_value_count).sum())
 
 
 def summarize_excretion(df):
@@ -6008,6 +6038,10 @@ def summarize_excretion(df):
 
     stool_count = count_stool_records(df)
     urine_count = count_urine_records(df)
+    stool_present_slots = int(df.apply(
+        lambda row: _excretion_value_count(row.get("便量", "")) > 0 or is_stool_present_row(row),
+        axis=1,
+    ).sum())
 
     return {
         "排尿回数": urine_count,
@@ -6015,8 +6049,72 @@ def summarize_excretion(df):
         "濃縮尿": int((df["尿性状"].fillna("") == "濃縮尿").sum()) if "尿性状" in df.columns else 0,
         "下痢便": int((df["便性状"].fillna("") == "下痢便").sum()) if "便性状" in df.columns else 0,
         "水様便": int((df["便性状"].fillna("") == "水様便").sum()) if "便性状" in df.columns else 0,
-        "排便なし枠": int(len(df) - stool_count),
+        "排便なし枠": int(max(len(df) - stool_present_slots, 0)),
     }
+
+
+DAILY_EXCRETION_SUMMARY_COLUMNS = ["記録日", "利用者名", "排尿回数", "排便回数"]
+
+
+def filter_excretion_records_for_period(df, start_date=None, end_date=None, user_name=""):
+    """管理一覧用に日付と利用者を絞る。日付表記は1件ずつ正規化する。"""
+    if df is None or df.empty:
+        return pd.DataFrame(columns=list(df.columns) if isinstance(df, pd.DataFrame) else EXCRETION_COLUMNS)
+    if "記録日" not in df.columns:
+        return df.iloc[0:0].copy()
+
+    work = df.copy()
+    work["記録日"] = _record_datetime_series(work["記録日"])
+    start_dt = _parse_record_datetime(start_date) if start_date not in [None, ""] else pd.NaT
+    end_dt = _parse_record_datetime(end_date) if end_date not in [None, ""] else pd.NaT
+    if not pd.isna(start_dt):
+        work = work[work["記録日"] >= start_dt.normalize()]
+    if not pd.isna(end_dt):
+        work = work[work["記録日"] < end_dt.normalize() + timedelta(days=1)]
+    if user_name:
+        work = work[_record_user_mask(work, user_name, get_user_id_by_name(user_name))]
+    return work
+
+
+def build_daily_excretion_summary(df):
+    """時間帯別の元記録を、利用者ID優先で1日1行に集計する。"""
+    if df is None or df.empty or "記録日" not in df.columns:
+        return pd.DataFrame(columns=DAILY_EXCRETION_SUMMARY_COLUMNS)
+
+    work = df.copy()
+    work["_集計日時"] = _record_datetime_series(work["記録日"])
+    work = work[work["_集計日時"].notna()].copy()
+    if work.empty:
+        return pd.DataFrame(columns=DAILY_EXCRETION_SUMMARY_COLUMNS)
+    work["_集計日"] = work["_集計日時"].dt.date
+
+    group_keys = []
+    for index, row in work.iterrows():
+        user_id = _normalize_user_id(row.get("user_id", ""))
+        user_name = _normalize_user_name(row.get("利用者名", ""))
+        group_keys.append(f"id:{user_id}" if user_id else (f"name:{user_name}" if user_name else f"unknown:{index}"))
+    work["_利用者集計キー"] = group_keys
+
+    rows = []
+    for (record_day, _user_key), group in work.groupby(["_集計日", "_利用者集計キー"], sort=False):
+        names = group.get("利用者名", pd.Series(dtype="object")).map(lambda value: clean_text(value))
+        names = names[names != ""]
+        summary = summarize_excretion(group)
+        rows.append({
+            "記録日": record_day.strftime("%Y-%m-%d"),
+            "利用者名": names.iloc[0] if not names.empty else "",
+            "排尿回数": int(summary["排尿回数"]),
+            "排便回数": int(summary["排便回数"]),
+        })
+
+    result = pd.DataFrame(rows, columns=DAILY_EXCRETION_SUMMARY_COLUMNS)
+    return result.sort_values(["記録日", "利用者名"], ascending=[False, True], kind="stable").reset_index(drop=True)
+
+
+def daily_excretion_summary_csv(summary_df):
+    """画面表示済みの日別集計をExcel互換のBOM付きCSVへ変換する。"""
+    work = summary_df if isinstance(summary_df, pd.DataFrame) else pd.DataFrame(columns=DAILY_EXCRETION_SUMMARY_COLUMNS)
+    return work.to_csv(index=False).encode("utf-8-sig")
 
 
 def build_excretion_text(df):
@@ -17726,15 +17824,12 @@ elif menu == "排泄詳細管理":
     with col3:
         end_date = st.date_input("終了日", value=today_jst(), key="ex_admin_end")
 
-    work = ex_df.copy()
-    work["記録日"] = pd.to_datetime(work["記録日"], errors="coerce")
-    work = work[
-        (work["記録日"].dt.date >= start_date)
-        & (work["記録日"].dt.date <= end_date)
-    ]
-
-    if ex_user != "全員":
-        work = work[work["利用者名"] == ex_user]
+    work = filter_excretion_records_for_period(
+        ex_df,
+        start_date,
+        end_date,
+        "" if ex_user == "全員" else ex_user,
+    )
 
     st.subheader("排泄サマリー")
     if work.empty:
@@ -17768,17 +17863,15 @@ elif menu == "排泄詳細管理":
             st.warning("確認したい排泄記録があります。")
             st.dataframe(alert, use_container_width=True, hide_index=True)
 
-        st.subheader("時系列の排泄詳細")
-        slot_order = {slot: i for i, (slot, _) in enumerate(EXCRETION_SLOTS)}
-        work["_slot_order"] = work["時間帯"].map(slot_order).fillna(99)
-        work = work.sort_values(["記録日", "利用者名", "_slot_order"]).drop(columns=["_slot_order"])
-        st.dataframe(work, use_container_width=True, hide_index=True)
+        st.subheader("日別の排泄集計")
+        daily_summary = build_daily_excretion_summary(work)
+        st.dataframe(daily_summary, use_container_width=True, hide_index=True)
 
-        csv = work.to_csv(index=False).encode("utf-8-sig")
+        csv = daily_excretion_summary_csv(daily_summary)
         st.download_button(
-            "排泄詳細CSVをダウンロード",
+            "日別排泄集計CSVをダウンロード",
             data=csv,
-            file_name="排泄詳細データ.csv",
+            file_name="日別排泄集計.csv",
             mime="text/csv",
         )
 
