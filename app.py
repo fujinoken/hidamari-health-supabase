@@ -299,9 +299,11 @@ def clear_hidamari_read_cache(reason=""):
     targets = []
     if any(key in reason_text for key in ["利用者", "マスタ", "user"]):
         targets.extend(["load_users", "load_active_user_names", "load_user_name_aliases", "_supabase_read_table_cached"])
-    if any(key in reason_text for key in ["健康", "排泄"]):
+    if "健康" in reason_text:
+        targets.append("_supabase_read_health_records_cached")
+    if "排泄" in reason_text:
         targets.append("_supabase_read_table_cached")
-    elif any(key in reason_text for key in ["申し送り", "短期", "目標", "モニタリング", "復元", "Supabase", "保存", "削除"]):
+    elif "健康" not in reason_text and any(key in reason_text for key in ["申し送り", "短期", "目標", "モニタリング", "復元", "Supabase", "保存", "削除"]):
         targets.extend(["_supabase_read_table_cached", "load_short_goal_master"])
     cleared = _clear_cached_functions(dict.fromkeys(targets))
     if cleared:
@@ -912,8 +914,7 @@ def _filter_df_by_date_range(df, date_col, start_date=None, end_date=None):
             work = work[work[date_col].dt.date <= end_dt.date()]
     return work
 
-@cache_safe_master_read(ttl=DEFAULT_QUERY_CACHE_TTL_SEC)
-def _supabase_read_table_cached(table_name: str, columns_tuple=(), date_field: str = "", start_iso: str = "", end_iso: str = "", limit: int = 0) -> pd.DataFrame:
+def _supabase_read_table_uncached(table_name: str, columns_tuple=(), date_field: str = "", start_iso: str = "", end_iso: str = "", limit: int = 0) -> pd.DataFrame:
     # PostgRESTのJSONBフィルタで data->>記録日 / data->>日付 を絞る。
     params = [("select", "record_key,data,updated_at")]
     if date_field and start_iso:
@@ -941,6 +942,22 @@ def _supabase_read_table_cached(table_name: str, columns_tuple=(), date_field: s
     diagnostic_log("DB", "supabase response received", table=table_name, rows=len(rows))
     return _normalize_supabase_df_from_rows(rows, list(columns_tuple))
 
+
+@cache_safe_master_read(ttl=DEFAULT_QUERY_CACHE_TTL_SEC)
+def _supabase_read_table_cached(table_name: str, columns_tuple=(), date_field: str = "", start_iso: str = "", end_iso: str = "", limit: int = 0) -> pd.DataFrame:
+    return _supabase_read_table_uncached(table_name, columns_tuple, date_field, start_iso, end_iso, limit)
+
+
+@cache_safe_master_read(ttl=DEFAULT_QUERY_CACHE_TTL_SEC)
+def _supabase_read_health_records_cached(columns_tuple=(), date_field: str = "", start_iso: str = "", end_iso: str = "", limit: int = 0) -> pd.DataFrame:
+    """健康記録専用キャッシュ。保存後に他テーブルのキャッシュを巻き込まず解除する。"""
+    return _supabase_read_table_uncached(SQLITE_TABLE_HEALTH, columns_tuple, date_field, start_iso, end_iso, limit)
+
+
+def clear_health_record_read_cache():
+    """健康記録の読込キャッシュだけを解除する。"""
+    _clear_cached_functions(["_supabase_read_health_records_cached"])
+
 def supabase_read_table(table_name: str, columns=None, date_field: str = "", start_date=None, end_date=None, limit: int = 0) -> pd.DataFrame:
     if not supabase_is_enabled() or table_name not in SUPABASE_CORE_TABLES:
         df = _original_load_sqlite_table(table_name, columns or [])
@@ -949,7 +966,10 @@ def supabase_read_table(table_name: str, columns=None, date_field: str = "", sta
         columns_tuple = tuple(columns or [])
         start_iso = _date_to_iso(start_date)
         end_iso = _date_to_iso(end_date)
-        df = _supabase_read_table_cached(table_name, columns_tuple, date_field or "", start_iso, end_iso, int(limit or 0))
+        if table_name == SQLITE_TABLE_HEALTH:
+            df = _supabase_read_health_records_cached(columns_tuple, date_field or "", start_iso, end_iso, int(limit or 0))
+        else:
+            df = _supabase_read_table_cached(table_name, columns_tuple, date_field or "", start_iso, end_iso, int(limit or 0))
 
         # Supabase正本化直後の安全措置：
         # Supabase側が空で、SQLiteミラー側に旧データがある場合はSQLiteを返す。
@@ -5405,24 +5425,121 @@ def find_health_index(df, record_date, user_name, user_id=""):
     return matches[0]
 
 
+def _health_record_key_candidates(record):
+    """現行user_idキーを先頭、旧利用者名キーを末尾にした互換候補を返す。"""
+    current_key = _make_supabase_record_key(
+        record,
+        SQLITE_TABLE_HEALTH,
+        unique_cols=["記録日", "user_id"],
+    )
+    legacy_key = _make_supabase_record_key(
+        record,
+        SQLITE_TABLE_HEALTH,
+        unique_cols=["記録日", "利用者名"],
+    )
+    return list(dict.fromkeys(key for key in [current_key, legacy_key] if clean_text(key)))
+
+
+def _find_supabase_health_record_key(record_keys):
+    """全件を読まず、record_key候補だけをSupabaseへ問い合わせる。"""
+    for record_key in record_keys or []:
+        res = requests.get(
+            _supabase_endpoint(SQLITE_TABLE_HEALTH),
+            headers=_supabase_headers(prefer=""),
+            params={"select": "record_key", "record_key": f"eq.{record_key}", "limit": "1"},
+            timeout=20,
+        )
+        res.raise_for_status()
+        rows = res.json() or []
+        if rows:
+            return clean_text(rows[0].get("record_key"))
+    return ""
+
+
+def _upsert_supabase_health_record(record, record_key):
+    """健康記録1行だけを既存のrecord_key主キーでUPSERTする。"""
+    data = {str(col): _sb_json_safe(record.get(col, "")) for col in HEALTH_COLUMNS}
+    payload = [{
+        "record_key": record_key,
+        "data": data,
+        "updated_at": format_now_jst("%Y-%m-%dT%H:%M:%S+09:00"),
+    }]
+    try:
+        response = requests.post(
+            _supabase_endpoint(SQLITE_TABLE_HEALTH, "?on_conflict=record_key"),
+            headers=_supabase_headers(prefer="resolution=merge-duplicates,return=minimal"),
+            json=payload,
+            timeout=30,
+        )
+        response.raise_for_status()
+        return True
+    except Exception as e:
+        try:
+            st.error(f"Supabaseへの健康記録保存に失敗しました。SQLiteは更新していません：{e}")
+        except Exception:
+            pass
+        return False
+
+
 def upsert_health_record(record):
+    record = {col: record.get(col, "") for col in HEALTH_COLUMNS}
     record["user_id"] = ensure_user_id_value(record.get("user_id", ""), record.get("利用者名", ""))
-    df = load_health_data()
-    df = df.astype("object")
-
-    idx = find_health_index(df, record["記録日"], record["利用者名"], record["user_id"])
-
-    if idx is None:
-        new_df = pd.DataFrame([record], columns=HEALTH_COLUMNS).astype("object")
-        df = pd.concat([df, new_df], ignore_index=True)
-        action = "登録"
-    else:
-        for col in HEALTH_COLUMNS:
-            df.at[idx, col] = record.get(col, "")
-        action = "更新"
-
-    if not save_health_data(df):
+    record_keys = _health_record_key_candidates(record)
+    if not record_keys:
         return ""
+
+    sqlite_key = None
+    try:
+        sqlite_key = db_engine.find_sqlite_health_record_key(
+            SQLITE_TABLE_HEALTH,
+            HEALTH_COLUMNS,
+            record_keys,
+            record.get("記録日", ""),
+            record.get("user_id", ""),
+            record.get("利用者名", ""),
+        )
+    except Exception as e:
+        _mark_sqlite_backup_error(e, SQLITE_TABLE_HEALTH)
+        _show_sqlite_backup_warning_once(e, SQLITE_TABLE_HEALTH)
+
+    supabase_key = ""
+    supabase_enabled = supabase_is_enabled()
+    if supabase_enabled:
+        try:
+            supabase_key = _find_supabase_health_record_key(record_keys)
+        except Exception as e:
+            try:
+                st.error(f"健康記録の既存キー確認に失敗したため保存を中止しました：{e}")
+            except Exception:
+                pass
+            return ""
+
+    record_key = supabase_key or sqlite_key or record_keys[0]
+    action = "更新" if (supabase_key or sqlite_key) else "登録"
+
+    if supabase_enabled and not _upsert_supabase_health_record(record, record_key):
+        return ""
+
+    try:
+        db_engine.upsert_sqlite_health_record(
+            record,
+            record_key,
+            SQLITE_TABLE_HEALTH,
+            HEALTH_COLUMNS,
+            date_cols=["記録日"],
+            legacy_record_keys=record_keys,
+        )
+        try:
+            st.session_state["sqlite_backup_available"] = True
+        except Exception:
+            pass
+    except Exception as e:
+        _mark_sqlite_backup_error(e, SQLITE_TABLE_HEALTH)
+        _show_sqlite_backup_warning_once(e, SQLITE_TABLE_HEALTH)
+        if not supabase_enabled:
+            return ""
+
+    clear_health_record_read_cache()
     add_audit_log(action, SQLITE_TABLE_HEALTH, make_date_user_key(record["記録日"], record["利用者名"]), "健康チェックを保存しました")
 
     return action
