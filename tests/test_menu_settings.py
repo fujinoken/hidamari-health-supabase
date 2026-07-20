@@ -149,6 +149,21 @@ class MenuSettingsTests(unittest.TestCase):
         self.assertIn("システム設定", admin_menus)
         self.assertNotIn("メニューカテゴリ設定", staff_menus)
 
+    def test_supabase_sql_creates_seeds_and_grants_role_settings(self):
+        repo_root = Path(__file__).resolve().parents[1]
+        dedicated_sql = (repo_root / "sql" / "menu_role_settings.sql").read_text(encoding="utf-8").lower()
+        primary_sql = (repo_root / "sql" / "supabase_ver45_tables.sql").read_text(encoding="utf-8").lower()
+        for sql_source in (dedicated_sql, primary_sql):
+            self.assertIn("create table if not exists public.menu_role_settings", sql_source)
+            self.assertIn("grant select, insert, update on table public.menu_role_settings", sql_source)
+            self.assertIn("values ('admin'), ('staff')", sql_source)
+
+    def test_supabase_read_failure_is_logged_and_success_clears_warning(self):
+        app_source = (Path(__file__).resolve().parents[1] / "app.py").read_text(encoding="utf-8")
+        self.assertIn('"MENU_SETTINGS",\n                "supabase read failed"', app_source)
+        self.assertIn('st.session_state.pop(f"menu_supabase_read_warning::{menu_scope}", None)', app_source)
+        self.assertIn('"項目": MENU_SETTINGS_TABLE', app_source)
+
 
 if __name__ == "__main__":
     unittest.main()

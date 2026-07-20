@@ -767,6 +767,23 @@ def _load_json_setting_from_supabase(table_name, json_column, filters):
     return rows[0].get(json_column) if rows else None
 
 
+def _supabase_exception_log_fields(error):
+    """requests例外から、認証情報を含まない診断項目だけを取り出す。"""
+    response = getattr(error, "response", None)
+    status_code = getattr(response, "status_code", "") if response is not None else ""
+    response_text = ""
+    if response is not None:
+        try:
+            response_text = str(response.text or "").replace("\r", " ").replace("\n", " ")[:500]
+        except Exception:
+            response_text = ""
+    return {
+        "error_type": type(error).__name__,
+        "http_status": status_code,
+        "response_body": response_text,
+    }
+
+
 def _upsert_json_setting_to_supabase(table_name, payload, conflict_columns):
     """JSON設定を指定した一意キーでUPSERTする。"""
     if requests is None or not supabase_is_enabled():
@@ -1211,6 +1228,17 @@ def get_supabase_diagnostic_rows():
                 })
             except Exception as e:
                 rows.append({"項目": table_name, "状態": "NG", "詳細": str(e)})
+        try:
+            url = _supabase_endpoint(MENU_SETTINGS_TABLE, "?select=menu_scope&limit=1")
+            res = requests.get(url, headers=_supabase_headers(prefer=""), timeout=10)
+            ok = res.status_code in [200, 206]
+            rows.append({
+                "項目": MENU_SETTINGS_TABLE,
+                "状態": "OK" if ok else "NG",
+                "詳細": "接続OK" if ok else f"HTTP {res.status_code} / {res.text[:160]}",
+            })
+        except Exception as e:
+            rows.append({"項目": MENU_SETTINGS_TABLE, "状態": "NG", "詳細": str(e)})
     return pd.DataFrame(rows)
 
 
@@ -1273,6 +1301,13 @@ create table if not exists public.menu_role_settings (
   created_at timestamptz not null default now(),
   updated_at timestamptz not null default now()
 );
+
+grant usage on schema public to anon, authenticated;
+grant select, insert, update on table public.menu_role_settings to anon, authenticated, service_role;
+
+insert into public.menu_role_settings (menu_scope)
+values ('admin'), ('staff')
+on conflict (menu_scope) do nothing;
 """.strip()
 
 
@@ -8253,8 +8288,8 @@ def save_alert_condition_master(df):
             df.at[i, "条件ID"] = cid
         existing_ids.add(cid)
 
-    save_sqlite_table(df, SQLITE_TABLE_ALERT_CONDITIONS, ALERT_CONDITION_COLUMNS, unique_cols=["条件ID"])
-    return df
+    saved = save_sqlite_table(df, SQLITE_TABLE_ALERT_CONDITIONS, ALERT_CONDITION_COLUMNS, unique_cols=["条件ID"])
+    return None if saved is False else df
 
 def parse_keywords(value):
     text = clean_text(value)
@@ -8493,7 +8528,10 @@ def build_business_handover_auto_extract_text(target_date):
     if pd.isna(target):
         return "Excel自動抽出情報：日付を確認できません。"
     target_day = target.date()
-    lines = [f"【Excel自動抽出情報】対象日：{target_day.strftime('%Y-%m-%d')} ／ 条件設定マスタに基づく抽出"]
+    lines = [
+        f"【Excel自動抽出情報】対象日：{target_day.strftime('%Y-%m-%d')} ／ "
+        "管理者が設定した申し送り・注意情報の抽出条件に基づいて表示しています"
+    ]
 
     alert_df = build_handover_alerts_by_condition(target_day)
     if alert_df.empty:
@@ -8522,8 +8560,12 @@ def build_business_handover_auto_extract_text(target_date):
 
 def show_alert_condition_master_menu():
     """管理者が申し送り自動抽出条件を編集する画面。"""
-    st.subheader("異常検知・申し送り条件設定マスタ")
-    st.caption("健康チェック・排泄チェックのExcelデータから、業務全体申し送りに自動表示する条件を設定します。診断ではなく、申し送り候補を拾うための設定です。")
+    st.subheader("申し送り・注意情報の抽出条件")
+    st.caption(
+        "健康チェック・排泄チェックの記録から、申し送り候補や注意情報を抽出する条件を設定します。"
+        "保存内容は、申し送り画面の自動抽出情報、管理者画面の注意記録・注意通知、抽出プレビューに共通で反映されます。"
+        "変更できるのは管理者だけです。"
+    )
 
     if not is_admin_user():
         st.warning("条件設定は管理者専用です。")
@@ -8532,16 +8574,22 @@ def show_alert_condition_master_menu():
     c1, c2, c3 = st.columns([1.1, 1.1, 1])
     with c1:
         if st.button("初期おすすめ条件に戻す", use_container_width=True):
-            save_alert_condition_master(pd.DataFrame(DEFAULT_ALERT_CONDITIONS, columns=ALERT_CONDITION_COLUMNS))
-            st.success("初期おすすめ条件に戻しました。")
-            st.rerun()
+            saved_df = save_alert_condition_master(pd.DataFrame(DEFAULT_ALERT_CONDITIONS, columns=ALERT_CONDITION_COLUMNS))
+            if saved_df is None:
+                st.error("初期おすすめ条件を保存できませんでした。現在の条件は変更されていません。")
+            else:
+                st.success("初期おすすめ条件に戻しました。")
+                st.rerun()
     with c2:
         if st.button("全条件を使用ONにする", use_container_width=True):
             df_on = load_alert_condition_master()
             df_on["使用"] = True
-            save_alert_condition_master(df_on)
-            st.success("全条件を使用ONにしました。")
-            st.rerun()
+            saved_df = save_alert_condition_master(df_on)
+            if saved_df is None:
+                st.error("条件を保存できませんでした。現在の条件は変更されていません。")
+            else:
+                st.success("全条件を使用ONにしました。")
+                st.rerun()
     with c3:
         preview_date = st.date_input("抽出プレビュー日", value=today_jst(), key="alert_condition_preview_date")
 
@@ -8576,16 +8624,19 @@ def show_alert_condition_master_menu():
             },
             key="alert_condition_master_editor",
         )
-        submitted = st.form_submit_button("条件マスタを保存して申し送り表示を更新", type="primary", use_container_width=True)
+        submitted = st.form_submit_button("抽出条件を保存して表示を更新", type="primary", use_container_width=True)
 
     if submitted:
         saved_df = save_alert_condition_master(edited)
-        st.session_state["alert_condition_master_saved_at"] = format_now_jst("%Y-%m-%d %H:%M:%S")
-        st.success(f"条件マスタを保存しました。使用ON：{int(saved_df['使用'].astype(bool).sum())}件。業務全体申し送りの自動抽出に反映されます。")
-        st.rerun()
+        if saved_df is None:
+            st.error("抽出条件を保存できませんでした。申し送り・注意情報には現在の保存済み条件が引き続き使用されます。")
+        else:
+            st.session_state["alert_condition_master_saved_at"] = format_now_jst("%Y-%m-%d %H:%M:%S")
+            st.success(f"抽出条件を保存しました。使用ON：{int(saved_df['使用'].astype(bool).sum())}件。申し送り・注意情報の自動抽出に反映されます。")
+            st.rerun()
 
     st.markdown("#### 抽出プレビュー")
-    st.caption("ここに表示される内容が、業務全体申し送りの『Excel自動抽出情報』に反映される内容です。")
+    st.caption("ここに表示される内容が、申し送り画面の自動抽出情報と管理者画面の注意情報に反映されます。")
     alert_df = build_handover_alerts_by_condition(preview_date)
     if alert_df.empty:
         st.info("この日の条件該当者はありません。使用ONの条件、対象日、健康チェック・排泄チェックの記録を確認してください。")
@@ -8597,9 +8648,18 @@ def show_alert_condition_master_menu():
 def show_business_handover_auto_extract_box(target_date):
     """申し送り画面内にExcel自動抽出情報を表示する。"""
     auto_text = build_business_handover_auto_extract_text(target_date)
-    st.markdown("#### Excel自動抽出情報")
+    st.markdown("#### 自動抽出された申し送り・注意情報")
     st.info(auto_text)
+    show_alert_condition_guidance()
     return auto_text
+
+
+def show_alert_condition_guidance():
+    """抽出条件の管理場所を、権限に応じた文言だけで案内する。"""
+    if is_admin_user():
+        st.caption("抽出条件は、管理者メニューの「マスタ・運用設定」→「申し送り・注意情報の抽出条件」から確認・変更できます。")
+    else:
+        st.caption("この情報の抽出条件は管理者が設定しています。")
 
 
 
@@ -9486,7 +9546,7 @@ def render_business_handover_card(row):
         {clean_text(row.get('全体申し送り'), '記載なし').replace(chr(10), '<br>')}<br><br>
         <b>要確認事項</b><br>
         {clean_text(row.get('要確認事項'), '記載なし').replace(chr(10), '<br>')}<br><br>
-        <b>Excel自動抽出情報</b><br>
+        <b>自動抽出された申し送り・注意情報</b><br>
         <div style="background-color:#eef7ff;border-left:4px solid #5ca8d8;padding:10px;margin-top:6px;">
         {auto_text}
         </div><br>
@@ -9613,8 +9673,9 @@ def show_business_handover_menu():
                 input_excel_display_text = ""
 
             auto_extract_text = build_business_handover_auto_extract_text(record_date)
-            st.markdown("#### 4. 自動抽出情報")
+            st.markdown("#### 4. 自動抽出された申し送り・注意情報")
             st.info(auto_extract_text)
+            show_alert_condition_guidance()
 
             submitted = st.form_submit_button("申し送りを保存する", use_container_width=True)
 
@@ -9867,8 +9928,9 @@ def show_business_handover_menu():
                 update_input_excel_display_text = current_excel_text
 
             update_auto_extract_text = build_business_handover_auto_extract_text(update_date)
-            st.markdown("#### Excel自動抽出情報（更新時に再作成）")
+            st.markdown("#### 申し送り・注意情報の自動抽出（更新時に再作成）")
             st.info(update_auto_extract_text)
+            show_alert_condition_guidance()
 
             update_submitted = st.form_submit_button("この申し送りを更新する", use_container_width=True)
 
@@ -14765,6 +14827,7 @@ def load_menu_category_settings(role="admin", force_reload=False):
         try:
             remote_rows = _load_menu_settings_from_supabase(menu_scope, standard_rows)
             if remote_rows is not None:
+                st.session_state.pop(f"menu_supabase_read_warning::{menu_scope}", None)
                 try:
                     _menu_local_store().upsert(
                         menu_scope, "", remote_rows, standard_rows, _menu_required_keys(menu_scope)
@@ -14774,9 +14837,17 @@ def load_menu_category_settings(role="admin", force_reload=False):
                 cached = _cache_menu_settings(menu_scope, remote_rows, standard_rows)
                 return _menu_setting_rows_to_df(cached, role=menu_scope)
             if local_rows is not None:
+                st.session_state.pop(f"menu_supabase_read_warning::{menu_scope}", None)
                 cached = _cache_menu_settings(menu_scope, local_rows, standard_rows)
                 return _menu_setting_rows_to_df(cached, role=menu_scope)
         except Exception as e:
+            diagnostic_log(
+                "MENU_SETTINGS",
+                "supabase read failed",
+                menu_scope=menu_scope,
+                table=MENU_SETTINGS_TABLE,
+                **_supabase_exception_log_fields(e),
+            )
             warning_key = f"menu_supabase_read_warning::{menu_scope}"
             if not st.session_state.get(warning_key):
                 st.warning("メニュー設定を外部DBから読み込めませんでした。安全な設定で表示します。")
@@ -14846,6 +14917,8 @@ def save_menu_category_settings(df, role="admin", updated_by=None):
     ok = remote_ok if supabase_is_enabled() else local_ok
     if local_ok or remote_ok:
         _cache_menu_settings(menu_scope, clean_rows, standard_rows)
+        if remote_ok:
+            st.session_state.pop(f"menu_supabase_read_warning::{menu_scope}", None)
         try:
             add_audit_log(
                 "メニューカテゴリ設定更新",
@@ -17196,7 +17269,8 @@ elif menu == "過去データ管理":
     # ---------------------------------
     elif data_mode == "注意記録":
         st.subheader("注意記録")
-        st.caption("条件設定マスタに基づいて、健康チェック・排泄チェックから注意候補を抽出します。診断ではなく、申し送り候補の確認です。")
+        st.caption("管理者が設定した申し送り・注意情報の抽出条件に基づいて、健康チェック・排泄チェックから確認候補を表示します。診断ではなく、申し送り候補の確認です。")
+        show_alert_condition_guidance()
 
         target_day = st.date_input("抽出日", value=today_jst(), key="past_alert_date")
         alert_df = build_handover_alerts_by_condition(target_day)
@@ -17634,18 +17708,18 @@ elif menu == "管理者支援":
         st.error("この画面は管理者専用です。")
         st.stop()
 
-    st.header("分析・確認支援")
+    st.header("申し送り・注意情報の抽出条件")
     health_df = load_health_data()
     ex_df = load_excretion_data()
 
-    tab1, tab2, tab3, tab4, tab5, tab6, tab7, tab8 = st.tabs([
+    tab7, tab1, tab2, tab3, tab4, tab5, tab6, tab8 = st.tabs([
+        "申し送り・注意情報の抽出条件",
         "AI家族レポート",
         "バイタル推移グラフ",
         "気になる変化",
         "ChatGPT連携",
         "申し送り支援",
         "注意通知",
-        "条件設定マスタ変更",
         "体重未測定確認",
     ])
 
@@ -17872,15 +17946,14 @@ elif menu == "管理者支援":
         if alert_df.empty:
             st.success("対象日の注意通知はありません。")
         else:
-            st.warning("条件設定マスタに該当する注意通知があります。")
+            st.warning("管理者が設定した抽出条件に該当する注意情報があります。")
             st.dataframe(alert_df, use_container_width=True, hide_index=True)
 
-        st.caption("注意通知は診断ではなく、条件設定マスタと記録に基づく確認支援です。")
+        st.caption("注意通知は診断ではなく、管理者が設定した抽出条件と記録に基づく確認支援です。")
+        show_alert_condition_guidance()
 
 
     with tab7:
-        st.subheader("条件設定マスタ変更")
-        st.caption("未排便・発熱・SpO2低下・食事量低下など、業務全体申し送りや注意通知で使う抽出条件を管理します。")
         show_alert_condition_master_menu()
 
     with tab8:

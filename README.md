@@ -71,6 +71,10 @@ Supabase SQL Editorで以下のSQLを実行します。
 
 - `sql/supabase_ver45_tables.sql`
 
+すでに主要テーブルを作成済みで、ロール共通メニュー設定だけを追加する場合は、次のSQLを実行します。
+
+- `sql/menu_role_settings.sql`
+
 古い3テーブル構成のみが必要な場合は、参考として以下も残しています。
 
 - `sql/supabase_tables.sql`
