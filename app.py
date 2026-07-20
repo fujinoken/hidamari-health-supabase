@@ -874,6 +874,34 @@ def _date_to_iso(value):
     except Exception:
         return ""
 
+
+def _parse_record_datetime(value):
+    """混在する保存形式を1件ずつ解釈し、比較可能な日時へ正規化する。"""
+    try:
+        parsed = pd.to_datetime(value, errors="coerce")
+    except Exception:
+        return pd.NaT
+    if pd.isna(parsed):
+        return pd.NaT
+    if getattr(parsed, "tzinfo", None) is not None:
+        parsed = parsed.tz_localize(None)
+    return parsed
+
+
+def _record_datetime_series(values):
+    """Pandasの一括形式推定に依存せず、日付表記が混在した列を正規化する。"""
+    return pd.to_datetime(values.map(_parse_record_datetime), errors="coerce")
+
+
+def _exclusive_end_date_text(end_text):
+    """終了日の翌日を、入力と同じ区切り文字で返す。"""
+    parsed = _parse_record_datetime(end_text)
+    if pd.isna(parsed):
+        return ""
+    separator = "/" if "/" in str(end_text) else "-"
+    return (parsed + timedelta(days=1)).strftime(f"%Y{separator}%m{separator}%d")
+
+
 def recent_start_date(days=DEFAULT_RECENT_DAYS, base_date=None):
     base = base_date or today_jst()
     try:
@@ -914,6 +942,27 @@ def _filter_df_by_date_range(df, date_col, start_date=None, end_date=None):
             work = work[work[date_col].dt.date <= end_dt.date()]
     return work
 
+
+def _filter_health_df_by_date_range(df, date_col, start_date=None, end_date=None):
+    """健康記録だけに、混在日付の正規化と半開区間判定を適用する。"""
+    if df is None or df.empty or not date_col or date_col not in df.columns:
+        return df
+    start_iso = _date_to_iso(start_date)
+    end_iso = _date_to_iso(end_date)
+    if not start_iso and not end_iso:
+        return df
+    work = df.copy()
+    work[date_col] = _record_datetime_series(work[date_col])
+    if start_iso:
+        start_dt = _parse_record_datetime(start_iso)
+        if not pd.isna(start_dt):
+            work = work[work[date_col] >= start_dt.normalize()]
+    if end_iso:
+        end_dt = _parse_record_datetime(end_iso)
+        if not pd.isna(end_dt):
+            work = work[work[date_col] < end_dt.normalize() + timedelta(days=1)]
+    return work
+
 def _supabase_read_table_uncached(table_name: str, columns_tuple=(), date_field: str = "", start_iso: str = "", end_iso: str = "", limit: int = 0) -> pd.DataFrame:
     # PostgRESTのJSONBフィルタで data->>記録日 / data->>日付 を絞る。
     params = [("select", "record_key,data,updated_at")]
@@ -921,24 +970,54 @@ def _supabase_read_table_uncached(table_name: str, columns_tuple=(), date_field:
         params.append((f"data->>{date_field}", f"gte.{start_iso}"))
     if date_field and end_iso:
         # 保存値が YYYY-MM-DDT00:00:00 でも同日分に含めるため、翌日未満で絞る。
-        end_dt = pd.to_datetime(end_iso, errors="coerce")
-        if not pd.isna(end_dt):
-            params.append((f"data->>{date_field}", f"lt.{(end_dt + timedelta(days=1)).strftime('%Y-%m-%d')}"))
+        exclusive_end = _exclusive_end_date_text(end_iso)
+        if exclusive_end:
+            params.append((f"data->>{date_field}", f"lt.{exclusive_end}"))
         else:
             params.append((f"data->>{date_field}", f"lte.{end_iso}"))
-    params.append(("order", "updated_at.desc"))
+    order_value = "updated_at.desc,record_key.asc" if table_name == SQLITE_TABLE_HEALTH else "updated_at.desc"
+    params.append(("order", order_value))
     if limit and int(limit) > 0:
         params.append(("limit", str(int(limit))))
 
+    rows = []
+    page_size = 1000
+    offset = 0
+    should_page = table_name == SQLITE_TABLE_HEALTH and not limit
+    seen_page_signatures = set()
     with perf_timer("supabase_read", f"{table_name} {start_iso or ''}-{end_iso or ''}"):
-        res = requests.get(
-            _supabase_endpoint(table_name),
-            headers=_supabase_headers(prefer=""),
-            params=params,
-            timeout=20,
-        )
-    res.raise_for_status()
-    rows = res.json() or []
+        while True:
+            headers = _supabase_headers(prefer="")
+            if should_page:
+                headers["Range-Unit"] = "items"
+                headers["Range"] = f"{offset}-{offset + page_size - 1}"
+            res = requests.get(
+                _supabase_endpoint(table_name),
+                headers=headers,
+                params=params,
+                timeout=20,
+            )
+            res.raise_for_status()
+            page_rows = res.json() or []
+            if should_page and page_rows:
+                signature = (
+                    len(page_rows),
+                    page_rows[0].get("record_key"),
+                    page_rows[-1].get("record_key"),
+                )
+                if signature in seen_page_signatures:
+                    diagnostic_log(
+                        "DB",
+                        "supabase pagination stopped because the same page was returned twice",
+                        table=table_name,
+                        offset=offset,
+                    )
+                    break
+                seen_page_signatures.add(signature)
+            rows.extend(page_rows)
+            if not should_page or len(page_rows) < page_size:
+                break
+            offset += page_size
     diagnostic_log("DB", "supabase response received", table=table_name, rows=len(rows))
     return _normalize_supabase_df_from_rows(rows, list(columns_tuple))
 
@@ -951,7 +1030,24 @@ def _supabase_read_table_cached(table_name: str, columns_tuple=(), date_field: s
 @cache_safe_master_read(ttl=DEFAULT_QUERY_CACHE_TTL_SEC)
 def _supabase_read_health_records_cached(columns_tuple=(), date_field: str = "", start_iso: str = "", end_iso: str = "", limit: int = 0) -> pd.DataFrame:
     """健康記録専用キャッシュ。保存後に他テーブルのキャッシュを巻き込まず解除する。"""
-    return _supabase_read_table_uncached(SQLITE_TABLE_HEALTH, columns_tuple, date_field, start_iso, end_iso, limit)
+    primary = _supabase_read_table_uncached(
+        SQLITE_TABLE_HEALTH, columns_tuple, date_field, start_iso, end_iso, limit
+    )
+    if not date_field or not start_iso or not end_iso:
+        return primary
+
+    # JSONB内の日付は文字列比較になる。旧データの YYYY/MM/DD は
+    # YYYY-MM-DD の範囲条件では取得できないため、同じ半開区間を別途問い合わせる。
+    slash_start = start_iso.replace("-", "/")
+    slash_end = end_iso.replace("-", "/")
+    legacy = _supabase_read_table_uncached(
+        SQLITE_TABLE_HEALTH, columns_tuple, date_field, slash_start, slash_end, limit
+    )
+    if primary.empty:
+        return legacy
+    if legacy.empty:
+        return primary
+    return pd.concat([primary, legacy], ignore_index=True)
 
 
 def clear_health_record_read_cache():
@@ -959,9 +1055,10 @@ def clear_health_record_read_cache():
     _clear_cached_functions(["_supabase_read_health_records_cached"])
 
 def supabase_read_table(table_name: str, columns=None, date_field: str = "", start_date=None, end_date=None, limit: int = 0) -> pd.DataFrame:
+    date_filter = _filter_health_df_by_date_range if table_name == SQLITE_TABLE_HEALTH else _filter_df_by_date_range
     if not supabase_is_enabled() or table_name not in SUPABASE_CORE_TABLES:
         df = _original_load_sqlite_table(table_name, columns or [])
-        return _filter_df_by_date_range(df, date_field, start_date, end_date)
+        return date_filter(df, date_field, start_date, end_date)
     try:
         columns_tuple = tuple(columns or [])
         start_iso = _date_to_iso(start_date)
@@ -977,12 +1074,12 @@ def supabase_read_table(table_name: str, columns=None, date_field: str = "", sta
         if df.empty:
             try:
                 local_df = _original_load_sqlite_table(table_name, columns or [])
-                local_df = _filter_df_by_date_range(local_df, date_field, start_date, end_date)
+                local_df = date_filter(local_df, date_field, start_date, end_date)
                 if local_df is not None and not local_df.empty:
                     return local_df
             except Exception:
                 pass
-        return df
+        return date_filter(df, date_field, start_date, end_date)
     except Exception as e:
         try:
             st.warning(f"Supabase読込に失敗しました。SQLite補助DBが使える場合のみ読み込みます：{table_name} / {e}")
@@ -990,7 +1087,7 @@ def supabase_read_table(table_name: str, columns=None, date_field: str = "", sta
             pass
         try:
             df = _original_load_sqlite_table(table_name, columns or [])
-            return _filter_df_by_date_range(df, date_field, start_date, end_date)
+            return date_filter(df, date_field, start_date, end_date)
         except Exception as e2:
             try:
                 _mark_sqlite_backup_error(e2, table_name)
@@ -5324,11 +5421,11 @@ def load_health_data(start_date=None, end_date=None, recent_days=None):
             df = supabase_read_table(SQLITE_TABLE_HEALTH, HEALTH_COLUMNS, date_field="記録日", start_date=start_date, end_date=end_date)
         else:
             df = load_sqlite_table(SQLITE_TABLE_HEALTH, HEALTH_COLUMNS, date_cols=["記録日"])
-            df = _filter_df_by_date_range(df, "記録日", start_date, end_date)
+            df = _filter_health_df_by_date_range(df, "記録日", start_date, end_date)
         df = attach_user_ids(df)
 
         if not df.empty:
-            df["記録日"] = pd.to_datetime(df["記録日"], errors="coerce")
+            df["記録日"] = _record_datetime_series(df["記録日"])
             df["利用者名"] = df["利用者名"].astype(str).str.strip()
 
         return df.astype("object")
@@ -5557,6 +5654,24 @@ def get_month_health_data(df, user_name, year, month):
         & (work["記録日"].dt.year == int(year))
         & (work["記録日"].dt.month == int(month))
     ].sort_values("記録日")
+
+
+def filter_health_records_for_month(df, year, month, user_name=""):
+    """月初以上・翌月初未満で健康記録を絞る。行の重複除去は行わない。"""
+    if df is None or df.empty or "記録日" not in df.columns:
+        return df.copy() if isinstance(df, pd.DataFrame) else pd.DataFrame()
+
+    month_start = date(int(year), int(month), 1)
+    next_month_start = (month_start.replace(day=28) + timedelta(days=4)).replace(day=1)
+    work = df.copy()
+    work["記録日"] = _record_datetime_series(work["記録日"])
+    result = work[
+        (work["記録日"] >= pd.Timestamp(month_start))
+        & (work["記録日"] < pd.Timestamp(next_month_start))
+    ]
+    if user_name:
+        result = result[_record_user_mask(result, user_name, get_user_id_by_name(user_name))]
+    return result.sort_values(["記録日", "利用者名"])
 
 
 # =========================
@@ -17188,6 +17303,7 @@ elif menu == "過去データ管理":
         if health_df.empty:
             # 直近7日より前にだけ記録がある場合も、管理画面自体を利用できるようにする。
             health_df = load_health_data()
+        has_health_records = not health_df.empty
 
         if health_df.empty:
             st.info("まだ健康チェックデータがありません。")
@@ -17294,26 +17410,25 @@ elif menu == "過去データ管理":
             st.divider()
             st.subheader("一覧検索")
 
-            if not health_df.empty:
+            if has_health_records:
                 year = st.number_input("年", min_value=2024, max_value=2035, value=today_jst().year, step=1, key="past_health_year")
                 month = st.number_input("月", min_value=1, max_value=12, value=today_jst().month, step=1, key="past_health_month")
                 user_filter = st.selectbox("利用者で絞り込み", ["全員"] + all_users, key="past_health_filter_user")
                 month_start = date(int(year), int(month), 1)
-                month_end = (month_start.replace(day=28) + timedelta(days=4)).replace(day=1) - timedelta(days=1)
+                next_month_start = (month_start.replace(day=28) + timedelta(days=4)).replace(day=1)
+                month_end = next_month_start - timedelta(days=1)
                 health_df = load_health_data(start_date=month_start, end_date=month_end)
-                health_df["記録日"] = pd.to_datetime(health_df["記録日"], errors="coerce")
+                result = filter_health_records_for_month(
+                    health_df,
+                    int(year),
+                    int(month),
+                    "" if user_filter == "全員" else user_filter,
+                )
 
-                result = health_df[
-                    (health_df["記録日"].dt.year == int(year))
-                    & (health_df["記録日"].dt.month == int(month))
-                ]
-                if user_filter != "全員":
-                    result = result[result["利用者名"] == user_filter]
-
-                st.dataframe(result.sort_values(["記録日", "利用者名"]), use_container_width=True, hide_index=True)
+                st.dataframe(result, use_container_width=True, hide_index=True)
                 st.download_button(
                     "この一覧をExcelでダウンロード",
-                    data=to_excel_download(result.sort_values(["記録日", "利用者名"])),
+                    data=to_excel_download(result),
                     file_name=f"health_records_{int(year)}_{int(month):02d}.xlsx",
                     mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
                     use_container_width=True,
