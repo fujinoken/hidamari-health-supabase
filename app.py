@@ -8493,24 +8493,45 @@ def check_alert_condition(rule, health_df, ex_df, target_day, user_name):
     }
 
 
-def build_handover_alerts_by_condition(target_date):
-    """条件マスタに基づき、健康・排泄Excelから申し送り候補を抽出する。"""
+def _alert_condition_date_range(target_date, rules):
+    """有効な抽出条件が参照する最小限の日付範囲を返す。"""
+    target = pd.to_datetime(target_date, errors="coerce")
+    if pd.isna(target):
+        return None, None
+    max_days = 1
+    try:
+        enabled = rules[rules["使用"].astype(bool)] if isinstance(rules, pd.DataFrame) else pd.DataFrame()
+        if not enabled.empty:
+            max_days = max(int(pd.to_numeric(enabled["日数"], errors="coerce").fillna(1).max()), 1)
+    except Exception:
+        max_days = 1
+    target_day = target.date()
+    # 体重減少は「日数+1」件分の比較を行うため、日数日前から含める。
+    return target_day - timedelta(days=max_days), target_day
+
+
+def build_handover_alerts_by_condition(target_date, health_df=None, ex_df=None, rules=None):
+    """条件マスタに基づき、必要期間の健康・排泄記録から申し送り候補を抽出する。"""
     target = pd.to_datetime(target_date, errors="coerce")
     if pd.isna(target):
         return pd.DataFrame(columns=["利用者名", "重要度", "分類", "条件名", "詳細", "申し送り文"])
     target_day = target.date()
-    try:
-        health_df = load_health_data()
-    except Exception:
-        health_df = pd.DataFrame(columns=HEALTH_COLUMNS)
-    try:
-        ex_df = load_excretion_data()
-    except Exception:
-        ex_df = pd.DataFrame(columns=EXCRETION_COLUMNS)
-    try:
-        rules = load_alert_condition_master()
-    except Exception:
-        rules = pd.DataFrame(DEFAULT_ALERT_CONDITIONS, columns=ALERT_CONDITION_COLUMNS)
+    if rules is None:
+        try:
+            rules = load_alert_condition_master()
+        except Exception:
+            rules = pd.DataFrame(DEFAULT_ALERT_CONDITIONS, columns=ALERT_CONDITION_COLUMNS)
+    start_day, end_day = _alert_condition_date_range(target_day, rules)
+    if health_df is None:
+        try:
+            health_df = load_health_data(start_date=start_day, end_date=end_day)
+        except Exception:
+            health_df = pd.DataFrame(columns=HEALTH_COLUMNS)
+    if ex_df is None:
+        try:
+            ex_df = load_excretion_data(start_date=start_day, end_date=end_day)
+        except Exception:
+            ex_df = pd.DataFrame(columns=EXCRETION_COLUMNS)
 
     enabled_rules = rules[rules["使用"].astype(bool)].copy()
     rows = []
@@ -8522,7 +8543,7 @@ def build_handover_alerts_by_condition(target_date):
     return pd.DataFrame(rows, columns=["利用者名", "重要度", "分類", "条件名", "詳細", "申し送り文"])
 
 
-def build_business_handover_auto_extract_text(target_date):
+def build_business_handover_auto_extract_text(target_date, alert_df=None):
     """条件設定マスタに基づき、健康チェック・排泄チェックExcelから申し送り候補を自動抽出する。"""
     target = pd.to_datetime(target_date, errors="coerce")
     if pd.isna(target):
@@ -8533,7 +8554,8 @@ def build_business_handover_auto_extract_text(target_date):
         "管理者が設定した申し送り・注意情報の抽出条件に基づいて表示しています"
     ]
 
-    alert_df = build_handover_alerts_by_condition(target_day)
+    if alert_df is None:
+        alert_df = build_handover_alerts_by_condition(target_day)
     if alert_df.empty:
         lines.append("・条件に該当する申し送り候補はありません。")
         return "\n".join(lines)
@@ -8637,13 +8659,21 @@ def show_alert_condition_master_menu():
 
     st.markdown("#### 抽出プレビュー")
     st.caption("ここに表示される内容が、申し送り画面の自動抽出情報と管理者画面の注意情報に反映されます。")
-    alert_df = build_handover_alerts_by_condition(preview_date)
+    preview_start, preview_end = _alert_condition_date_range(preview_date, df)
+    preview_health_df = load_health_data(start_date=preview_start, end_date=preview_end)
+    preview_ex_df = load_excretion_data(start_date=preview_start, end_date=preview_end)
+    alert_df = build_handover_alerts_by_condition(
+        preview_date,
+        health_df=preview_health_df,
+        ex_df=preview_ex_df,
+        rules=df,
+    )
     if alert_df.empty:
         st.info("この日の条件該当者はありません。使用ONの条件、対象日、健康チェック・排泄チェックの記録を確認してください。")
     else:
         st.dataframe(alert_df, use_container_width=True, hide_index=True)
         st.markdown("#### 業務全体申し送りに表示される文章")
-        st.info(build_business_handover_auto_extract_text(preview_date))
+        st.info(build_business_handover_auto_extract_text(preview_date, alert_df=alert_df))
 
 def show_business_handover_auto_extract_box(target_date):
     """申し送り画面内にExcel自動抽出情報を表示する。"""
@@ -17708,11 +17738,10 @@ elif menu == "管理者支援":
         st.error("この画面は管理者専用です。")
         st.stop()
 
-    st.header("申し送り・注意情報の抽出条件")
-    health_df = load_health_data()
-    ex_df = load_excretion_data()
-
-    tab7, tab1, tab2, tab3, tab4, tab5, tab6, tab8 = st.tabs([
+    st.header("管理者支援")
+    st.caption("確認・作成したい内容を選ぶと、その画面に必要な期間の記録だけを読み込みます。")
+    support_views = [
+        "表示する内容を選んでください",
         "申し送り・注意情報の抽出条件",
         "AI家族レポート",
         "バイタル推移グラフ",
@@ -17721,9 +17750,17 @@ elif menu == "管理者支援":
         "申し送り支援",
         "注意通知",
         "体重未測定確認",
-    ])
+    ]
+    support_view = st.selectbox(
+        "確認・作成する内容",
+        support_views,
+        key="admin_support_view",
+    )
 
-    with tab1:
+    if support_view == "表示する内容を選んでください":
+        st.info("上の選択欄から、確認または作成したい内容を選んでください。")
+
+    elif support_view == "AI家族レポート":
         st.subheader("AI家族レポート自動文章")
         col1, col2, col3 = st.columns(3)
         with col1:
@@ -17733,27 +17770,34 @@ elif menu == "管理者支援":
         with col3:
             ai_month = st.number_input("対象月", min_value=1, max_value=12, value=today_jst().month, step=1, key="ai_month")
 
+        ai_start = date(int(ai_year), int(ai_month), 1)
+        ai_end = (date(int(ai_year) + (1 if int(ai_month) == 12 else 0), 1 if int(ai_month) == 12 else int(ai_month) + 1, 1) - timedelta(days=1))
+        health_df = load_health_data(start_date=ai_start, end_date=ai_end)
+        ex_df = load_excretion_data(start_date=ai_start, end_date=ai_end)
         summary = create_family_summary_text(health_df, ex_df, ai_user, ai_year, ai_month)
         st.text_area("家族向け文章", value=summary, height=360)
 
-    with tab2:
+    elif support_view == "バイタル推移グラフ":
         st.subheader("バイタル推移グラフ")
-        if health_df.empty:
-            st.info("データがありません。")
-        else:
-            col1, col2, col3, col4 = st.columns(4)
-            with col1:
-                graph_user = st.selectbox("利用者", all_users, key="graph_user")
-            with col2:
-                graph_item = st.selectbox("項目", ["体温", "血圧上", "血圧下", "脈拍", "SpO2", "体重", "朝食摂取率", "昼食摂取率", "夕食摂取率"], key="graph_item")
-            with col3:
-                graph_year = st.number_input("年", min_value=2024, max_value=2035, value=today_jst().year, step=1, key="graph_year")
-            with col4:
-                graph_month = st.number_input("月", min_value=1, max_value=12, value=today_jst().month, step=1, key="graph_month")
+        col1, col2, col3, col4 = st.columns(4)
+        with col1:
+            graph_user = st.selectbox("利用者", all_users, key="graph_user")
+        with col2:
+            graph_item = st.selectbox("確認する項目", ["体温", "血圧上", "血圧下", "脈拍", "SpO2", "体重", "朝食摂取率", "昼食摂取率", "夕食摂取率"], key="graph_item")
+        with col3:
+            graph_year = st.number_input("対象年", min_value=2024, max_value=2035, value=today_jst().year, step=1, key="graph_year")
+        with col4:
+            graph_month = st.number_input("対象月", min_value=1, max_value=12, value=today_jst().month, step=1, key="graph_month")
 
+        graph_start = date(int(graph_year), int(graph_month), 1)
+        graph_end = (date(int(graph_year) + (1 if int(graph_month) == 12 else 0), 1 if int(graph_month) == 12 else int(graph_month) + 1, 1) - timedelta(days=1))
+        health_df = load_health_data(start_date=graph_start, end_date=graph_end)
+        if health_df.empty:
+            st.info("選択した月の健康チェック記録はありません。")
+        else:
             target = get_month_health_data(health_df, graph_user, graph_year, graph_month)
             if target.empty:
-                st.warning("対象データがありません。")
+                st.warning("選択した利用者・項目の記録はありません。")
             else:
                 chart_df = target[["記録日", graph_item]].copy()
                 chart_df[graph_item] = pd.to_numeric(chart_df[graph_item], errors="coerce")
@@ -17762,31 +17806,29 @@ elif menu == "管理者支援":
                 st.line_chart(chart_df)
 
 
-    with tab3:
+    elif support_view == "気になる変化":
         st.subheader("気になる変化（日付別一覧）")
         st.caption("健康チェック入力の『気になる変化』を、利用者・日付で絞り込み、日付ごとに確認できます。")
 
+        user_options_for_change = ["全員"] + [u for u in all_users if clean_text(u) and clean_text(u) != "全員"]
+        default_end_date = today_jst()
+        default_start_date = default_end_date.replace(day=1)
+        col1, col2, col3 = st.columns(3)
+        with col1:
+            change_user = st.selectbox("確認する利用者", user_options_for_change, key="change_user")
+        with col2:
+            change_start_date = st.date_input("開始日", value=default_start_date, key="change_start_date")
+        with col3:
+            change_end_date = st.date_input("終了日", value=default_end_date, key="change_end_date")
+
+        if change_start_date > change_end_date:
+            st.error("開始日は終了日以前にしてください。")
+            st.stop()
+
+        health_df = load_health_data(start_date=change_start_date, end_date=change_end_date)
         if health_df.empty:
-            st.info("健康チェックデータがありません。")
+            st.info("選択した期間の健康チェック記録はありません。")
         else:
-            # Ver4.6追加：利用者に「全員」を追加し、年月だけではなく日付範囲で絞り込めるようにする。
-            user_options_for_change = ["全員"] + [u for u in all_users if clean_text(u) and clean_text(u) != "全員"]
-
-            default_end_date = today_jst()
-            default_start_date = default_end_date.replace(day=1)
-
-            col1, col2, col3 = st.columns(3)
-            with col1:
-                change_user = st.selectbox("利用者", user_options_for_change, key="change_user")
-            with col2:
-                change_start_date = st.date_input("開始日", value=default_start_date, key="change_start_date")
-            with col3:
-                change_end_date = st.date_input("終了日", value=default_end_date, key="change_end_date")
-
-            if change_start_date > change_end_date:
-                st.error("開始日は終了日以前にしてください。")
-                st.stop()
-
             change_target = health_df.copy()
             if "記録日" not in change_target.columns:
                 st.error("健康チェックデータに『記録日』列がありません。")
@@ -17883,16 +17925,20 @@ elif menu == "管理者支援":
                         use_container_width=True,
                     )
 
-    with tab4:
+    elif support_view == "ChatGPT連携":
         st.subheader("ChatGPT連携用プロンプト")
         col1, col2, col3 = st.columns(3)
         with col1:
             prompt_user = st.selectbox("利用者", all_users, key="prompt_user")
         with col2:
-            prompt_year = st.number_input("年", min_value=2024, max_value=2035, value=today_jst().year, step=1, key="prompt_year")
+            prompt_year = st.number_input("対象年", min_value=2024, max_value=2035, value=today_jst().year, step=1, key="prompt_year")
         with col3:
-            prompt_month = st.number_input("月", min_value=1, max_value=12, value=today_jst().month, step=1, key="prompt_month")
+            prompt_month = st.number_input("対象月", min_value=1, max_value=12, value=today_jst().month, step=1, key="prompt_month")
 
+        prompt_start = date(int(prompt_year), int(prompt_month), 1)
+        prompt_end = (date(int(prompt_year) + (1 if int(prompt_month) == 12 else 0), 1 if int(prompt_month) == 12 else int(prompt_month) + 1, 1) - timedelta(days=1))
+        health_df = load_health_data(start_date=prompt_start, end_date=prompt_end)
+        ex_df = load_excretion_data(start_date=prompt_start, end_date=prompt_end)
         target_h = get_month_health_data(health_df, prompt_user, prompt_year, prompt_month)
         target_e = get_month_excretion_data(ex_df, prompt_user, prompt_year, prompt_month)
 
@@ -17932,15 +17978,19 @@ elif menu == "管理者支援":
 """
         st.text_area("プロンプト", value=prompt, height=520)
 
-    with tab5:
+    elif support_view == "申し送り支援":
         st.subheader("申し送り支援")
-        target_date = st.date_input("対象日", value=today_jst(), key="handover_date")
+        st.caption("対象日の記録と、それ以前の直近記録との差を整理します。")
+        target_date = st.date_input("申し送りを作成する日", value=today_jst(), key="handover_date")
+        health_df = load_health_data(end_date=target_date)
+        ex_df = load_excretion_data(end_date=target_date)
         handover = create_handover_text(health_df, ex_df, target_date)
         st.text_area("申し送り案", value=handover, height=360)
 
-    with tab6:
+    elif support_view == "注意通知":
         st.subheader("注意通知")
-        alert_date = st.date_input("注意通知の対象日", value=today_jst(), key="alert_date")
+        st.caption("選択した日と、抽出条件で必要な直近日数の記録だけを確認します。")
+        alert_date = st.date_input("確認する日", value=today_jst(), key="alert_date")
         alert_df = build_handover_alerts_by_condition(alert_date)
 
         if alert_df.empty:
@@ -17953,13 +18003,14 @@ elif menu == "管理者支援":
         show_alert_condition_guidance()
 
 
-    with tab7:
+    elif support_view == "申し送り・注意情報の抽出条件":
         show_alert_condition_master_menu()
 
-    with tab8:
+    elif support_view == "体重未測定確認":
         st.subheader("体重未測定確認")
         st.caption("体重は測定した日だけ入力します。14日以上測定が空いている場合だけ確認対象にします。")
         check_day = st.date_input("確認日", value=today_jst(), key="weight_overdue_check_day")
+        health_df = load_health_data(end_date=check_day)
         show_latest_weight_block(health_df, all_users, check_day)
         show_weight_overdue_block(health_df, all_users, check_day, threshold_days=14)
 
